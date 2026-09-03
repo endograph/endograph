@@ -1,149 +1,130 @@
 import { existsSync, mkdirSync, unlinkSync } from "node:fs";
-import { homedir } from "node:os";
-import { basename, join } from "node:path";
-import type { AgentDir } from "../agent/dir.ts";
-import { dim } from "./shared.ts";
+import { homedir, platform } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /**
- * `endo install|uninstall|restart` — the agent's home process. On macOS an
- * agent runs as a launchd user agent: started at login, relaunched if it
- * exits, in the owner's GUI session (keychain, ssh agent, unrestricted
- * network — the things a sandboxed shell lacks). Logs go to the agent dir.
+ * `endo up -d`: run the agent under the platform supervisor. launchd user
+ * agent on macOS (now and at every login; KeepAlive restarts crashes but
+ * not a clean exit, so a moved home does not crash-loop); systemd user
+ * unit on Linux (lingering enabled so it survives logout).
  */
 
-export function serviceLabel(dir: AgentDir): string {
-  return `endo.${basename(dir.project)}.${dir.name}`;
+export function serviceLabel(name: string): string {
+  return `endograph.${name}`;
 }
 
-export function servicePlistPath(dir: AgentDir): string {
-  return join(homedir(), "Library", "LaunchAgents", `${serviceLabel(dir)}.plist`);
+function cliPath(): string {
+  return fileURLToPath(new URL("./index.ts", import.meta.url));
 }
 
-export function serviceLogPath(dir: AgentDir): string {
-  return join(dir.root, `${dir.name}.log`);
+function plistPath(name: string): string {
+  return join(homedir(), "Library", "LaunchAgents", `${serviceLabel(name)}.plist`);
 }
 
-/** The plist, built from how `endo` is being run right now (bun + this CLI). */
-export function launchAgentPlist(
-  dir: AgentDir,
-  opts: { bun: string; cli: string; path: string; home: string },
-): string {
-  const args = [opts.bun, opts.cli, "--agent", dir.root, "up"];
-  const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  return `<?xml version="1.0" encoding="UTF-8"?>
+function unitPath(name: string): string {
+  return join(homedir(), ".config", "systemd", "user", `${serviceLabel(name)}.service`);
+}
+
+export interface ServiceInfo {
+  file: string;
+  installed: boolean;
+}
+
+export function serviceInfo(name: string): ServiceInfo {
+  const file = platform() === "darwin" ? plistPath(name) : unitPath(name);
+  return { file, installed: existsSync(file) };
+}
+
+export async function installService(name: string, home: string): Promise<void> {
+  const bun = process.execPath;
+  const log = join(home, "agent", "endo.log");
+  if (platform() === "darwin") {
+    const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>${esc(serviceLabel(dir))}</string>
-  <key>ProgramArguments</key>
-  <array>
-${args.map((a) => `    <string>${esc(a)}</string>`).join("\n")}
+<plist version="1.0"><dict>
+  <key>Label</key><string>${esc(serviceLabel(name))}</string>
+  <key>ProgramArguments</key><array>
+    <string>${esc(bun)}</string><string>${esc(cliPath())}</string><string>up</string><string>${esc(home)}</string><string>--service</string>
   </array>
-  <key>WorkingDirectory</key>
-  <string>${esc(dir.project)}</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key>
-    <string>${esc(opts.path)}</string>
-    <key>HOME</key>
-    <string>${esc(opts.home)}</string>
-  </dict>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>ThrottleInterval</key>
-  <integer>10</integer>
-  <key>StandardOutPath</key>
-  <string>${esc(serviceLogPath(dir))}</string>
-  <key>StandardErrorPath</key>
-  <string>${esc(serviceLogPath(dir))}</string>
-</dict>
-</plist>
+  <key>WorkingDirectory</key><string>${esc(home)}</string>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${esc(process.env.PATH ?? "/usr/bin:/bin")}</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>${esc(log)}</string>
+  <key>StandardErrorPath</key><string>${esc(log)}</string>
+</dict></plist>
 `;
+    mkdirSync(join(homedir(), "Library", "LaunchAgents"), { recursive: true });
+    await Bun.write(plistPath(name), plist);
+    await launchctl(["bootout", `${domain()}/${serviceLabel(name)}`]);
+    // bootout returns before the job is gone; bootstrapping the same label
+    // meanwhile fails with "Input/output error". Wait for the unload, then retry.
+    for (let i = 0; i < 50 && (await launchctl(["print", `${domain()}/${serviceLabel(name)}`])) === null; i++) await Bun.sleep(200);
+    let err: string | null = null;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      err = await launchctl(["bootstrap", domain(), plistPath(name)]);
+      if (!err) return;
+      await Bun.sleep(500);
+    }
+    throw new Error(`launchctl bootstrap failed: ${err}`);
+  }
+  const unit = `[Unit]
+Description=endograph agent ${name}
+
+[Service]
+ExecStart=${bun} ${cliPath()} up ${home} --service
+WorkingDirectory=${home}
+Environment=PATH=${process.env.PATH ?? "/usr/bin:/bin"}
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:${log}
+StandardError=append:${log}
+
+[Install]
+WantedBy=default.target
+`;
+  mkdirSync(join(homedir(), ".config", "systemd", "user"), { recursive: true });
+  await Bun.write(unitPath(name), unit);
+  await run(["loginctl", "enable-linger"]);
+  await run(["systemctl", "--user", "daemon-reload"]);
+  const err = await run(["systemctl", "--user", "enable", "--now", `${serviceLabel(name)}.service`]);
+  if (err) throw new Error(`systemctl enable failed: ${err}`);
+  await run(["systemctl", "--user", "restart", `${serviceLabel(name)}.service`]);
 }
 
-export async function cmdInstall(dir: AgentDir): Promise<number> {
-  requireMacOS();
-  const plist = servicePlistPath(dir);
-  mkdirSync(join(homedir(), "Library", "LaunchAgents"), { recursive: true });
-  await Bun.write(
-    plist,
-    launchAgentPlist(dir, {
-      bun: process.execPath,
-      cli: Bun.main,
-      path: process.env.PATH ?? "/usr/bin:/bin",
-      home: homedir(),
-    }),
-  );
-  await bootout(dir); // idempotent: re-install replaces a running instance
-  const err = await bootstrap(plist);
-  if (err) {
-    console.error(`installed ${plist} but launchd refused it: ${err}`);
-    return 1;
+export async function removeService(name: string): Promise<boolean> {
+  const info = serviceInfo(name);
+  if (platform() === "darwin") {
+    await launchctl(["bootout", `${domain()}/${serviceLabel(name)}`]);
+  } else {
+    await run(["systemctl", "--user", "disable", "--now", `${serviceLabel(name)}.service`]);
   }
-  console.log(`installed ${serviceLabel(dir)} — running now and at every login`);
-  console.log(dim(`  plist ${plist}`));
-  console.log(dim(`  log   ${serviceLogPath(dir)}`));
-  return 0;
+  if (info.installed) unlinkSync(info.file);
+  return info.installed;
 }
 
-export async function cmdUninstall(dir: AgentDir): Promise<number> {
-  requireMacOS();
-  await bootout(dir);
-  const plist = servicePlistPath(dir);
-  if (existsSync(plist)) unlinkSync(plist);
-  console.log(`uninstalled ${serviceLabel(dir)}`);
-  return 0;
-}
-
-/** Stop and start the home process: picks up new endograph code. (Charter, grant, and playbook reload live without this.) */
-export async function cmdRestart(dir: AgentDir): Promise<number> {
-  requireMacOS();
-  const plist = servicePlistPath(dir);
-  if (!existsSync(plist)) {
-    console.error(`${serviceLabel(dir)} is not installed — run \`endo install\``);
-    return 1;
-  }
-  await bootout(dir);
-  const err = await bootstrap(plist);
-  if (err) {
-    console.error(`restart failed: ${err}`);
-    return 1;
-  }
-  console.log(`restarted ${serviceLabel(dir)}`);
-  return 0;
-}
-
-function requireMacOS(): void {
-  if (process.platform !== "darwin") {
-    throw new Error("endo install/uninstall/restart use launchd and need macOS");
-  }
+export async function serviceRunning(name: string): Promise<boolean> {
+  if (platform() === "darwin") return (await launchctl(["print", `${domain()}/${serviceLabel(name)}`])) === null;
+  return (await run(["systemctl", "--user", "is-active", "--quiet", `${serviceLabel(name)}.service`])) === null;
 }
 
 function domain(): string {
   return `gui/${process.getuid?.() ?? 501}`;
 }
 
-async function launchctl(args: string[]): Promise<{ code: number; err: string }> {
-  const child = Bun.spawn(["launchctl", ...args], { stdout: "ignore", stderr: "pipe" });
+async function launchctl(args: string[]): Promise<string | null> {
+  return run(["launchctl", ...args]);
+}
+
+/** Null on success, stderr on failure. */
+async function run(cmd: string[]): Promise<string | null> {
+  const child = Bun.spawn(cmd, { stdout: "ignore", stderr: "pipe" });
   const [code, err] = await Promise.all([child.exited, new Response(child.stderr as ReadableStream).text()]);
-  return { code, err: err.trim() };
+  return code === 0 ? null : err.trim() || `exit ${code}`;
 }
 
-async function loaded(dir: AgentDir): Promise<boolean> {
-  return (await launchctl(["print", `${domain()}/${serviceLabel(dir)}`])).code === 0;
-}
-
-/** Unload if loaded, and wait until launchd agrees it is gone. */
-async function bootout(dir: AgentDir): Promise<void> {
-  if (!(await loaded(dir))) return;
-  await launchctl(["bootout", `${domain()}/${serviceLabel(dir)}`]);
-  for (let i = 0; i < 50 && (await loaded(dir)); i++) await Bun.sleep(100);
-}
-
-async function bootstrap(plist: string): Promise<string | null> {
-  const { code, err } = await launchctl(["bootstrap", domain(), plist]);
-  return code === 0 ? null : err || `launchctl bootstrap exited ${code}`;
+function esc(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }

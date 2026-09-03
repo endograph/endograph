@@ -1,121 +1,68 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { expect, test } from "bun:test";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Inbox, findReply, waitForReply, writeMessage, writeRequest } from "../src/inbox/inbox.ts";
-import { openMemoryStore } from "../src/store/memory.ts";
-import { openWorld } from "../src/world/world.ts";
+import { Inbox } from "../src/inbox/inbox.ts";
+import { readReply, waitForReply, writeMessage, PROTOCOL_VERSION, type CallMessage } from "../src/inbox/protocol.ts";
+import type { FrameInput } from "../src/store/types.ts";
 
-let dir!: string;
-beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "endograph-inbox-"));
-});
-afterEach(() => {
-  rmSync(dir, { recursive: true, force: true });
-});
-
-function harness() {
-  const store = openMemoryStore();
-  const world = openWorld(store);
+function setup(onCall?: (c: CallMessage) => Promise<{ ok: boolean; summary: string; pending?: boolean; refused?: boolean }>) {
+  const dir = mkdtempSync(join(tmpdir(), "endo-"));
+  const frames: Partial<FrameInput>[] = [];
   const inbox = new Inbox({
-    dir,
-    record: (input, entries) => world.record(input, entries),
+    inboxDir: join(dir, "inbox"),
+    outboxDir: join(dir, "outbox"),
+    record: (f) => frames.push(f),
+    onCall: onCall ?? (async () => ({ ok: true, summary: "called" })),
+    onSession: async (name, ask) => ({ ok: true, summary: `${name}: ${ask ?? "no ask"}` }),
   });
-  return { store, world, inbox };
+  return { dir, frames, inbox, inboxDir: join(dir, "inbox"), outboxDir: join(dir, "outbox") };
 }
 
-describe("inbox", () => {
-  test("a poll drains every request into one drift and records each request", async () => {
-    const { store, inbox } = harness();
-    writeRequest(dir, { incident: "inc-a", from: "fox:/w1", ref: "abc", text: "deploy", at: 1 });
-    writeRequest(dir, { incident: "inc-b", from: "fox:/w2", text: "deploy too", at: 2 });
+test("a batch of requests is one drift; settlement answers the unanswered", async () => {
+  const { inbox, inboxDir, outboxDir, frames } = setup();
+  writeMessage(inboxDir, { v: PROTOCOL_VERSION, kind: "request", incident: "inc-1", from: "local:t", text: "deploy", at: 1 });
+  writeMessage(inboxDir, { v: PROTOCOL_VERSION, kind: "request", incident: "inc-2", from: "local:t", text: "status?", at: 2 });
+  const drifts = await inbox.poll();
+  expect(drifts.length).toBe(1);
+  expect(drifts[0]!.summary).toMatch(/2 requests pending/);
+  expect(inbox.reply("inc-1", true, "done")).toBe(true);
+  expect(inbox.reply("inc-1", true, "again")).toBe(false);
+  drifts[0]!.settle!({ ok: false, summary: "superseded" });
+  expect(readReply(outboxDir, "inc-1")).toMatchObject({ ok: true, state: "completed", text: "done" });
+  expect(readReply(outboxDir, "inc-2")).toMatchObject({ ok: false, state: "failed", text: "superseded" });
+  expect(frames.filter((f) => f.type === "reply").length).toBe(2);
+  expect(await inbox.poll()).toEqual([]);
+});
 
-    const drifts = await inbox.poll();
-
-    expect(drifts).toHaveLength(1);
-    expect(drifts[0]).toMatchObject({
-      kind: "request.received",
-      subject: "request:inc-a",
-      incident: "inc-a",
-      observedAt: 2,
-    });
-    expect((drifts[0]!.data!.requests as unknown[]).length).toBe(2);
-    expect(readdirSync(dir)).toEqual([]);
-    expect(store.read(0).map((f) => [f.type, f.incident])).toEqual([
-      ["request", "inc-a"],
-      ["request", "inc-b"],
-    ]);
-    expect(await inbox.poll()).toEqual([]);
+test("a call runs the procedure and replies without a drift; refusal is rejected", async () => {
+  const calls: CallMessage[] = [];
+  const { inbox, inboxDir, outboxDir } = setup(async (c) => {
+    calls.push(c);
+    return c.procedure === "nope" ? { ok: false, refused: true, summary: "no such" } : { ok: true, summary: `ran ${c.args.X}` };
   });
+  writeMessage(inboxDir, { v: PROTOCOL_VERSION, kind: "call", incident: "inc-c1", from: "local:t", procedure: "deploy", args: { X: "1" }, at: 1 });
+  writeMessage(inboxDir, { v: PROTOCOL_VERSION, kind: "call", incident: "inc-c2", from: "local:t", procedure: "nope", args: {}, at: 2 });
+  expect(await inbox.poll()).toEqual([]);
+  expect((await waitForReply(outboxDir, "inc-c1", { timeoutMs: 2000, pollMs: 20 }))?.text).toBe("ran 1");
+  expect((await waitForReply(outboxDir, "inc-c2", { timeoutMs: 2000, pollMs: 20 }))?.state).toBe("rejected");
+  expect(calls.map((c) => c.procedure)).toEqual(["deploy", "nope"]);
+});
 
-  test("explicit reply answers once; settle answers the rest", async () => {
-    const { store, inbox } = harness();
-    writeRequest(dir, { incident: "inc-a", from: "x", text: "one", at: 1 });
-    writeRequest(dir, { incident: "inc-b", from: "y", text: "two", at: 2 });
-    const [drift] = await inbox.poll();
+test("a request naming a session starts it and is answered with its outcome, not judged", async () => {
+  const { inbox, inboxDir, outboxDir } = setup();
+  writeMessage(inboxDir, { v: PROTOCOL_VERSION, kind: "request", incident: "inc-s", from: "local:t", text: "look at deploys", session: "capex", at: 1 });
+  expect(await inbox.poll()).toEqual([]);
+  expect((await waitForReply(outboxDir, "inc-s", { timeoutMs: 2000, pollMs: 20 }))?.text).toBe("capex: look at deploys");
+});
 
-    expect(inbox.reply("inc-a", true, "deployed abc")).toBe(true);
-    expect(inbox.reply("inc-a", true, "again")).toBe(false);
-    drift!.settle!({ ok: false, summary: "superseded", detail: "by inc-a" });
-    // A detail that already ends with the summary is not repeated.
-    writeRequest(dir, { incident: "inc-c", from: "z", text: "three", at: 3 });
-    const [second] = await inbox.poll();
-    second!.settle!({ ok: true, summary: "deployed x", detail: "building…\ndeployed x" });
-    expect(findReply(store, "inc-c")).toMatchObject({ ok: true, text: "building…\ndeployed x" });
-
-    expect(findReply(store, "inc-a")).toMatchObject({ ok: true, text: "deployed abc" });
-    expect(findReply(store, "inc-b")).toMatchObject({ ok: false, text: "superseded\nby inc-a" });
-    expect(inbox.pendingRequests()).toEqual([]);
-    expect(store.read(0).filter((f) => f.type === "reply")).toHaveLength(3);
-  });
-
-  test("a reply message from a peer answers a pending request; unknown incidents are noted", async () => {
-    const { store, inbox } = harness();
-    writeRequest(dir, { incident: "inc-a", from: "x", text: "deploy", at: 1 });
-    await inbox.poll();
-    writeMessage(dir, { kind: "reply", incident: "inc-a", ok: true, text: "deployed abc", from: "job", at: 2 });
-    writeMessage(dir, { kind: "reply", incident: "inc-zzz", ok: true, text: "?", from: "job", at: 3 });
-
-    expect(await inbox.poll()).toEqual([]);
-
-    expect(findReply(store, "inc-a")).toMatchObject({ ok: true, text: "deployed abc" });
-    expect(inbox.pendingRequests()).toEqual([]);
-    expect(store.read(0).at(-1)).toMatchObject({ type: "note", incident: "inc-zzz" });
-  });
-
-  test("a world message sets and clears world entries", async () => {
-    const { world, inbox } = harness();
-    writeMessage(dir, {
-      kind: "world", op: "set", subject: "target:stout", state: "yellow",
-      summary: "building since 09:41", data: { started: 1 }, from: "job", at: 1,
-    });
-    expect(await inbox.poll()).toEqual([]);
-    expect(world.world()["target:stout"]).toMatchObject({
-      kind: "target", state: "yellow", summary: "building since 09:41", data: { started: 1 },
-    });
-
-    writeMessage(dir, { kind: "world", op: "clear", subject: "target:stout", from: "job", at: 2 });
-    await inbox.poll();
-    expect(world.world()).toEqual({});
-  });
-
-  test("malformed files are discarded with an error frame", async () => {
-    const { store, inbox } = harness();
-    writeFileSync(join(dir, "1-bad.json"), "{not json");
-    expect(await inbox.poll()).toEqual([]);
-    expect(readdirSync(dir)).toEqual([]);
-    expect(store.read(0)[0]).toMatchObject({ type: "error", subject: "inbox" });
-  });
-
-  test("waitForReply resolves when the reply lands and null on timeout", async () => {
-    const { store, inbox } = harness();
-    writeRequest(dir, { incident: "inc-a", from: "x", text: "one", at: 1 });
-    await inbox.poll();
-
-    const waiting = waitForReply(store, "inc-a", { timeoutMs: 2000, pollMs: 10 });
-    setTimeout(() => inbox.reply("inc-a", true, "done"), 30);
-    expect(await waiting).toMatchObject({ incident: "inc-a", ok: true, text: "done" });
-
-    expect(await waitForReply(store, "inc-zzz", { timeoutMs: 30, pollMs: 10 })).toBeNull();
-  });
+test("reply and world messages act on the agent's behalf", async () => {
+  const { inbox, inboxDir, outboxDir, frames } = setup();
+  writeMessage(inboxDir, { v: PROTOCOL_VERSION, kind: "request", incident: "inc-1", from: "local:t", text: "long job", at: 1 });
+  await inbox.poll();
+  writeMessage(inboxDir, { v: PROTOCOL_VERSION, kind: "reply", incident: "inc-1", ok: true, text: "job done", from: "local:job", at: 2 });
+  writeMessage(inboxDir, { v: PROTOCOL_VERSION, kind: "world", incident: "", set: { "target:stout": { kind: "target", state: "green", summary: "up", data: {}, updatedAt: 3 } }, from: "local:job", at: 3 });
+  await inbox.poll();
+  expect(readReply(outboxDir, "inc-1")?.text).toBe("job done");
+  expect(frames.find((f) => f.type === "world")?.subject).toBe("target:stout");
 });
