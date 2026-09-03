@@ -1,11 +1,14 @@
 {
   "name": "endograph",
-  "version": "0.0.1",
-  "description": "Embedded ops agents: a converged world model, a reviewed charter, a learned playbook.",
+  "version": "0.1.0",
+  "description": "Embedded agents on projector: a declaration, a mandate, an inbox, a self-written playbook, a frame log.",
   "type": "module",
   "license": "MIT",
   "bin": {
     "endo": "./src/cli/index.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts"
   },
   "scripts": {
     "test": "bun test",
@@ -18,7 +21,7 @@
     "@projectors/core": "link:@projectors/core",
     "ai": "6.0.222",
     "smol-toml": "^1.3.1",
-    "zod": "^4.0.0"
+    "zod": "^4.5.4"
   },
   "devDependencies": {
     "@types/bun": "latest",

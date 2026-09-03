@@ -1,39 +1,22 @@
-import type { AgentDir } from "../agent/dir.ts";
-import { openSqliteStore } from "../store/sqlite.ts";
-import { allFrames, printFrame, endoPayload } from "./shared.ts";
+import { latestState } from "../store/queries.ts";
+import type { Frame, FrameStore } from "../store/types.ts";
+import { WORLD_STATE_KEY } from "../world/world.ts";
 
-/** `endo why metro` — recent frames about a subject; accepts loose names. */
-export async function cmdWhy(dir: AgentDir, thing: string): Promise<number> {
-  const store = openSqliteStore(dir.dbPath);
-  const frames = allFrames(store).filter(
-    (f) => f.subject != null && f.subject.includes(thing),
-  );
-  store.close();
-  if (frames.length === 0) {
-    console.log(`no frames mention "${thing}"`);
-    return 1;
-  }
-  for (const frame of frames.slice(-25)) printFrame(frame);
-  return 0;
+export { framesAbout, framesOfIncident, openIncidents, recentFrames } from "../store/queries.ts";
+
+export function worldModel(store: FrameStore): Record<string, unknown> {
+  return latestState<Record<string, unknown>>(store, WORLD_STATE_KEY) ?? {};
 }
 
-/** `endo replay inc-1a2b3c4d` — the full frame sequence of one incident. */
-export async function cmdReplay(dir: AgentDir, incident: string): Promise<number> {
-  const store = openSqliteStore(dir.dbPath);
-  const frames = allFrames(store).filter((f) => f.incident === incident);
-  store.close();
-  if (frames.length === 0) {
-    console.log(`no incident "${incident}"`);
-    return 1;
-  }
-  for (const frame of frames) {
-    printFrame(frame);
-    const detail = endoPayload(frame)?.detail;
-    if (typeof detail === "string") {
-      for (const line of detail.split("\n").slice(-15)) {
-        console.log(`    ${line}`);
-      }
-    }
-  }
-  return 0;
+export function fmtTime(at: number): string {
+  return new Date(at).toLocaleTimeString("en-GB", { hour12: false });
 }
+
+export function fmtFrame(frame: Frame): string {
+  const subject = frame.subject ? ` ${frame.subject}` : "";
+  const incident = frame.incident ? ` [${frame.incident}]` : "";
+  return `${fmtTime(frame.at)} ${frame.type.padEnd(10)}${subject}${incident}  ${frame.summary.split("\n")[0]}`;
+}
+
+export const dim = (s: string) => (process.stdout.isTTY ? `\x1b[2m${s}\x1b[0m` : s);
+export const bold = (s: string) => (process.stdout.isTTY ? `\x1b[1m${s}\x1b[0m` : s);

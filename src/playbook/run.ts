@@ -1,83 +1,81 @@
-import type { Drift, Verb, VerbResult } from "../core/types.ts";
-import type { PlaybookRule, Procedure } from "./types.ts";
+import { spawn } from "node:child_process";
+import type { Drift, Outcome } from "../loop/types.ts";
+import type { Procedure, Rule } from "./types.ts";
 
 /**
- * A script that exits with this status is REFUSING, deterministically: the
- * drift settles not-ok with the script's last stdout line, and the judgment
- * layer is not consulted. Any other non-zero status is a failure.
+ * Exit-code contract (sysexits.h): 0 handled, 75 EX_TEMPFAIL in progress
+ * (a background job finishes and answers later), 77 EX_NOPERM refused
+ * (deterministic policy: settle not-ok, never judge). Anything else is a
+ * failure and falls to judgment when the rule says so.
  */
-export const REFUSED_EXIT_STATUS = 64;
-/**
- * A script that exits with this status has STARTED the work and will
- * finish it in the background (a job it spawned): the drift is not settled;
- * the job answers the request later with `endo reply <incident>`.
- */
-export const IN_PROGRESS_EXIT_STATUS = 75;
+export const IN_PROGRESS_EXIT = 75;
+export const REFUSED_EXIT = 77;
 
-export interface RuleRunContext {
-  /** Project directory; scripts run here under the granted shell. */
-  projectDir: string;
-  agentDir: string;
-  /** World-model verbs available to rules (the ergonomic safe path). */
-  verbs: Map<string, Verb>;
-  timeoutMs?: number;
+/** Where scripts run and what they see. */
+export interface ScriptContext {
+  /** Working directory for scripts and bash (the declaration's `cwd`). */
+  cwd: string;
+  /** The agent's home; ENDO_HOME. */
+  home: string;
+  /** agent/src; ENDO_SRC. */
+  src: string;
+  env?: Record<string, string>;
+}
+
+export function scriptEnv(ctx: ScriptContext, extra: Record<string, string | undefined> = {}) {
+  return {
+    ...process.env,
+    FORCE_COLOR: "0",
+    ENDO_HOME: ctx.home,
+    ENDO_SRC: ctx.src,
+    ENDO_CWD: ctx.cwd,
+    ...ctx.env,
+    ...extra,
+  };
 }
 
 /**
- * Execute a rule's response against the drift that matched it. Verb first
- * (if declared), then script. Scripts run under the same shell the agent
- * was granted — writing a rule never escalates privilege.
+ * The one place scripts run. The child leads its own process group so a
+ * timeout kills the whole tree (a `make` under a `sh`), not just the shell.
  */
-export async function runRule(
-  rule: PlaybookRule,
-  drift: Drift,
-  ctx: RuleRunContext,
-): Promise<VerbResult> {
-  if (rule.verb) {
-    const verb = ctx.verbs.get(rule.verb);
-    if (!verb) {
-      return { ok: false, summary: `rule ${rule.name}: unknown verb "${rule.verb}"` };
-    }
-    const result = await verb.run(drift.subject);
-    if (!result.ok || !rule.script) return result;
-  }
-  if (!rule.script) {
-    return { ok: true, summary: `rule ${rule.name}: verb completed` };
-  }
-  return runScript(rule.script, drift, ctx);
-}
-
-async function runScript(
+export function runShell(
   script: string,
-  drift: Drift,
-  ctx: RuleRunContext,
-): Promise<VerbResult> {
-  const timeoutMs = ctx.timeoutMs ?? 120_000;
-  const child = Bun.spawn(["sh", "-c", script], {
-    cwd: ctx.projectDir,
-    env: {
-      ...process.env,
-      ENDO_DRIFT_KIND: drift.kind,
-      ENDO_DRIFT_SUBJECT: drift.subject,
-      ENDO_DRIFT_SUMMARY: drift.summary,
-      ENDO_DRIFT_DATA: JSON.stringify(drift.data ?? {}),
-      ...(drift.incident ? { ENDO_DRIFT_INCIDENT: drift.incident } : {}),
-      ENDO_AGENT_DIR: ctx.agentDir,
-      ENDO_PLAYBOOK_DIR: `${ctx.agentDir}/src/playbook`,
-      ENDO_PROJECT_DIR: ctx.projectDir,
-    },
-    stdout: "pipe",
-    stderr: "pipe",
-    stdin: "ignore",
+  ctx: ScriptContext,
+  opts: { env?: Record<string, string | undefined>; timeoutMs?: number; tailLines?: number; what?: string } = {},
+): Promise<Outcome & { code: number }> {
+  return new Promise((resolve) => {
+    const child = spawn("sh", ["-c", script], {
+      cwd: ctx.cwd,
+      env: scriptEnv(ctx, opts.env) as NodeJS.ProcessEnv,
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
+    child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+    const timer = setTimeout(() => {
+      timedOut = true;
+      if (child.pid) {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          child.kill("SIGKILL");
+        }
+      }
+    }, opts.timeoutMs ?? 120_000);
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      resolve({ code: 127, ...scriptOutcome(opts.what ?? "script", 127, stdout, `${stderr}\n${err.message}`, opts.tailLines ?? 40) });
+    });
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      const exit = code ?? 128;
+      if (timedOut) stderr += `\n${opts.what ?? "script"} timed out after ${(opts.timeoutMs ?? 120_000) / 1000}s (${signal ?? "killed"})`;
+      resolve({ code: exit, ...scriptOutcome(opts.what ?? "script", exit, stdout, stderr, opts.tailLines ?? 40) });
+    });
   });
-  const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
-  const [code, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout as ReadableStream).text(),
-    new Response(child.stderr as ReadableStream).text(),
-  ]);
-  clearTimeout(timer);
-  return scriptResult("script", code, stdout, stderr, 20);
 }
 
 /**
@@ -85,68 +83,61 @@ async function runScript(
  * summary (what a rule prints last is what the requester reads); on
  * failure the exit code is, with the output tail as evidence either way.
  */
-export function scriptResult(
-  what: string,
-  code: number,
-  stdout: string,
-  stderr: string,
-  tailLines: number,
-): VerbResult {
+export function scriptOutcome(what: string, code: number, stdout: string, stderr: string, tailLines: number): Outcome {
   const output = (stdout + stderr).trim();
-  const tail = output.split("\n").slice(-tailLines).join("\n");
-  // What the script said last: stdout by preference, stderr when that is
-  // all it wrote (refusals and errors usually go there).
+  const tail = output.split("\n").slice(-tailLines).join("\n") || undefined;
   const lastLine =
-    stdout.trim().split("\n").filter(Boolean).pop() ??
-    stderr.trim().split("\n").filter(Boolean).pop();
-  if (code === IN_PROGRESS_EXIT_STATUS) {
-    return { ok: true, summary: lastLine ?? `${what} in progress`, detail: tail || undefined, pending: true };
-  }
-  if (code === REFUSED_EXIT_STATUS) {
-    return { ok: false, summary: lastLine ?? `${what} refused`, detail: tail || undefined, refused: true };
-  }
-  return {
-    ok: code === 0,
-    summary: code === 0 ? lastLine ?? `${what} exited 0` : `${what} exited ${code}`,
-    detail: tail || undefined,
-  };
+    stdout.trim().split("\n").filter(Boolean).pop() ?? stderr.trim().split("\n").filter(Boolean).pop();
+  if (code === IN_PROGRESS_EXIT) return { ok: true, summary: lastLine ?? `${what} in progress`, detail: tail, pending: true };
+  if (code === REFUSED_EXIT) return { ok: false, summary: lastLine ?? `${what} refused`, detail: tail, refused: true };
+  return { ok: code === 0, summary: code === 0 ? (lastLine ?? `${what} exited 0`) : `${what} exited ${code}`, detail: tail };
 }
 
-/**
- * Run a script procedure with named arguments as ENDO_ARG_<NAME> env vars.
- * Same shell grant as rules; the full output tail comes back for judgment.
- */
+export async function runRule(rule: Rule, drift: Drift, ctx: ScriptContext, opts: { timeoutMs?: number } = {}): Promise<Outcome> {
+  const { code: _code, ...outcome } = await runShell(rule.script, ctx, {
+    what: `rule ${rule.name}`,
+    timeoutMs: opts.timeoutMs,
+    env: {
+      ENDO_DRIFT_KIND: drift.kind,
+      ENDO_DRIFT_SUBJECT: drift.subject,
+      ENDO_DRIFT_SUMMARY: drift.summary,
+      ENDO_DRIFT_DATA: JSON.stringify(drift.data ?? {}),
+      ...(drift.incident ? { ENDO_DRIFT_INCIDENT: drift.incident } : {}),
+    },
+  });
+  return outcome;
+}
+
+/** Validate call/procedure args against the spec: unknown or missing names are errors. */
+export function validateArgs(procedure: Procedure, args: Record<string, string>): string | null {
+  const problems: string[] = [];
+  for (const key of Object.keys(args)) if (!(key in procedure.args)) problems.push(`unknown arg ${key}`);
+  for (const [key, spec] of Object.entries(procedure.args)) {
+    if (spec.required && !(key in args)) problems.push(`missing required arg ${key}`);
+  }
+  return problems.length ? problems.join("; ") : null;
+}
+
 export async function runProcedure(
   procedure: Procedure,
   args: Record<string, string>,
-  ctx: { projectDir: string; agentDir: string; timeoutMs?: number },
-): Promise<VerbResult> {
-  if (!procedure.script) {
-    return { ok: false, summary: `procedure ${procedure.name} has no script` };
-  }
-  const env: Record<string, string | undefined> = {
-    ...process.env,
-    ENDO_AGENT_DIR: ctx.agentDir,
-    ENDO_PLAYBOOK_DIR: `${ctx.agentDir}/src/playbook`,
-    ENDO_PROJECT_DIR: ctx.projectDir,
-  };
-  for (const [key, value] of Object.entries(args)) {
-    env[`ENDO_ARG_${key.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`] = value;
-  }
-  const timeoutMs = ctx.timeoutMs ?? 30 * 60 * 1000;
-  const child = Bun.spawn(["sh", "-c", procedure.script], {
-    cwd: ctx.projectDir,
+  ctx: ScriptContext,
+  opts: { timeoutMs?: number } = {},
+): Promise<Outcome> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(args)) env[`ENDO_ARG_${key}`] = value;
+  const { code: _code, ...outcome } = await runShell(procedure.script, ctx, {
+    what: `procedure ${procedure.name}`,
+    timeoutMs: opts.timeoutMs ?? 30 * 60 * 1000,
+    tailLines: 80,
     env,
-    stdout: "pipe",
-    stderr: "pipe",
-    stdin: "ignore",
   });
-  const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
-  const [code, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout as ReadableStream).text(),
-    new Response(child.stderr as ReadableStream).text(),
-  ]);
-  clearTimeout(timer);
-  return scriptResult(`procedure ${procedure.name}`, code, stdout, stderr, 80);
+  return outcome;
+}
+
+/** `sh -n` on a script: the shell's complaint, or null when it parses. */
+export async function checkShellSyntax(script: string): Promise<string | null> {
+  const child = Bun.spawn(["sh", "-n"], { stdin: new Blob([script]), stdout: "ignore", stderr: "pipe" });
+  const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr as ReadableStream).text()]);
+  return code === 0 ? null : stderr.trim() || `sh -n exited ${code}`;
 }
