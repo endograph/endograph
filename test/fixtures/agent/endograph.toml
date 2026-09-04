@@ -1,0 +1,5 @@
+name = "fixture"
+batteries = ["bash", "evolve", "scheduler"]
+
+[executor]
+module = ".endo/scripted.ts"

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { actionResult, createAction, normalizeSchema, schemaFromJsonSchema, type AnyAction } from "@projectors/core";
-import type { Battery } from "../grant/define.ts";
+import type { Battery } from "../grant/grant.ts";
 import type { ProcedureMeta } from "./lib.ts";
 import type { RunStarter } from "./runs.ts";
 

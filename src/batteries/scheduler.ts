@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { Battery } from "../grant/define.ts";
+import type { Battery } from "../grant/grant.ts";
 
 /**
  * The scheduler battery: a `schedule` procedure field (five-field cron)

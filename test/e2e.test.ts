@@ -54,6 +54,16 @@ test("empty state dir → inception with a fixture inceptor (two rounds) → a s
   expect(inception?.summary).toBe("inception 1 after 2 rounds");
   expect(inception?.payload).toMatchObject({ n: 1, rounds: 2, version: expect.any(String) });
   expect(existsSync(join(dir, ".endo/workspace/ERRORS.md"))).toBe(false);
+  // The record: the workspace as read, and both rounds with what the inceptor said, wrote, and got back.
+  const record = join(dir, ".endo/inceptions/1");
+  expect(JSON.parse(readFileSync(join(record, "inception.json"), "utf8"))).toMatchObject({ n: 1, rounds: 2, outcome: "recorded", inceptor: expect.stringContaining("inceptor.ts") });
+  expect(existsSync(join(record, "workspace/TASK.md"))).toBe(true);
+  expect(readdirSync(join(record, "rounds/1")).sort()).toEqual(["ERRORS.md", "agent.ts", "round.json", "src", "stdout.txt"]);
+  expect(JSON.parse(readFileSync(join(record, "rounds/1/round.json"), "utf8"))).toMatchObject({ round: 1, passed: false, stage: "program", exitCode: 0 });
+  expect(readFileSync(join(record, "rounds/1/agent.ts"), "utf8")).toMatch(/do not edit/);
+  expect(readFileSync(join(record, "rounds/1/stdout.txt"), "utf8")).toMatch(/fixture inceptor wrote the program/);
+  expect(JSON.parse(readFileSync(join(record, "rounds/2/round.json"), "utf8"))).toMatchObject({ round: 2, passed: true });
+  expect(existsSync(join(record, "rounds/2/ERRORS.md"))).toBe(false);
 
   // Owner commands with the agent down.
   expect((await endo(dir, "charter")).out).toMatch(/### reply[\s\S]*### bash[\s\S]*### spawn[\s\S]*`schedule` \(scheduler\)/);
@@ -74,6 +84,7 @@ test("empty state dir → inception with a fixture inceptor (two rounds) → a s
   expect(readFileSync(join(dir, ".endo/workspace/DIFF.md"), "utf8")).toMatch(/\+Also: be brief/);
   expect(readFileSync(join(dir, ".endo/workspace/TASK.md"), "utf8")).toMatch(/revising it, not starting over/);
   expect(readdirSync(join(dir, ".endo/snapshots")).sort()).toEqual(["1", "2"]);
+  expect(readdirSync(join(dir, ".endo/inceptions/2/rounds/2")).sort()).toEqual(["CHANGES.md", "agent.ts", "instance.json", "round.json", "src", "stdout.txt"]);
   expect(existsSync(join(dir, ".endo/src/README.md"))).toBe(true);
 
   // The first up after inception 2 delivers the inceptor's brief as a request from inceptor:2, once.

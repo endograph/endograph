@@ -59,8 +59,8 @@ what the model should think about.
 | Word | Meaning |
 |---|---|
 | **agent directory** | The directory `endo up` runs in. Holds the owner's two files and the state directory. Its path is the agent's identity. |
-| **grant** | `endograph.ts`: name, manifest path, executor, batteries, charter contributions. Owner-written, typechecked, never reachable from the program. |
-| **manifest** | `manifest.md`: the owner's intent, in prose. Input to every inception. Never handed to the running agent. |
+| **grant** | `endograph.toml`: name, manifest path, executor, batteries by name, inception options. Data, owner-written, validated at load, never reachable from the program. |
+| **manifest** | The owner's intent, in prose: `manifest.md` beside the grant, or inline in it. Input to every inception. Never handed to the running agent. |
 | **state directory** | `.endo/`: everything the agent is. The frame log, the program, `src`, the wire, snapshots. Gitignored. `rm -rf .endo` is a factory reset; the next `up` incepts a fresh agent from the owner's two files. |
 | **program** | `.endo/program/agent.ts`: what inception wrote. Nodes, instructions, projections. Written only by inception; the running agent and the owner never edit it. |
 | **src** | `.endo/src/`: what the agent writes. Procedures, notes, whatever it keeps as files. Seeded by inception, owned by the agent. |
@@ -79,7 +79,7 @@ inception with a baseline), rule, match, policy (future).
 
 ```
 project-repo/agents/endofrog/     # AGENT DIRECTORY (two files; usually committed; git never required)
-  endograph.ts                    #   the GRANT
+  endograph.toml                  #   the GRANT
   manifest.md                     #   the MANIFEST
   .endo/                          #   STATE DIRECTORY (gitignored; everything the agent is)
     env                           #     KEY=VALUE credentials (mode 600), loaded at start
@@ -90,6 +90,7 @@ project-repo/agents/endofrog/     # AGENT DIRECTORY (two files; usually committe
     src/                          #     agent-owned: procedures/*.ts (§7), notes, anything
     inbox/  outbox/               #     the wire (§11)
     snapshots/<n>/                #     inputs + program + src copy after inception n
+    inceptions/<n>/               #     how inception n went: the workspace as read, each round's output, writes, errors
     workspace/                    #     the inception in progress
 
 ~/.endograph/agents/endofrog -> project-repo/agents/endofrog     # the registry (§12)
@@ -97,8 +98,8 @@ project-repo/agents/endofrog/     # AGENT DIRECTORY (two files; usually committe
 
 - `endo up` runs in the agent directory. No walking up, no `dir` argument.
   Three ways in:
-  - the directory holds `endograph.ts`: load it;
-  - `endo up --template <dir>`: copy that directory's `endograph.ts` and
+  - the directory holds `endograph.toml`: load it;
+  - `endo up --template <dir>`: copy that directory's `endograph.toml` and
     `manifest.md` here (refused when either already exists), then load;
   - neither: interactive. Ask, one question at a time: name, executor,
     the manifest (a path or text typed in), batteries to include. Write
@@ -113,30 +114,42 @@ project-repo/agents/endofrog/     # AGENT DIRECTORY (two files; usually committe
   writes `program/`, the agent writes `src/`. Review of the program is
   reading it or `endo replay`, never editing it.
 
-## 4. The grant: `endograph.ts` and `defineAgent`
+## 4. The grant: `endograph.toml`
 
-```ts
-import { defineAgent, aisdk, bash, evolve } from "endograph";
+```toml
+name = "endofrog"                 # required; kebab-case; the registry key, the unit label, `from` on outgoing messages
+manifest = "manifest.md"          # default; or inline, with no file: [manifest] text = """..."""
+cwd = "."                         # where procedures and bash run; default
+batteries = ["bash", "evolve"]    # by name: bash, evolve, scheduler
 
-export default defineAgent({
-  name: "endofrog",                                   // required; the registry key
-  manifest: "./manifest.md",
-  executor: aisdk({ provider: "openai", model: "gpt-5.6-luna" }),
-  cwd: "../..",                                       // where procedures and bash run
-  batteries: [bash(), evolve()],
-  states: [],                                         // pass-through projector states
-  actions: [],                                        // pass-through projector actions
-  inception: { inceptor: "claude", rounds: 5 },       // optional; first of claude, codex on PATH; validation loops
-});
+[executor]
+provider = "openai"               # anthropic | openai, through the AI SDK; credentials from .endo/env
+model = "gpt-5.6-luna"
+# max_output_tokens = 16000
+# temperature = 0.2
+# or, the escape hatch: module = "./executor.ts", a TS module whose default export is an ExecutorSpec
+
+[inception]
+# inceptor = "claude -p --dangerously-skip-permissions"   # default: the first of claude, codex on PATH
+rounds = 5                        # validation rounds before an inception gives up
 ```
 
-- The name is required, kebab-case, checked by the type checker and at
-  load. It is used for exactly three things: the registry key, the unit
-  label, `from` on outgoing messages.
+- The grant is data. Everything in it is a name or a number (or the
+  manifest's prose, inline), so nothing in the agent directory is code: an owner edits it by hand, a peer in
+  any language can write one, `endo up --template` copies it, and
+  `DIFF.md` diffs a config. (For v3's first two days it was
+  `endograph.ts` with `defineAgent`, which bought a type-level name check
+  and cost a resolver trick to load it, a generated tsconfig beside it,
+  and a rule against relative imports. The same check runs at load.)
+- Validated at load: a bad name, an unknown key, an unknown or repeated
+  battery, a missing executor all fail `endo up` with the file and the
+  reason.
 - The grant is the whole universe: every action the model can ever call
-  (core actions, battery actions, pass-through actions). Procedures
-  compose these and cannot widen them (§7).
-- Battery actions are offered, not placed. `evolve()` puts transition,
+  (core actions, battery actions). Procedures compose these and cannot
+  widen them (§7). Custom batteries beyond the built-in three, and
+  pass-through projector states and actions: future, as packages named
+  in the grant.
+- Battery actions are offered, not placed. `evolve` puts transition,
   spawn, and cede in the grant; whether a node carries them, which node,
   and with what instructions is the inceptor's choice, like any other
   grant action.
@@ -144,27 +157,23 @@ export default defineAgent({
   ok, text, lifecycle state), `compact` (record a horizon and the
   summary that follows it), `update_state` (write any program-declared
   state through projector's address-based write, schema-checked).
-- Endograph re-exports every projector primitive a grant or program
-  needs, and `z` (zod) for schemas. Neither imports `@projectors/core`
-  or zod directly (version skew across links yields two copies).
+- Endograph re-exports every projector primitive a program needs, and
+  `z` (zod) for schemas. A program never imports `@projectors/core` or
+  zod directly (version skew across links yields two copies).
 - The agent directory holds no `package.json` or `node_modules`. `endo
-  up` links the endograph that is running into `.endo/node_modules/`;
-  the program and procedures resolve upward from `.endo/` to it, and the
-  grant is loaded from a copy at `.endo/grant.ts` so it does too. The
-  grant imports only from `endograph`: a relative import beside it would
-  not survive the copy. For editors and `bunx tsc`, `endo up` writes a
-  `tsconfig.json` beside the grant once (paths to the link; the owner's
-  file from then on): the one file in the agent directory that is
-  tooling, not intent.
-- `endograph.ts` changes are owner inputs: they need `endo up` again and
-  `endo incept` when the program should follow (§9). Nothing in the
+  up` links the endograph that is running into `.endo/node_modules/`,
+  and writes `.endo/tsconfig.json`; the program and procedures resolve
+  upward to the link, and an editor or `bunx tsc` in `.endo/` typechecks
+  them.
+- `endograph.toml` changes are owner inputs: they need `endo up` again
+  and `endo incept` when the program should follow (§9). Nothing in the
   grant reloads live.
 
 ## 5. The program contract
 
 ```ts
 // .endo/program/agent.ts — written by inception 3 (2026-09-04). Do not edit:
-// change manifest.md or endograph.ts and run `endo incept`.
+// change manifest.md or endograph.toml and run `endo incept`.
 import { defineProgram, createNode, createSourceInstance, createState, tool } from "endograph";
 
 export default defineProgram((endo) => {
@@ -506,10 +515,19 @@ errors and leaves the workspace for inspection; the previous program
 stays in place and the agent can be started again as it was.
 
 **Record.** A success writes an `inception` frame (n, manifest hash,
-grant hash, program hash, endograph version, inceptor identity, rounds
-used), a fresh machine snapshot so a failing frame is never replayed
-again, and `snapshots/<n>/` holding the inputs, the program, and a copy
-of `src`.
+grant hash, program hash, endograph version, inceptor command, rounds
+used, elapsed ms), a fresh machine snapshot so a failing frame is never
+replayed again, and `snapshots/<n>/` holding the inputs, the program,
+and a copy of `src`. Every attempt, success or not, also leaves
+`inceptions/<n>/`: `inception.json` (command, prompt, timing, outcome),
+`workspace/` as the inceptor read it, and `rounds/<k>/` with the
+inceptor's stdout and stderr, the program and `src` as that round left
+them, `ERRORS.md` when validation failed, `CHANGES.md` and
+`instance.json` when written, and `round.json` (timings, exit code, the
+failing stage). The snapshot is the baseline the next inception starts
+from; the record is the evidence for iterating on inception itself:
+the prompt, the workspace, the validation messages. Attempting
+inception n again clears it.
 
 **Self-evolution is not inception.** The agent evolves through
 transition, spawn, cede, and procedures. The manifest is the owner's
@@ -590,7 +608,7 @@ whenever `up` runs. Data, not code: any endo binary reads and writes it.
 ```
 endo up                      # in the agent directory: register, install the unit, start; incepts first (foreground) when there is no program
 endo up --foreground         # run in this terminal instead (debugging, tests); refuses while the service is loaded
-endo up --template <dir>     # seed endograph.ts + manifest.md from <dir>, then as above; with neither and no template, endo asks
+endo up --template <dir>     # seed endograph.toml + manifest.md from <dir>, then as above; with neither and no template, endo asks
 endo down                    # stop the service and remove the unit
 endo logs [-f]               # the service log
 endo incept                  # re-incept now, with the agent stopped; --manual / --accept
@@ -632,7 +650,7 @@ program may tell peers to type.
 The loop (drift, sensor, outcome, rule matching as a stage); the judge
 (framing and drift prompts, core tools other than reply/compact/state);
 sessions (`learn`, `capex`, the `session` message field); `evolvable()`
-and the self component; `defineAgent`'s `children`; the world state and
+and the self component; the declaration's `children`; the world state and
 `world` messages; battery sensors, `onSettle`, and sessions; the
 in-process model migrator and the word migration; the declaration/home
 split, `--home`, the `declaration` link, `.endo/<name>/`; `mandate.md`
@@ -666,7 +684,7 @@ Order:
    review; it comes before any code.
 2. Delete `src/` and `test/` except the carry list; move the carried
    modules to their v3 names with their tests.
-3. The grant: `defineAgent`, core actions, the bash battery.
+3. The grant (`defineAgent` then; `endograph.toml` since), core actions, the bash battery.
 4. The program loader and the harness: pipeline, charter assembly, router,
    `runMachine` to quiescence, reply-once, live reload of procedures.
    Procedures: `endograph/procedure`, describe mode, the two phases,

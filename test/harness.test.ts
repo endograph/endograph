@@ -84,7 +84,7 @@ test("calls, requests, procedures that emit, reply-once, live reload, and recove
     // A message from another agent's live run is stamped as that agent's procedure, checked through the registry.
     process.env.ENDOGRAPH_HOME = mkdtempSync(join(tmpdir(), "endo-home-"));
     const other = mkdtempSync(join(tmpdir(), "endo-other-"));
-    writeFileSync(join(other, "endograph.ts"), "");
+    writeFileSync(join(other, "endograph.toml"), 'name = "other"\n[executor]\nprovider = "openai"\nmodel = "x"\n');
     mkdirSync(join(other, ".endo/runs"), { recursive: true });
     writeFileSync(join(other, ".endo/runs/r9.json"), JSON.stringify({ id: "r9", procedure: "deploy" }));
     (await import("../src/cli/registry.ts")).claim("other", other);
@@ -117,7 +117,7 @@ test("calls, requests, procedures that emit, reply-once, live reload, and recove
   expect(frames.find((f) => f.type === "procedure")?.summary).toMatch(/broken failed to describe/);
   expect(frames.find((f) => f.type === "call" && f.summary.startsWith("timer:"))?.summary).toBe("timer:nightly: nightly");
   expect(frames.find((f) => f.type === "request" && f.id === "from-other")?.summary).toBe("agent:other/deploy: 2+2?");
-  expect(existsSync(join(dir, "tsconfig.json"))).toBe(true);
+  expect(existsSync(join(dir, ".endo/tsconfig.json"))).toBe(true);
   expect(frames.filter((f) => f.type === "reply").map((f) => (f.payload as { text: string }).text)).toContain("checked");
   expect(frames.filter((f) => f.type === "request" && f.summary.includes("2+2 again"))).toEqual([]);
   // Simulate a crash: a request frame whose activation never completed, and one whose activation completed without a reply.

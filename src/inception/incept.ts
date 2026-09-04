@@ -1,16 +1,16 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { serializeInstance, type SerializedInstance } from "@projectors/core";
 import { grantActions } from "../grant/core.ts";
-import type { Grant } from "../grant/define.ts";
-import { importGrant } from "../harness/agent.ts";
+import { loadGrant, type Grant } from "../grant/grant.ts";
 import { isLocked } from "../harness/lock.ts";
 import { ensureStateDir, pathsOf, type Paths } from "../harness/paths.ts";
 import { loadAgent, LoadError, type Loaded } from "../program/load.ts";
 import { openSqliteStore } from "../store/sqlite.ts";
 import { allFrames } from "../store/types.ts";
 import { renderEvolution } from "./evolution.ts";
+import { openRecord } from "./record.ts";
 import { renderWorkspace, writeSnapshot } from "./workspace.ts";
 
 /**
@@ -21,6 +21,8 @@ import { renderWorkspace, writeSnapshot } from "./workspace.ts";
  * stops, `--accept` validates what the owner's session wrote and records
  * it. Every success is an `inception` frame, a fresh machine snapshot,
  * and a copy of the inputs, the program, and src under snapshots/<n>/.
+ * Every attempt, success or not, leaves inceptions/<n>/: the workspace as
+ * read and each round's output, writes, and errors (record.ts).
  */
 
 export interface InceptOptions {
@@ -43,8 +45,9 @@ export class InceptionFailed extends Error {
   constructor(
     readonly errors: string,
     readonly workspace: string,
+    readonly record: string,
   ) {
-    super(`inception failed; the workspace is at ${workspace}:\n${errors}`);
+    super(`inception failed; the workspace is at ${workspace}, the rounds at ${record}:\n${errors}`);
   }
 }
 
@@ -60,50 +63,67 @@ export async function incept(opts: InceptOptions): Promise<InceptResult | { work
   const paths = pathsOf(resolve(opts.agentDir));
   ensureStateDir(paths);
   if (isLocked(paths.lock)) throw new Error(`${paths.agentDir} is running; stop it first (endo down)`);
-  const grant = await importGrant(paths);
+  const grant = await loadGrant(paths);
   const cwd = resolve(paths.agentDir, grant.cwd);
   const actions = grantActions(grant, { name: grant.name, cwd, charter: notRunning }, { reply: () => "not running" });
   const last = lastInception(paths);
   const n = (last?.n ?? 0) + 1;
+  const started = Date.now();
+  const inceptor = opts.accept || opts.manual ? "manual" : (opts.inceptor ?? grant.inception.inceptor ?? (await defaultInceptor()));
 
   if (!opts.accept) {
     const baseline = last ? await baselineOf(paths, grant, actions, cwd, last) : undefined;
     const workspace = renderWorkspace({ paths, grant, actions, n, version: VERSION, baseline });
     log(`workspace rendered at ${workspace} (inception ${n})`);
-    if (opts.manual) return { workspace, manual: true };
+    if (opts.manual) {
+      openRecord(paths, { n, version: VERSION, inceptor });
+      return { workspace, manual: true };
+    }
   }
+  // --accept keeps the record --manual opened, so the workspace as rendered survives.
+  const record = openRecord(paths, { n, version: VERSION, inceptor, ...(opts.accept ? {} : { prompt: PROMPT }) }, { keep: opts.accept });
 
   let rounds = 0;
   let errors: string | null = null;
   if (opts.accept) {
     rounds = 1;
+    const t = Date.now();
     errors = await validate(paths, grant, actions, cwd);
+    record.round(1, { validateMs: Date.now() - t, errors });
   } else {
-    const inceptor = opts.inceptor ?? grant.inception.inceptor ?? (await defaultInceptor());
     for (rounds = 1; rounds <= grant.inception.rounds; rounds++) {
       log(`inceptor round ${rounds}/${grant.inception.rounds}: ${inceptor}`);
       const prompt = errors ? `${PROMPT} Validation failed; ERRORS.md in the workspace has the stage and the error. Fix the program and src.` : PROMPT;
-      await runInceptor(inceptor, prompt, paths.agentDir, log);
-      errors = await validate(paths, grant, actions, cwd);
+      const run = await runInceptor(inceptor, prompt, paths.agentDir, log);
+      const t = Date.now();
+      errors = run.exitCode === 0 ? await validate(paths, grant, actions, cwd) : `inceptor: exited ${run.exitCode}`;
+      record.round(rounds, { ...run, validateMs: Date.now() - t, errors });
+      if (run.exitCode !== 0) {
+        record.close("failed", rounds, errors ?? undefined);
+        throw new Error(`inceptor exited ${run.exitCode}; its output is under ${record.dir}`);
+      }
       if (!errors) break;
       writeFileSync(join(paths.workspace, "ERRORS.md"), `# ERRORS (round ${rounds})\n\n${errors}\n`);
       log(`validation failed: ${errors.split("\n")[0]}`);
     }
     if (errors) rounds = grant.inception.rounds;
   }
-  if (errors) throw new InceptionFailed(errors, paths.workspace);
+  if (errors) {
+    record.close("failed", rounds, errors);
+    throw new InceptionFailed(errors, paths.workspace, record.dir);
+  }
 
   // Record: the frame, a fresh machine snapshot (from the edited instance.json when there is one), and the inputs as they stand.
   const store = openSqliteStore(paths.db);
   try {
     const loaded = await loadAgent({ paths, grant, store, actions, cwd, startRun: dryStart, instance: editedInstance(paths) });
-    const hashes = { manifest: hashOf(resolve(paths.agentDir, grant.manifest)), grant: hashOf(paths.grant), program: hashOf(paths.program) };
+    const hashes = { manifest: hashText(grant.manifest.text), grant: hashOf(paths.grant), program: hashOf(paths.program) };
     const changes = existsSync(join(paths.workspace, "CHANGES.md")) ? readFileSync(join(paths.workspace, "CHANGES.md"), "utf8").trim() : undefined;
     store.append({
       type: "inception",
       summary: `inception ${n}${opts.accept ? " (manual)" : ""} after ${rounds} round${rounds === 1 ? "" : "s"}`,
       at: Date.now(),
-      payload: { n, ...hashes, version: VERSION, inceptor: opts.accept ? "manual" : (opts.inceptor ?? grant.inception.inceptor ?? "default"), rounds, ...(changes ? { changes } : {}) },
+      payload: { n, ...hashes, version: VERSION, inceptor, rounds, ms: Date.now() - started, ...(changes ? { changes } : {}) },
     });
     store.writeSnapshot({ asOfSeq: store.lastSeq(), at: Date.now(), state: serializeInstance(loaded.machine.instance, loaded.charter) });
   } finally {
@@ -111,6 +131,7 @@ export async function incept(opts: InceptOptions): Promise<InceptResult | { work
   }
   const snapshot = writeSnapshot(paths, grant, n);
   rmSync(join(paths.workspace, "ERRORS.md"), { force: true });
+  record.close("recorded", rounds);
   log(`inception ${n} recorded; snapshot at ${snapshot}`);
   return { n, rounds, workspace: paths.workspace, snapshot };
 }
@@ -119,7 +140,7 @@ export async function incept(opts: InceptOptions): Promise<InceptResult | { work
 async function validate(paths: Paths, grant: Grant, actions: Loaded["provisions"]["actions"][string][], cwd: string): Promise<string | null> {
   if (!existsSync(paths.program)) return `program: nothing at ${paths.program}`;
   const header = readFileSync(paths.program, "utf8").split("\n").slice(0, 2);
-  if (!/^\/\/ \.endo\/program\/agent\.ts — written by inception \d+ \(\d{4}-\d{2}-\d{2}\)\. Do not edit:$/.test(header[0] ?? "") || !/^\/\/ change manifest\.md or endograph\.ts and run `endo incept`\.$/.test(header[1] ?? ""))
+  if (!/^\/\/ \.endo\/program\/agent\.ts — written by inception \d+ \(\d{4}-\d{2}-\d{2}\)\. Do not edit:$/.test(header[0] ?? "") || !/^\/\/ change manifest\.md or endograph\.toml and run `endo incept`\.$/.test(header[1] ?? ""))
     return `program: the two-line header is missing or malformed (PROGRAM.md §2); got:\n${header.join("\n")}`;
   const store = openSqliteStore(paths.db);
   try {
@@ -141,11 +162,12 @@ const dryStart = () => {
   throw new Error("a procedure cannot run during a dry load");
 };
 
-async function runInceptor(command: string, prompt: string, cwd: string, log: (line: string) => void): Promise<void> {
+async function runInceptor(command: string, prompt: string, cwd: string, log: (line: string) => void) {
+  const started = Date.now();
   const child = Bun.spawn(["sh", "-c", `${command} "$0"`, prompt], { cwd, stdout: "pipe", stderr: "pipe", env: { ...process.env, FORCE_COLOR: "0" } });
-  const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
-  for (const line of `${out}\n${err}`.split("\n")) if (line.trim()) log(`  | ${line}`);
-  if (code !== 0) throw new Error(`inceptor exited ${code}`);
+  const [exitCode, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  for (const line of `${stdout}\n${stderr}`.split("\n")) if (line.trim()) log(`  | ${line}`);
+  return { stdout, stderr, exitCode, inceptorMs: Date.now() - started };
 }
 
 async function defaultInceptor(): Promise<string> {
@@ -189,15 +211,19 @@ function editedInstance(paths: Paths): SerializedInstance | undefined {
 async function baselineOf(paths: Paths, grant: Grant, actions: Loaded["provisions"]["actions"][string][], cwd: string, last: InceptionRecord) {
   const dir = join(paths.snapshots, String(last.n));
   const diffs: string[] = [];
+  mkdirSync(paths.workspace, { recursive: true });
+  const nowManifest = join(paths.workspace, ".manifest.now");
+  writeFileSync(nowManifest, grant.manifest.text);
   for (const [file, now] of [
-    ["manifest.md", resolve(paths.agentDir, grant.manifest)],
-    ["endograph.ts", paths.grant],
+    ["manifest.md", nowManifest],
+    ["endograph.toml", paths.grant],
   ] as const) {
     const then = join(dir, file);
     if (!existsSync(then)) continue;
     const r = Bun.spawnSync(["diff", "-u", "--label", `${file} (inception ${last.n})`, "--label", `${file} (now)`, then, now], { stdout: "pipe", stderr: "ignore" });
     if (r.exitCode === 1) diffs.push(r.stdout.toString());
   }
+  rmSync(nowManifest, { force: true });
   if (last.version !== VERSION) diffs.push(`endograph ${last.version} -> ${VERSION}\n`);
   const errors = existsSync(paths.program) ? await validate(paths, grant, actions, cwd) : `program: nothing at ${paths.program}`;
   const store = openSqliteStore(paths.db);
@@ -222,9 +248,9 @@ export interface InceptionStatus {
 export async function inceptionStatus(paths: Paths, opts: { load?: boolean } = {}): Promise<InceptionStatus> {
   const last = lastInception(paths);
   if (!last) return { n: 0, changed: [], programEdited: false, loadError: null };
-  const grant = await importGrant(paths);
+  const grant = await loadGrant(paths);
   const changed: string[] = [];
-  if (hashOf(resolve(paths.agentDir, grant.manifest)) !== last.manifest) changed.push("manifest");
+  if (hashText(grant.manifest.text) !== last.manifest) changed.push("manifest");
   if (hashOf(paths.grant) !== last.grant) changed.push("grant");
   if (VERSION !== last.version) changed.push("endograph");
   const programEdited = existsSync(paths.program) && hashOf(paths.program) !== last.program;
@@ -239,5 +265,9 @@ export async function inceptionStatus(paths: Paths, opts: { load?: boolean } = {
 
 export function hashOf(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex").slice(0, 16);
+}
+
+export function hashText(text: string): string {
+  return createHash("sha256").update(text).digest("hex").slice(0, 16);
 }
 

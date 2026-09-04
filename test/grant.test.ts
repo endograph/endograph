@@ -1,22 +1,39 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, realpathSync } from "node:fs";
+import { mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SchemaError } from "@projectors/core";
 import { bash } from "../src/batteries/bash.ts";
 import { coreActions } from "../src/grant/core.ts";
-import { defineAgent, isGrant } from "../src/grant/define.ts";
-import type { ExecutorSpec } from "../src/grant/executor.ts";
+import { loadGrant } from "../src/grant/grant.ts";
+import { pathsOf } from "../src/harness/paths.ts";
 
-const executor: ExecutorSpec = { create: () => ({}) as never };
+function agentDir(toml: string, manifest = true): ReturnType<typeof pathsOf> {
+  const dir = mkdtempSync(join(tmpdir(), "endo-grant-"));
+  writeFileSync(join(dir, "endograph.toml"), toml);
+  if (manifest) writeFileSync(join(dir, "manifest.md"), "# m\n");
+  return pathsOf(dir);
+}
 
-test("defineAgent fills defaults and refuses a bad name, a battery twice, or a core action name", () => {
-  const grant = defineAgent({ name: "frog-1", executor, batteries: [bash()] });
-  expect(isGrant(grant)).toBe(true);
-  expect(grant).toMatchObject({ manifest: "./manifest.md", cwd: ".", inception: { rounds: 5 } });
-  expect(() => defineAgent({ name: "Frog" as never, executor })).toThrow(/kebab-case/);
-  expect(() => defineAgent({ name: "frog", executor, batteries: [bash(), bash()] })).toThrow(/granted twice/);
-  expect(() => defineAgent({ name: "frog", executor, actions: [{ state: null, name: "reply" }] })).toThrow(/core action/);
+test("loadGrant: defaults, batteries by name, a module executor; bad names, unknown keys, and unknown or repeated batteries are refused", async () => {
+  const paths = agentDir('name = "frog-1"\nbatteries = ["bash"]\n[executor]\nprovider = "openai"\nmodel = "gpt-x"\n', false);
+  await expect(loadGrant(paths)).rejects.toThrow(/no manifest: write .*manifest.md, or put it inline/);
+  writeFileSync(join(paths.agentDir, "manifest.md"), "# frog\n");
+  const grant = await loadGrant(paths);
+  expect(grant).toMatchObject({ name: "frog-1", manifest: { text: "# frog\n", path: join(paths.agentDir, "manifest.md") }, cwd: ".", inception: { rounds: 5 } });
+  const inline = await loadGrant(agentDir('name = "inline"\n[executor]\nprovider = "openai"\nmodel = "x"\n[manifest]\ntext = """\n# inline\n\nSay hi.\n"""\n', false));
+  expect(inline.manifest).toEqual({ text: "# inline\n\nSay hi.\n" });
+  expect(grant.batteries.map((b) => b.name)).toEqual(["bash"]);
+  expect(grant.executor.description).toBe("aisdk openai gpt-x");
+
+  writeFileSync(join(paths.agentDir, "exec.ts"), "export default { description: \"mine\", create: () => ({}) };\n");
+  expect((await loadGrant(agentDir('name = "m"\n[executor]\nmodule = "./exec.ts"\n'.replace("./exec.ts", join(paths.agentDir, "exec.ts"))))).executor.description).toBe("mine");
+
+  await expect(loadGrant(agentDir('name = "Frog"\n[executor]\nprovider = "openai"\nmodel = "x"\n'))).rejects.toThrow(/kebab-case/);
+  await expect(loadGrant(agentDir('name = "frog"\ncolour = 1\n[executor]\nprovider = "openai"\nmodel = "x"\n'))).rejects.toThrow(/colour/);
+  await expect(loadGrant(agentDir('name = "frog"\nbatteries = ["nope"]\n[executor]\nprovider = "openai"\nmodel = "x"\n'))).rejects.toThrow(/unknown battery "nope"; available: bash, evolve, scheduler/);
+  await expect(loadGrant(agentDir('name = "frog"\nbatteries = ["bash", "bash"]\n[executor]\nprovider = "openai"\nmodel = "x"\n'))).rejects.toThrow(/listed twice/);
+  await expect(loadGrant(agentDir('name = "frog"\n'))).rejects.toThrow(/executor/);
 });
 
 test("core actions: reply once through the runtime, compact emits a horizon, update_state writes by address", async () => {

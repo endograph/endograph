@@ -52,7 +52,7 @@ export function lookup(name: string): Entry | null {
     return null;
   }
   const dir = readlinkSync(link);
-  return { name, dir, exists: existsSync(join(dir, "endograph.ts")) };
+  return { name, dir, exists: existsSync(join(dir, "endograph.toml")) };
 }
 
 export function list(): Entry[] {
@@ -75,7 +75,7 @@ export function release(name: string): void {
 /** `--agent <name|dir>`: a directory holding a grant wins; otherwise the registry. Null when neither. */
 export function resolveAgent(arg: string): string | null {
   const dir = resolve(arg);
-  if (existsSync(join(dir, "endograph.ts"))) return dir;
+  if (existsSync(join(dir, "endograph.toml"))) return dir;
   if (!/[/.]/.test(arg)) {
     const entry = lookup(arg);
     if (entry?.exists) return entry.dir;

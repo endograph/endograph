@@ -1,5 +1,5 @@
 // .endo/program/agent.ts — written by inception 1 (2026-09-03). Do not edit:
-// change manifest.md or endograph.ts and run `endo incept`.
+// change manifest.md or endograph.toml and run `endo incept`.
 import { createNode, createSourceInstance, createState, defineProgram, tool, z } from "endograph";
 
 export default defineProgram((endo) => {

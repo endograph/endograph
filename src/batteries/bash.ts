@@ -1,7 +1,7 @@
 import { createAction, type AnyAction } from "@projectors/core";
 import { spawn } from "node:child_process";
 import { z } from "zod";
-import type { Battery } from "../grant/define.ts";
+import type { Battery } from "../grant/grant.ts";
 
 declare module "../program/define.ts" {
   interface GrantedActions {

@@ -14,7 +14,7 @@ import {
   type SerializedInstance,
   type StateDescriptor,
 } from "@projectors/core";
-import type { Grant } from "../grant/define.ts";
+import type { Grant } from "../grant/grant.ts";
 import type { Paths } from "../harness/paths.ts";
 import { compileProcedure, describeProcedures, type DescribeFailure, type ProcedureSpec } from "../procedures/describe.ts";
 import type { RunStarter } from "../procedures/runs.ts";

@@ -1,7 +1,7 @@
 import { actionResult, createAction, type AnyAction, type StateUpdate } from "@projectors/core";
 import { z } from "zod";
 import type { ReplyState } from "../protocol/wire.ts";
-import type { BatteryContext, Grant } from "./define.ts";
+import type { BatteryContext, Grant } from "./grant.ts";
 
 /**
  * The actions endo always contributes: the one that answers a request, the
@@ -103,9 +103,9 @@ export function coreActions(runtime: CoreRuntime): AnyAction[] {
   return [reply, compact, updateState];
 }
 
-/** Everything the grant puts in the charter: core, then each battery's, then pass-through. Names must not collide. */
+/** Everything the grant puts in the charter: core, then each battery's. Names must not collide. */
 export function grantActions(grant: Grant, ctx: BatteryContext, runtime: CoreRuntime): AnyAction[] {
-  const actions = [...coreActions(runtime), ...grant.batteries.flatMap((b) => b.actions?.(ctx) ?? []), ...grant.actions];
+  const actions = [...coreActions(runtime), ...grant.batteries.flatMap((b) => b.actions?.(ctx) ?? [])];
   const names = new Set<string>();
   for (const a of actions) {
     if (names.has(a.name)) throw new Error(`action "${a.name}" is granted twice`);

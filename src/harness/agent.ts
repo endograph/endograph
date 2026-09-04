@@ -1,10 +1,9 @@
 import { existsSync, readdirSync, readFileSync, statSync, unlinkSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { userInfo } from "node:os";
 import { join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
 import { collectRunnableActivations, normalizeSchema, runMachine, serializeInstance, type ProjectorExecutor } from "@projectors/core";
 import { grantActions } from "../grant/core.ts";
-import { isGrant, type Grant } from "../grant/define.ts";
+import { loadGrant, type Grant } from "../grant/grant.ts";
 import { loadAgent, LoadError, type Loaded } from "../program/load.ts";
 import { createRuns, type Runs, type RunRequest } from "../procedures/runs.ts";
 import { newId, PROTOCOL_VERSION, writeReply, type CallMessage, type Delivered, type Message, type Reply, type ReplyState, type RequestMessage } from "../protocol/wire.ts";
@@ -16,7 +15,7 @@ import { hashOf } from "../inception/incept.ts";
 import { lookup } from "../cli/registry.ts";
 import { liveRun } from "../procedures/runs.ts";
 import { loadEnv } from "./env.ts";
-import { copyGrant, ensureStateDir, pathsOf, type Paths } from "./paths.ts";
+import { ensureStateDir, pathsOf, type Paths } from "./paths.ts";
 
 /**
  * `endo up`, the running half: hold the lock, load the program, deliver
@@ -82,7 +81,7 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
   try {
     if (!existsSync(paths.program)) throw new NoProgram(`no program at ${paths.program}`);
     loadEnv(paths);
-    const grant = await importGrant(paths);
+    const grant = await loadGrant(paths);
     const name = grant.name;
     const cwd = resolve(paths.agentDir, grant.cwd);
     const store = openSqliteStore(paths.db);
@@ -425,13 +424,4 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
     lock.release();
     throw err;
   }
-}
-
-/** The grant, loaded from its copy under `.endo/` so `endograph` resolves; the copy is refreshed first. */
-export async function importGrant(paths: Paths): Promise<Grant> {
-  if (!existsSync(paths.grant)) throw new Error(`no grant at ${paths.grant}`);
-  const copy = copyGrant(paths);
-  const mod = (await import(`${pathToFileURL(copy).href}?t=${statSync(copy).mtimeMs}-${Date.now()}`)) as { default?: unknown };
-  if (!isGrant(mod.default)) throw new Error(`${paths.grant} must export default defineAgent(...)`);
-  return mod.default;
 }

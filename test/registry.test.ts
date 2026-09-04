@@ -6,7 +6,7 @@ import { claim, list, lookup, NameConflict, resolveAgent } from "../src/cli/regi
 
 function agentDir(): string {
   const dir = mkdtempSync(join(tmpdir(), "endo-agent-"));
-  writeFileSync(join(dir, "endograph.ts"), "export default {}\n");
+  writeFileSync(join(dir, "endograph.toml"), 'name = "x"\n');
   return dir;
 }
 

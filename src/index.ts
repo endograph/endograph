@@ -1,14 +1,12 @@
 /**
- * endograph: embedded agents on projector. Everything a grant, a program,
- * or a procedure imports comes from here (projector's primitives, and zod
- * for schemas), so one copy of each is in play and an agent directory
- * needs no dependencies of its own.
+ * endograph: embedded agents on projector. Everything a program or a
+ * procedure imports comes from here (projector's primitives, and zod for
+ * schemas), so one copy of each is in play and an agent directory needs
+ * no dependencies of its own. The grant is data (endograph.toml) and
+ * imports nothing.
  */
-export { defineAgent, type AgentConfig, type Battery, type BatteryContext, type Grant, type TickContext } from "./grant/define.ts";
-export { aisdk, type AiSdkOptions, type ExecutorSpec } from "./grant/executor.ts";
-export { bash } from "./batteries/bash.ts";
-export { evolve } from "./batteries/evolve.ts";
-export { scheduler } from "./batteries/scheduler.ts";
+export type { Battery, BatteryContext, Grant, TickContext } from "./grant/grant.ts";
+export type { ExecutorSpec } from "./grant/executor.ts";
 export { defineProgram, type Program, type ProgramResult, type Provisions } from "./program/define.ts";
 export {
   action,
