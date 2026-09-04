@@ -42,6 +42,7 @@ export const USAGE = `endo — embedded agents
 
 owner:
   endo up [--foreground] [--inceptor <cmd>]   run this directory's agent under launchd/systemd (incepting first when there is no program)
+  endo up --adopt                             run a state directory another host still holds (a copy, a synced mirror); the move is a frame
   endo down                                   stop the service and remove its unit
   endo logs [-f]                              the service log
   endo incept [--manual|--accept] [--inceptor <cmd>]

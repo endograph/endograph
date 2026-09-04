@@ -1,4 +1,4 @@
-import { lstatSync, mkdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 /** The agent directory and everything under `.endo/`, the state directory. */
@@ -60,9 +60,17 @@ export const ENDOGRAPH_ROOT = resolve(import.meta.dir, "../..");
  * one dependency the program and the procedures need is the package
  * linked here by `endo up`, so they resolve upward to it; a tsconfig
  * beside the link lets an editor and `bunx tsc` do the same.
+ *
+ * The state directory is written so that a copy of it, taken at any
+ * instant, is a valid state directory (the log is checkpointed at every
+ * quiescence). Its `.gitignore` names what a copy should leave behind:
+ * relinked on the next `up`, or meaningless off this machine. Written
+ * once; the owner's from then on.
  */
 export function ensureStateDir(paths: Paths): void {
   for (const dir of [paths.procedures, paths.inbox, paths.outbox, paths.runs, paths.snapshots, paths.modules]) mkdirSync(dir, { recursive: true });
+  const ignore = join(paths.state, ".gitignore");
+  if (!existsSync(ignore)) writeFileSync(ignore, GITIGNORE);
   const link = join(paths.modules, "endograph");
   let current: string | undefined;
   try {
@@ -78,6 +86,13 @@ export function ensureStateDir(paths: Paths): void {
 }
 
 /** `.endo/tsconfig.json`: the program and src typecheck against the linked endograph. Tooling, rewritten at every start. */
+const GITIGNORE = `# relinked by every \`endo up\`
+node_modules
+# empty after every quiescence; only this machine's SQLite reads them
+agent.db-wal
+agent.db-shm
+`;
+
 const TSCONFIG = {
   compilerOptions: {
     target: "ESNext",

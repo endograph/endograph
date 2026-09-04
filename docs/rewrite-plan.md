@@ -61,7 +61,7 @@ what the model should think about.
 | **agent directory** | The directory `endo up` runs in. Holds the owner's two files and the state directory. Its path is the agent's identity. |
 | **grant** | `endograph.toml`: name, manifest path, executor, batteries by name, inception options. Data, owner-written, validated at load, never reachable from the program. |
 | **manifest** | The owner's intent, in prose: `manifest.md` beside the grant, or inline in it. Input to every inception. Never handed to the running agent. |
-| **state directory** | `.endo/`: everything the agent is. The frame log, the program, `src`, the wire, snapshots. Gitignored. `rm -rf .endo` is a factory reset; the next `up` incepts a fresh agent from the owner's two files. |
+| **state directory** | `.endo/`: everything the agent is. The frame log, the program, `src`, the wire, snapshots. Gitignored. `rm -rf .endo` is a factory reset; the next `up` incepts a fresh agent from the owner's two files. Copy-safe, and may be mirrored to another machine; one host runs it (§12, `docs/persistence.md`). |
 | **program** | `.endo/program/agent.ts`: what inception wrote. Nodes, instructions, projections. Written only by inception; the running agent and the owner never edit it. |
 | **src** | `.endo/src/`: what the agent writes. Procedures, notes, whatever it keeps as files. Seeded by inception, owned by the agent. |
 | **provisions** | What the program function receives: the grant's actions and states, the compiled procedures, name, cwd, executor config. The narrowed view; `endo` in the examples. |
@@ -82,9 +82,11 @@ project-repo/agents/endofrog/     # AGENT DIRECTORY (two files; usually committe
   endograph.toml                  #   the GRANT
   manifest.md                     #   the MANIFEST
   .endo/                          #   STATE DIRECTORY (gitignored; everything the agent is)
+    .gitignore                    #     what a copy of the directory leaves behind (node_modules, the WAL); written once
     env                           #     KEY=VALUE credentials (mode 600), loaded at start
     endo.log                      #     the service's stdout/stderr
     lock                          #     flock held while running
+    status.json                   #     what `endo status` reads; the host that holds the directory (residence, §12)
     agent.db                      #     frame log + machine snapshot (SQLite)
     program/agent.ts              #     the PROGRAM: defineProgram((endo) => ...), inception-owned
     src/                          #     agent-owned: procedures/*.ts (§7), notes, anything
@@ -602,6 +604,14 @@ whenever `up` runs. Data, not code: any endo binary reads and writes it.
   more: future.
 - Bare `endo` lists the registered agents. A port is an address, not an
   identity.
+- Residence. A state directory may be mirrored to another machine (a
+  copy, a synced checkout; `docs/persistence.md`); exactly one host runs
+  it. `status.json` carries that host and whether it released (`down`,
+  Ctrl-C). `up` elsewhere refuses while it is held; `up --adopt` takes
+  it and records a `residence` frame. A running agent whose
+  `status.json` is replaced by a newer one from another host records the
+  move and stops: under a last-writer-wins mirror a double run becomes a
+  handoff.
 
 ## 13. Running
 
@@ -609,6 +619,7 @@ whenever `up` runs. Data, not code: any endo binary reads and writes it.
 endo up                      # in the agent directory: register, install the unit, start; incepts first (foreground) when there is no program
 endo up --foreground         # run in this terminal instead (debugging, tests); refuses while the service is loaded
 endo up --template <dir>     # seed endograph.toml + manifest.md from <dir>, then as above; with neither and no template, endo asks
+endo up --adopt              # run a state directory another host still holds (a copy, a synced mirror); the move is a frame
 endo down                    # stop the service and remove the unit
 endo logs [-f]               # the service log
 endo incept                  # re-incept now, with the agent stopped; --manual / --accept

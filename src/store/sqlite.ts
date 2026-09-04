@@ -5,7 +5,9 @@ import type { Frame, FrameInput, FrameStore, Snapshot } from "./types.ts";
  * SQLite backend: one file in the state directory. Copy it, back it up,
  * attach it to a bug report; the frame log is a plain table for `sqlite3`.
  * The envelope is mirrored into columns; the payload column holds the full
- * projector frame.
+ * projector frame. Writing the snapshot checkpoints the WAL into the main
+ * file, so between activations `agent.db` alone is the whole log and a
+ * copy of it is consistent.
  */
 export function openSqliteStore(path: string): FrameStore {
   const db = new Database(path, { create: true });
@@ -60,6 +62,7 @@ export function openSqliteStore(path: string): FrameStore {
         `INSERT INTO snapshot (id, as_of_seq, at, state) VALUES (1, ?, ?, ?)
          ON CONFLICT (id) DO UPDATE SET as_of_seq = excluded.as_of_seq, at = excluded.at, state = excluded.state`,
       ).run(s.asOfSeq, s.at, JSON.stringify(s.state));
+      db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
     },
     readSnapshot() {
       const row = db.prepare("SELECT as_of_seq, at, state FROM snapshot WHERE id = 1").get() as

@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   createToolActionRequest,
@@ -9,7 +9,9 @@ import {
   type ExecutorRunRequest,
   type ProjectorExecutor,
 } from "@projectors/core";
-import { openAgent, type Agent } from "../src/harness/agent.ts";
+import { HeldElsewhere, openAgent, type Agent } from "../src/harness/agent.ts";
+import { pathsOf } from "../src/harness/paths.ts";
+import { adopt } from "../src/harness/residence.ts";
 import { newId, PROTOCOL_VERSION, readReply, waitForReply, writeMessage } from "../src/protocol/wire.ts";
 import { answer, scripted } from "./fixtures/agent/scripted.ts";
 import { openSqliteStore } from "../src/store/sqlite.ts";
@@ -118,6 +120,7 @@ test("calls, requests, procedures that emit, reply-once, live reload, and recove
   expect(frames.find((f) => f.type === "call" && f.summary.startsWith("timer:"))?.summary).toBe("timer:nightly: nightly");
   expect(frames.find((f) => f.type === "request" && f.id === "from-other")?.summary).toBe("agent:other/deploy: 2+2?");
   expect(existsSync(join(dir, ".endo/tsconfig.json"))).toBe(true);
+  expect(readFileSync(join(dir, ".endo/.gitignore"), "utf8")).toMatch(/^node_modules$/m);
   expect(frames.filter((f) => f.type === "reply").map((f) => (f.payload as { text: string }).text)).toContain("checked");
   expect(frames.filter((f) => f.type === "request" && f.summary.includes("2+2 again"))).toEqual([]);
   // Simulate a crash: a request frame whose activation never completed, and one whose activation completed without a reply.
@@ -150,3 +153,28 @@ test("calls, requests, procedures that emit, reply-once, live reload, and recove
     await agent.stop();
   }
 }, 30000);
+
+test("residence: one host runs a state directory; a copy elsewhere refuses until adopted, and the holder stops when adopted", async () => {
+  const dir = scaffold();
+  const status = join(dir, ".endo/status.json");
+  const read = () => JSON.parse(readFileSync(status, "utf8"));
+  let adoptedBy: string | undefined;
+  let agent = await openAgent({ agentDir: dir, executor: scripted(answer), pollMs: 50, onAdopted: (h) => (adoptedBy = h) });
+  agent.start();
+  expect(read()).toMatchObject({ host: hostname(), running: true });
+  // Another host's newer status lands (a synced mirror): the agent records the move, stops writing, and asks to be stopped.
+  writeFileSync(status, JSON.stringify({ ...read(), host: "elsewhere", at: Date.now() + 1 }));
+  for (let i = 0; i < 100 && !adoptedBy; i++) await Bun.sleep(50);
+  expect(adoptedBy).toBe("elsewhere");
+  await agent.stop();
+  expect(read().host).toBe("elsewhere");
+  // This host now refuses; adopting records the move and restamps the status, released.
+  await expect(openAgent({ agentDir: dir, executor: scripted(answer) })).rejects.toBeInstanceOf(HeldElsewhere);
+  expect(adopt(pathsOf(dir))?.host).toBe("elsewhere");
+  agent = await openAgent({ agentDir: dir, executor: scripted(answer), pollMs: 50 });
+  await agent.stop();
+  expect(read()).toMatchObject({ host: hostname(), running: false });
+  const store = openSqliteStore(join(dir, ".endo/agent.db"));
+  expect([...allFrames(store)].filter((f) => f.type === "residence").map((f) => f.summary)).toEqual([expect.stringMatching(/^adopted by elsewhere/), expect.stringMatching(/^adopted from elsewhere/)]);
+  store.close();
+});

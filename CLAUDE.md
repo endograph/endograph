@@ -44,7 +44,9 @@ outside `src/` imports `@projectors/core`.
 - `src/harness/` — the running agent: the router (call → procedure
   process; request → frame → `runMachine` to quiescence), reply-once
   with harness-supplied failures and one re-drive after a restart, live
-  reload of procedures, the lock, `env`, the frame envelope.
+  reload of procedures, the lock, `env`, the frame envelope, residence
+  (one host runs a state directory; `up --adopt` moves it; see
+  `docs/persistence.md`).
 - `src/procedures/` — `endograph/procedure` (the script-side library:
   `procedure()`, `actionResult`, `emitMessage`, `waitForCompletion`,
   `waitForQuiescence`), describe mode (a child process per load), the
