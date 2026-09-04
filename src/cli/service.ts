@@ -4,10 +4,12 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /**
- * `endo up -d`: run the agent under the platform supervisor. launchd user
- * agent on macOS (now and at every login; KeepAlive restarts crashes but
- * not a clean exit, so a moved home does not crash-loop); systemd user
- * unit on Linux (lingering enabled so it survives logout).
+ * `endo up -d`: run the agent under the platform supervisor. A launchd user
+ * agent on macOS (now and at every login), a systemd user unit on Linux
+ * (lingering enabled so it survives logout). Units run `endo up --service`
+ * in the agent directory. Both restart a failure and leave a clean exit
+ * alone, so a service that exits 0 (a program that no longer loads) does
+ * not crash-loop.
  */
 
 export function serviceLabel(name: string): string {
@@ -36,18 +38,19 @@ export function serviceInfo(name: string): ServiceInfo {
   return { file, installed: existsSync(file) };
 }
 
-export async function installService(name: string, home: string): Promise<void> {
+export async function installService(name: string, agentDir: string): Promise<void> {
   const bun = process.execPath;
-  const log = join(home, "agent", "endo.log");
+  const log = join(agentDir, ".endo", "endo.log");
+  mkdirSync(join(agentDir, ".endo"), { recursive: true });
   if (platform() === "darwin") {
     const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>${esc(serviceLabel(name))}</string>
   <key>ProgramArguments</key><array>
-    <string>${esc(bun)}</string><string>${esc(cliPath())}</string><string>up</string><string>${esc(home)}</string><string>--service</string>
+    <string>${esc(bun)}</string><string>${esc(cliPath())}</string><string>up</string><string>--service</string>
   </array>
-  <key>WorkingDirectory</key><string>${esc(home)}</string>
+  <key>WorkingDirectory</key><string>${esc(agentDir)}</string>
   <key>EnvironmentVariables</key><dict><key>PATH</key><string>${esc(process.env.PATH ?? "/usr/bin:/bin")}</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
@@ -74,8 +77,8 @@ export async function installService(name: string, home: string): Promise<void> 
 Description=endograph agent ${name}
 
 [Service]
-ExecStart=${bun} ${cliPath()} up ${home} --service
-WorkingDirectory=${home}
+ExecStart=${bun} ${cliPath()} up --service
+WorkingDirectory=${agentDir}
 Environment=PATH=${process.env.PATH ?? "/usr/bin:/bin"}
 Restart=on-failure
 RestartSec=10

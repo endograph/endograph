@@ -1,0 +1,136 @@
+import { expect, test } from "bun:test";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import {
+  createToolActionRequest,
+  executeActionInvocation,
+  type ExecuteActionResult,
+  type ExecutorRunRequest,
+  type ProjectorExecutor,
+} from "@projectors/core";
+import { openAgent, type Agent } from "../src/harness/agent.ts";
+import { newId, PROTOCOL_VERSION, readReply, waitForReply, writeMessage } from "../src/protocol/wire.ts";
+import { answer, scripted } from "./fixtures/agent/scripted.ts";
+import { openSqliteStore } from "../src/store/sqlite.ts";
+import { allFrames } from "../src/store/types.ts";
+
+export const ROOT = resolve(import.meta.dir, "..");
+
+/**
+ * A fresh agent directory from the fixtures: the grant and manifest, and
+ * unless told otherwise the program and three procedures under `.endo/`.
+ * Nothing is rewritten: `endo` links endograph into `.endo/node_modules`
+ * and everything resolves upward to it. The fixture executor sits beside
+ * the grant's copy under `.endo/`; its projector import is the one thing
+ * a test fixture needs that an agent never does.
+ */
+export function scaffold(opts: { program?: boolean; procedures?: boolean } = {}): string {
+  const dir = mkdtempSync(join(tmpdir(), "endo-agent-"));
+  cpSync(join(ROOT, "test/fixtures/agent"), dir, { recursive: true });
+  mkdirSync(join(dir, ".endo"), { recursive: true });
+  writeFileSync(join(dir, ".endo/scripted.ts"), readFileSync(join(dir, "scripted.ts"), "utf8").replaceAll('"@projectors/core"', `"${import.meta.resolve("@projectors/core")}"`));
+  rmSync(join(dir, "scripted.ts"));
+  if (opts.program !== false) {
+    mkdirSync(join(dir, ".endo/program"), { recursive: true });
+    cpSync(join(ROOT, "test/fixtures/program.ts"), join(dir, ".endo/program/agent.ts"));
+  }
+  if (opts.procedures !== false) {
+    mkdirSync(join(dir, ".endo/src/procedures"), { recursive: true });
+    for (const p of ["hello", "ask", "broken", "nightly"]) cpSync(join(ROOT, `test/fixtures/procedures/${p}.ts`), join(dir, `.endo/src/procedures/${p}.ts`));
+  }
+  return dir;
+}
+
+const send = (agent: Agent, text: string, id = newId()) => (writeMessage(agent.paths.inbox, { v: PROTOCOL_VERSION, kind: "request", id, text, at: Date.now() }), id);
+const callProc = (agent: Agent, procedure: string, args: Record<string, unknown> = {}, id = newId()) =>
+  (writeMessage(agent.paths.inbox, { v: PROTOCOL_VERSION, kind: "call", id, procedure, args, at: Date.now() }), id);
+const wait = (agent: Agent, id: string, terminal = true) => waitForReply(agent.paths.outbox, id, { timeoutMs: 15000, pollMs: 25, terminal });
+
+test("calls, requests, procedures that emit, reply-once, live reload, and recovery after a restart", async () => {
+  const dir = scaffold();
+  let agent = await openAgent({ agentDir: dir, executor: scripted(answer), pollMs: 50, activationTimeoutMs: 800 });
+  expect(agent.loaded.procedures.map((p) => p.name)).toEqual(["ask", "hello", "nightly"]);
+  expect(agent.loaded.failures.map((f) => f.name)).toEqual(["broken"]);
+  agent.start();
+  try {
+    // A call runs its procedure without the model; unknown names and bad args are rejected deterministically.
+    expect((await wait(agent, callProc(agent, "hello", { NAME: "x" })))?.text).toBe("hello x");
+    expect(await wait(agent, callProc(agent, "nope"))).toMatchObject({ state: "rejected", text: expect.stringMatching(/exposed: ask, hello/) });
+    expect(await wait(agent, callProc(agent, "hello", {}))).toMatchObject({ state: "rejected", text: expect.stringMatching(/invalid args/) });
+
+    // A request wakes the model; here it runs a procedure as a tool and answers with the result.
+    expect((await wait(agent, send(agent, "say hello")))?.text).toBe("hello bob");
+    expect((await wait(agent, send(agent, "note this please")))?.text).toBe("seen from local:" + (process.env.USER ?? ""));
+
+    // A request the program never answers is failed by the harness when the activation ends; a hang is aborted.
+    expect(await wait(agent, send(agent, "ignore me"))).toMatchObject({ ok: false, state: "failed", text: expect.stringMatching(/ended without a reply/) });
+    expect(await wait(agent, send(agent, "hang"))).toMatchObject({ ok: false, state: "failed", text: expect.stringMatching(/timed out/) });
+
+    // A procedure acks, emits a message to its agent (stamped as the procedure), waits for the answer, and completes.
+    const ask = callProc(agent, "ask");
+    expect(await wait(agent, ask, false)).toMatchObject({ state: "working", text: "asking" });
+    expect(await wait(agent, ask)).toMatchObject({ ok: true, state: "completed", text: "agent said: 4" });
+
+    // evolve: a spawn naming an unknown tool is refused with the granted names; the retry lands as an instance frame.
+    expect((await wait(agent, send(agent, "spawn a helper")))?.text).toMatch(/unknown tools: nope; granted: .*bash/);
+    expect(agent.loaded.machine.instance.children?.map((c) => c.node.key)).toEqual(["helper"]);
+
+    // scheduler: a tick starts the due procedure as a timer call.
+    await agent.tick(Date.now());
+    for (let i = 0; i < 100 && agent.runs.active().length; i++) await Bun.sleep(50);
+
+    // A duplicate id is dropped; a second terminal reply is refused.
+    const first = send(agent, "2+2?");
+    expect((await wait(agent, first))?.text).toBe("4");
+    send(agent, "2+2 again", first);
+    await agent.poll();
+    expect(readReply(agent.paths.outbox, first)?.text).toBe("4");
+    expect(agent.reply(first, { ok: true, state: "completed", text: "again" })).toMatch(/no open request/);
+
+    // A new procedure file is picked up between activations.
+    writeFileSync(join(dir, ".endo/src/procedures/bye.ts"), readFileSync(join(ROOT, "test/fixtures/procedures/hello.ts"), "utf8").replaceAll("hello", "bye"));
+    for (let i = 0; i < 100 && !agent.loaded.procedures.some((p) => p.name === "bye"); i++) await Bun.sleep(50);
+    expect((await wait(agent, callProc(agent, "bye", { NAME: "now" })))?.text).toBe("bye now");
+  } finally {
+    await agent.stop();
+  }
+
+  const store = openSqliteStore(join(dir, ".endo/agent.db"));
+  const frames = [...allFrames(store)];
+  const emitted = frames.find((f) => f.type === "request" && f.summary.includes("2+2?") && f.summary.startsWith("agent:"));
+  expect(emitted?.summary).toBe("agent:fixture/ask: what is 2+2?");
+  expect(frames.find((f) => f.type === "procedure")?.summary).toMatch(/broken failed to describe/);
+  expect(frames.find((f) => f.type === "call" && f.summary.startsWith("timer:"))?.summary).toBe("timer:nightly: nightly");
+  expect(frames.filter((f) => f.type === "reply").map((f) => (f.payload as { text: string }).text)).toContain("checked");
+  expect(frames.filter((f) => f.type === "request" && f.summary.includes("2+2 again"))).toEqual([]);
+  // Simulate a crash: a request frame whose activation never completed, and one whose activation completed without a reply.
+  const lost = (id: string, completed: boolean) => ({
+    type: "request",
+    summary: `local:t: ${id}`,
+    id,
+    at: Date.now(),
+    payload: {
+      id: `frame-${id}`,
+      messages: [
+        { type: "user", text: `[request id=${id} from=local:t]\n2+2?`, actor: { id: "local:t", label: "local:t" } },
+        // What the machine appends at enqueue: the scheduled activation. A crash leaves it without a completion.
+        { type: "work", kind: "activation", activationId: `activation:${id}`, generatorId: "instance:agent", sourceFrameId: `frame-${id}`, concurrencyKey: "instance:agent", concurrency: "serial" },
+        ...(completed ? [{ type: "work", kind: "completion", activationId: `activation:${id}`, generatorId: "instance:agent", sourceFrameId: `frame-${id}`, reason: "end-turn" }] : []),
+      ],
+      metadata: { endo: { type: "request", summary: id, id, ids: [id], at: Date.now(), requests: [{ v: 1, kind: "request", id, from: "local:t", text: "2+2?", at: 1 }] } },
+    },
+  });
+  store.append(lost("lost-live", false));
+  store.append(lost("lost-done", true));
+  store.close();
+
+  agent = await openAgent({ agentDir: dir, executor: scripted(answer), pollMs: 50 });
+  try {
+    expect(readReply(agent.paths.outbox, "lost-done")).toMatchObject({ state: "failed", text: expect.stringMatching(/restarted/) });
+    expect((await wait(agent, "lost-live"))?.text).toBe("4");
+    expect(agent.status().open).toEqual([]);
+  } finally {
+    await agent.stop();
+  }
+}, 30000);

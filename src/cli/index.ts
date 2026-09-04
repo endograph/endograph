@@ -1,561 +1,445 @@
 #!/usr/bin/env bun
-import { existsSync, readdirSync, realpathSync, rmSync, symlinkSync, unlinkSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { resolve } from "node:path";
-import type { CliCommand } from "../agent/define.ts";
-import {
-  createHome,
-  defaultHome,
-  DECLARATION_FILE,
-  homePaths,
-  isDeclarationDir,
-  isHomeDir,
-  isRunning,
-  readDeclarationLink,
-  type HomePaths,
-} from "../agent/home.ts";
-import { loadDeclaration, type LoadedDeclaration } from "../agent/load.ts";
-import { claim, findByDeclaration, list as listRegistry, lookup, NameConflict } from "../agent/registry.ts";
-import { AlreadyRunning, openAgent } from "../agent/run.ts";
-import { localPrincipal, newIncident, readReply, waitForReply, writeMessage, PROTOCOL_VERSION, type Reply } from "../inbox/protocol.ts";
-import { loadPlaybook } from "../playbook/parse.ts";
-import { isEntryMap } from "../world/model.ts";
+import { openAgent, AlreadyRunning, NoProgram } from "../harness/agent.ts";
+import { isLocked } from "../harness/lock.ts";
+import { pathsOf } from "../harness/paths.ts";
+import { incept, InceptionFailed } from "../inception/incept.ts";
+import { newId, PROTOCOL_VERSION, waitForReply, writeMessage } from "../protocol/wire.ts";
 import { openSqliteStore } from "../store/sqlite.ts";
-import { bold, dim, fmtFrame, framesAbout, framesOfIncident, openIncidents, recentFrames, worldModel } from "./query.ts";
+import { allFrames } from "../store/types.ts";
+import { framesAbout, printFrame } from "./frames.ts";
+import { claim, list, lookup, NameConflict, release, resolveAgent } from "./registry.ts";
 import { installService, removeService, serviceInfo, serviceRunning } from "./service.ts";
-
-const USAGE = `endo — embedded agents: a declaration, a mandate, an inbox, a playbook, a frame log
-
-consumer commands (address an agent with --agent <name|home|declaration dir>, or run inside one):
-  endo send [--ref r] [--wait] [--timeout s] <text…>   prose request; prints the incident id
-  endo call <procedure> [KEY=VAL…] [--wait]            run an exposed procedure deterministically
-  endo wait <incident> [--timeout s]                   block until the reply (exit 0 ok / 1 not ok / 2 timeout)
-  endo commands                                        exposed procedures and their args
-  endo status                                          world model, open requests, recent frames
-  endo why <thing>                                     recent frames about a subject or incident
-  endo replay <incident>                               every frame of one incident
-
-owner commands:
-  endo up [dir] [--home <dir>] [--declaration <dir>]   run the agent here (dir = declaration or home; cwd if omitted)
-  endo up -d [dir]                                     …under launchd/systemd: now, at every login, after crashes
-  endo down                                            stop the service and remove its unit
-  endo <session> [ask…]                                a standing session a battery declares (learn, capex, …)
-  endo reply <incident> [--failed] <text…>             answer on the agent's behalf (background jobs)
-  endo world set <subject> [--state s] [--kind k] [--data json] <summary…> | world clear <subject>
-  endo reset --force                                   wipe agent/ (log, inbox, src); keep declaration link and env
-  endo doctor                                          registry, lock, links, service, credentials
-  endo                                                 registered agents on this machine
-`;
+import { fromTemplate, interactiveSetup } from "./setup.ts";
+import { USAGE } from "./usage.ts";
 
 interface Flags {
   agent?: string;
-  home?: string;
-  declaration?: string;
-  ref?: string;
+  inceptor?: string;
+  manual: boolean;
+  accept: boolean;
   wait: boolean;
-  detach: boolean;
-  /** Set by the unit launchd/systemd runs: we are the service. */
+  follow: boolean;
+  foreground: boolean;
   service: boolean;
   force: boolean;
-  failed: boolean;
-  timeout?: number;
-  state?: string;
-  kind?: string;
-  data?: string;
+  template?: string;
+  id?: string;
+  ref?: string;
   rest: string[];
 }
 
-function parseFlags(argv: string[]): Flags {
-  const f: Flags = { wait: false, detach: false, service: false, force: false, failed: false, rest: [] };
+function parse(argv: string[]): { command: string; flags: Flags } {
+  const flags: Flags = { manual: false, accept: false, wait: false, follow: false, foreground: false, service: false, force: false, rest: [] };
+  let command = "";
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
-    const next = () => argv[++i] ?? "";
-    if (a === "--agent") f.agent = next();
-    else if (a === "--home") f.home = next();
-    else if (a === "--declaration") f.declaration = next();
-    else if (a === "--ref") f.ref = next();
-    else if (a === "--timeout") f.timeout = Number(next());
-    else if (a === "--state") f.state = next();
-    else if (a === "--kind") f.kind = next();
-    else if (a === "--data") f.data = next();
-    else if (a === "--wait") f.wait = true;
-    else if (a === "-d" || a === "--detach") f.detach = true;
-    else if (a === "--service") f.service = true;
-    else if (a === "--force") f.force = true;
-    else if (a === "--failed") f.failed = true;
-    else f.rest.push(a);
+    if (a === "--agent") flags.agent = argv[++i];
+    else if (a === "--inceptor") flags.inceptor = argv[++i];
+    else if (a === "--manual") flags.manual = true;
+    else if (a === "--accept") flags.accept = true;
+    else if (a === "--wait") flags.wait = true;
+    else if (a === "-f" || a === "--follow") flags.follow = true;
+    else if (a === "--foreground") flags.foreground = true;
+    else if (a === "--service") flags.service = true;
+    else if (a === "--force") flags.force = true;
+    else if (a === "--template") flags.template = argv[++i];
+    else if (a === "--id") flags.id = argv[++i];
+    else if (a === "--ref") flags.ref = argv[++i];
+    else if (!command) command = a;
+    else flags.rest.push(a);
   }
-  return f;
+  return { command, flags };
 }
 
-function expandHome(p: string): string {
-  return p.startsWith("~") ? resolve(homedir(), p.slice(2)) : resolve(p);
+const say = (line: string) => console.log(line);
+const notRunning = () => {
+  throw new Error("the agent is not running");
+};
+
+/** The agent directory a command targets: `--agent`, else the current directory. It must hold a grant. */
+function target(flags: Flags): ReturnType<typeof pathsOf> | null {
+  const dir = flags.agent ? resolveAgent(flags.agent) : existsSync(resolve("endograph.ts")) ? process.cwd() : null;
+  if (dir) return pathsOf(dir);
+  console.error(flags.agent ? `no agent "${flags.agent}": not a registered name and no endograph.ts at that path` : `no endograph.ts in ${process.cwd()}; run in the agent directory or pass --agent <name|dir>`);
+  return null;
 }
 
-/**
- * Resolve the home to operate on: a home dir, a declaration dir (through
- * the registry, else its default home), or a registry name. Never walks up.
- */
-function resolveHome(target: string | undefined): HomePaths {
-  const t = target ?? process.env.ENDO_AGENT ?? process.cwd();
-  const looksLikePath = t.includes("/") || t.startsWith(".") || t.startsWith("~") || t === process.cwd();
-  if (looksLikePath) {
-    const dir = expandHome(t);
-    if (isHomeDir(dir)) return homePaths(realpathSync(dir), readDeclarationLink(dir));
-    if (isDeclarationDir(dir)) {
-      const registered = findByDeclaration(dir);
-      if (registered) return homePaths(realpathSync(registered.home), readDeclarationLink(registered.home));
-      const candidates = existingDefaultHomes(realpathSync(dir));
-      if (candidates.length === 1) return homePaths(candidates[0]!, readDeclarationLink(candidates[0]!));
-      throw new Error(`${dir} is a declaration that has not been started here (no home); run \`endo up\` in it first`);
+/** Load the grant once to learn the name (claiming the registry needs it before the harness runs). */
+async function agentName(paths: ReturnType<typeof pathsOf>): Promise<string> {
+  const { importGrant } = await import("../harness/agent.ts");
+  const { ensureStateDir } = await import("../harness/paths.ts");
+  ensureStateDir(paths);
+  return (await importGrant(paths)).name;
+}
+
+async function up(flags: Flags): Promise<number> {
+  if (!flags.agent && !existsSync(resolve("endograph.ts"))) {
+    if (flags.template) {
+      const err = fromTemplate(process.cwd(), flags.template);
+      if (err) {
+        console.error(err);
+        return 1;
+      }
+      say(`endograph.ts and manifest.md copied from ${flags.template}`);
+    } else if (flags.service) {
+      console.error(`no endograph.ts in ${process.cwd()}`);
+      return 0;
+    } else {
+      say(`no endograph.ts in ${process.cwd()}: setting up a new agent here`);
+      await interactiveSetup(process.cwd(), async (q, fallback) => {
+        const answer = (prompt(`${q}${fallback ? ` [${fallback}]` : ""}:`) ?? "").trim();
+        return answer || fallback || "";
+      });
+      say("wrote endograph.ts and manifest.md; edit manifest.md before inception if the stub is not enough");
     }
-    throw new Error(`${dir} is neither a home (declaration link) nor a declaration (${DECLARATION_FILE})`);
   }
-  const entry = lookup(t);
-  if (!entry) throw new Error(`no agent "${t}" registered; known: ${listRegistry().map((e) => e.name).join(", ") || "(none)"}`);
-  if (!entry.exists) throw new Error(`agent "${t}" is registered at ${entry.home}, which is gone; run \`endo up\` from its new location`);
-  return homePaths(realpathSync(entry.home), readDeclarationLink(entry.home));
-}
-
-function existingDefaultHomes(declarationDir: string): string[] {
-  const base = resolve(declarationDir, ".endo");
-  if (!existsSync(base)) return [];
-  return readdirSync(base)
-    .map((n) => resolve(base, n))
-    .filter((p) => isHomeDir(p));
-}
-
-/** The registered name of a home, if any (reverse lookup; no declaration import). */
-function nameOf(home: HomePaths): string | undefined {
-  for (const e of listRegistry()) {
+  const paths = target(flags);
+  if (!paths) return 1;
+  let name: string;
+  try {
+    name = await agentName(paths);
+    claim(name, paths.agentDir);
+  } catch (err) {
+    console.error(err instanceof NameConflict ? err.message : `cannot load ${paths.grant}: ${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
+  if (!existsSync(paths.program)) {
+    if (flags.service) {
+      console.error("no program; run `endo up` in a terminal so inception can run");
+      return 0;
+    }
+    say("no program: running inception 1");
     try {
-      if (e.exists && realpathSync(e.home) === home.root) return e.name;
-    } catch {}
+      await incept({ agentDir: paths.agentDir, inceptor: flags.inceptor, log: say });
+    } catch (err) {
+      console.error(err instanceof InceptionFailed ? err.message : `inception failed: ${err instanceof Error ? err.message : String(err)}`);
+      return 1;
+    }
   }
-  return undefined;
+  if (!flags.foreground && !flags.service) {
+    if (isLocked(paths.lock) && !(await serviceRunning(name).catch(() => false))) {
+      console.error(`${name} is running in the foreground somewhere; stop it first`);
+      return 1;
+    }
+    try {
+      await installService(name, paths.agentDir);
+    } catch (err) {
+      console.error(`could not install the service: ${err instanceof Error ? err.message : String(err)}`);
+      return 1;
+    }
+    say(`${name} is up under ${process.platform === "darwin" ? "launchd" : "systemd"} from ${paths.agentDir}: now, at every login, after crashes`);
+    say(`  endo --agent ${name} status | endo logs -f | endo down`);
+    return 0;
+  }
+  if (flags.foreground && (await serviceRunning(name).catch(() => false))) {
+    console.error(`${name} is running as a service; \`endo down\` first, or watch it with \`endo logs -f\``);
+    return 1;
+  }
+  try {
+    const agent = await openAgent({ agentDir: paths.agentDir });
+    agent.start();
+    say(`${agent.name} up in ${paths.agentDir} (${agent.loaded.procedures.length} procedures)`);
+    const stop = async () => {
+      await agent.stop();
+      process.exit(0);
+    };
+    process.on("SIGINT", () => void stop());
+    process.on("SIGTERM", () => void stop());
+    await new Promise(() => {});
+    return 0;
+  } catch (err) {
+    if (err instanceof AlreadyRunning || err instanceof NoProgram) console.error(err.message);
+    else console.error(`${err instanceof Error ? err.message : String(err)}\nrun \`endo incept\` to rewrite the program`);
+    // A service exits 0 so the supervisor does not crash-loop; the foreground says what to do.
+    return flags.service ? 0 : 1;
+  }
 }
 
-async function main(): Promise<number> {
-  const parsed = parseFlags(process.argv.slice(2));
-  const [command, ...positional] = parsed.rest;
-  const f: Flags = { ...parsed, rest: positional };
-  if (!command) return cmdList();
-  if (command === "help" || command === "--help" || command === "-h") return (console.log(USAGE), 0);
-  switch (command) {
-    case "up":
-      return cmdUp(f);
-    case "down":
-      return cmdDown(f);
-    case "send":
-      return cmdSend(f);
-    case "call":
-      return cmdCall(f);
-    case "wait":
-      return cmdWait(f);
-    case "commands":
-      return cmdCommands(f);
-    case "status":
-      return cmdStatus(f);
-    case "why":
-      return cmdWhy(f);
-    case "replay":
-      return cmdReplay(f);
-    case "reply":
-      return cmdReply(f);
-    case "world":
-      return cmdWorld(f);
-    case "reset":
-      return cmdReset(f);
-    case "doctor":
-      return cmdDoctor(f);
-    default:
-      return cmdBattery(command, f);
+async function down(flags: Flags): Promise<number> {
+  const paths = target(flags);
+  if (!paths) return 1;
+  const name = await agentName(paths);
+  const removed = await removeService(name);
+  say(removed ? `${name} stopped and its unit removed` : `${name}: no service unit${isLocked(paths.lock) ? " (a foreground `endo up` is running; Ctrl-C it)" : ""}`);
+  return 0;
+}
+
+async function logs(flags: Flags): Promise<number> {
+  const paths = target(flags);
+  if (!paths) return 1;
+  if (!existsSync(paths.log)) {
+    say(`no log yet at ${paths.log}`);
+    return 0;
+  }
+  const text = readFileSync(paths.log, "utf8");
+  const lines = text.split("\n");
+  say(lines.slice(-50).join("\n").trimEnd());
+  if (!flags.follow) return 0;
+  let offset = statSync(paths.log).size;
+  for (;;) {
+    await Bun.sleep(500);
+    const size = statSync(paths.log).size;
+    if (size > offset) {
+      process.stdout.write(readFileSync(paths.log, "utf8").slice(offset));
+      offset = size;
+    } else if (size < offset) offset = 0;
   }
 }
 
-function cmdList(): number {
-  const entries = listRegistry();
+async function listAgents(): Promise<number> {
+  const entries = list();
   if (entries.length === 0) {
-    console.log(dim("no agents registered on this machine — run `endo up` in a declaration directory"));
+    say("no agents registered; `endo up` in an agent directory registers it");
     return 0;
   }
   for (const e of entries) {
-    const running = e.exists && isRunning(homePaths(e.home, "").lockPath);
-    console.log(`${e.name.padEnd(20)} ${e.exists ? (running ? "running" : "stopped") : "MISSING"}  ${e.home}`);
+    const state = !e.exists ? "gone" : isLocked(pathsOf(e.dir).lock) ? "up" : "down";
+    say(`${e.name.padEnd(20)} ${state.padEnd(5)} ${e.dir}`);
   }
-  if (isDeclarationDir(process.cwd())) console.log(dim(`\n(cwd holds a declaration: ${resolve(process.cwd(), DECLARATION_FILE)})`));
   return 0;
 }
 
-/** up: declaration or home → (load, ensure home, claim) → foreground loop or service. */
-async function cmdUp(f: Flags): Promise<number> {
-  const dir = expandHome(f.rest[0] ?? process.cwd());
-  let declarationDir: string;
-  let homeRoot: string | undefined;
-  if (isHomeDir(dir)) {
-    homeRoot = realpathSync(dir);
-    if (f.declaration) {
-      // Repair a stale link.
-      unlinkSync(resolve(dir, "declaration"));
-      symlinkSync(realpathSync(expandHome(f.declaration)), resolve(dir, "declaration"));
-    }
-    declarationDir = readDeclarationLink(dir);
-  } else if (isDeclarationDir(dir)) {
-    declarationDir = realpathSync(dir);
-  } else {
-    console.error(`${dir} is neither a declaration directory (${DECLARATION_FILE}) nor a home; pass one`);
-    return 2;
+async function inceptCommand(flags: Flags): Promise<number> {
+  const paths = target(flags);
+  if (!paths) return 1;
+  try {
+    const result = await incept({ agentDir: paths.agentDir, inceptor: flags.inceptor, manual: flags.manual, accept: flags.accept, log: say });
+    if ("manual" in result) say(`run your coding agent in ${paths.agentDir}, then \`endo incept --accept\``);
+    return 0;
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    return 1;
   }
-  const loaded = await loadDeclaration(declarationDir);
-  const name = loaded.definition.name;
-  if (!homeRoot) {
-    const registered = findByDeclaration(declarationDir);
-    if (registered && f.home && realpathSync(registered.home) !== realpathSync(expandHome(f.home))) {
-      console.error(`${name} already has a home at ${registered.home}; --home would create a second one`);
+}
+
+/** What `send` says about its caller: the current directory and its git HEAD. */
+function callerContext(): { origin: string; ref?: string } {
+  const origin = realpathSync(process.cwd());
+  const git = (args: string[]) => {
+    const r = Bun.spawnSync(["git", "-C", origin, ...args], { stdout: "pipe", stderr: "ignore" });
+    return r.exitCode === 0 ? r.stdout.toString().trim() : null;
+  };
+  const head = git(["rev-parse", "HEAD"]);
+  if (!head) return { origin };
+  const dirty = git(["status", "--porcelain"]);
+  return { origin, ref: dirty ? `${head}-dirty` : head };
+}
+
+async function send(flags: Flags): Promise<number> {
+  const text = flags.rest.join(" ").trim();
+  if (!text) return usage();
+  const paths = target(flags);
+  if (!paths) return 1;
+  const id = flags.id ?? newId();
+  const caller = callerContext();
+  writeMessage(paths.inbox, { v: PROTOCOL_VERSION, kind: "request", id, text, origin: caller.origin, ref: flags.ref ?? caller.ref, at: Date.now() });
+  if (!flags.wait) {
+    say(id);
+    return 0;
+  }
+  return await waitAndPrint(paths.outbox, id);
+}
+
+async function call(flags: Flags): Promise<number> {
+  const [procedure, ...pairs] = flags.rest;
+  if (!procedure) return usage();
+  const args: Record<string, unknown> = {};
+  for (const pair of pairs) {
+    const eq = pair.indexOf("=");
+    if (eq < 1) {
+      console.error(`args are KEY=VAL: ${pair}`);
       return 2;
     }
-    homeRoot = registered ? realpathSync(registered.home) : expandHome(f.home ?? defaultHome(declarationDir, name));
+    args[pair.slice(0, eq)] = pair.slice(eq + 1);
   }
-  const home = createHome(homeRoot, declarationDir);
+  const paths = target(flags);
+  if (!paths) return 1;
+  const id = flags.id ?? newId();
+  writeMessage(paths.inbox, { v: PROTOCOL_VERSION, kind: "call", id, procedure, args, origin: callerContext().origin, at: Date.now() });
+  return await waitAndPrint(paths.outbox, id, flags.wait);
+}
 
-  if (f.detach) {
-    try {
-      claim(name, home.root);
-    } catch (err) {
-      if (err instanceof NameConflict) return (console.error(err.message), 2);
-      throw err;
-    }
-    await installService(name, home.root);
-    console.log(`${name} running under the service manager from ${home.root} — now, at every login, after crashes`);
-    return 0;
-  }
+async function waitAndPrint(outbox: string, id: string, terminal = true): Promise<number> {
+  const reply = await waitForReply(outbox, id, { timeoutMs: 24 * 60 * 60 * 1000, pollMs: 200, terminal });
+  if (!reply) return 1;
+  say(reply.text);
+  return reply.ok || reply.state === "working" ? 0 : 1;
+}
 
-  if (!f.service && (await serviceRunning(name).catch(() => false))) {
-    console.error(`${name} is running as a service (endo down to stop it, or endo status to watch)`);
-    return 2;
-  }
-  let agent;
+async function wait(flags: Flags): Promise<number> {
+  const id = flags.rest[0];
+  if (!id) return usage();
+  const paths = target(flags);
+  return paths ? waitAndPrint(paths.outbox, id) : 1;
+}
+
+interface StatusFile {
+  name: string;
+  open: string[];
+  runs: unknown[];
+  active: boolean;
+  at: number;
+  commands?: { name: string; description: string; args: Record<string, unknown>; required: string[] }[];
+}
+
+function readStatus(paths: ReturnType<typeof pathsOf>): StatusFile | null {
   try {
-    agent = await openAgent({ home, loaded, onFrame: (input) => console.log(fmtFrame({ ...input, seq: 0 })) });
-  } catch (err) {
-    if (err instanceof AlreadyRunning || err instanceof NameConflict) return (console.error(err.message), 2);
-    throw err;
-  }
-  console.log(bold(`${name} up`) + dim(` — home ${home.root}, cwd ${loaded.cwd}, ${loaded.definition.batteries.map((b) => b.name).join(", ") || "no batteries"}`));
-  agent.start();
-  const stop = async () => {
-    console.log(dim("stopping…"));
-    await agent.stop();
-    process.exit(0);
-  };
-  process.on("SIGINT", stop);
-  process.on("SIGTERM", stop);
-  await new Promise(() => {});
-  return 0;
-}
-
-async function cmdDown(f: Flags): Promise<number> {
-  const home = resolveHome(f.agent ?? f.rest[0]);
-  const name = nameOf(home);
-  if (!name) return (console.error(`${home.root} is not registered`), 2);
-  const removed = await removeService(name);
-  console.log(removed ? `${name} stopped and its unit removed` : `${name}: no service unit${isRunning(home.lockPath) ? " (a foreground `endo up` is running; Ctrl-C it)" : ""}`);
-  return 0;
-}
-
-function principal(): string {
-  return localPrincipal();
-}
-
-async function cmdSend(f: Flags): Promise<number> {
-  const home = resolveHome(f.agent);
-  const text = f.rest.join(" ").trim();
-  if (!text) return (console.error("usage: endo send [--ref r] [--wait] <text…>"), 2);
-  const incident = newIncident();
-  writeMessage(home.inboxDir, {
-    v: PROTOCOL_VERSION,
-    kind: "request",
-    incident,
-    from: principal(),
-    origin: process.cwd(),
-    ref: f.ref ?? (await gitRef(process.cwd())),
-    text,
-    at: Date.now(),
-  });
-  console.log(incident);
-  warnIfDown(home);
-  return f.wait ? waitAndPrint(home, incident, f.timeout) : 0;
-}
-
-async function cmdCall(f: Flags): Promise<number> {
-  const home = resolveHome(f.agent);
-  const [procedure, ...rest] = f.rest;
-  if (!procedure) return (console.error("usage: endo call <procedure> [KEY=VAL…] [--wait]"), 2);
-  const args: Record<string, string> = {};
-  for (const kv of rest) {
-    const m = kv.match(/^([A-Z][A-Z0-9_]*)=(.*)$/s);
-    if (!m) return (console.error(`bad arg ${kv}: expected KEY=VAL with an UPPER_SNAKE key`), 2);
-    args[m[1]!] = m[2]!;
-  }
-  const incident = newIncident();
-  writeMessage(home.inboxDir, { v: PROTOCOL_VERSION, kind: "call", incident, from: principal(), origin: process.cwd(), procedure, args, at: Date.now() });
-  console.log(incident);
-  warnIfDown(home);
-  return f.wait ? waitAndPrint(home, incident, f.timeout) : 0;
-}
-
-async function cmdWait(f: Flags): Promise<number> {
-  const home = resolveHome(f.agent);
-  const incident = f.rest[0];
-  if (!incident) return (console.error("usage: endo wait <incident> [--timeout s]"), 2);
-  return waitAndPrint(home, incident, f.timeout);
-}
-
-async function waitAndPrint(home: HomePaths, incident: string, timeoutS?: number): Promise<number> {
-  const reply = await waitForReply(home.outboxDir, incident, { timeoutMs: (timeoutS ?? 3600) * 1000 });
-  if (!reply) return (console.error(`no reply to ${incident} yet`), 2);
-  printReply(reply);
-  return reply.ok ? 0 : 1;
-}
-
-function printReply(reply: Reply): void {
-  console.log(`${reply.state}: ${reply.text}`);
-}
-
-function warnIfDown(home: HomePaths): void {
-  if (!isRunning(home.lockPath)) console.error(dim(`warning: agent is not running — the message waits in ${home.inboxDir}`));
-}
-
-async function cmdCommands(f: Flags): Promise<number> {
-  const home = resolveHome(f.agent);
-  const entries = await loadPlaybook(home.srcDir);
-  const exposed = entries.filter((e) => e.kind === "procedure" && e.expose);
-  if (exposed.length === 0) return (console.log(dim("no exposed procedures")), 0);
-  for (const p of exposed) {
-    if (p.kind !== "procedure") continue;
-    console.log(`${bold(p.name)}  ${p.description ?? ""}`);
-    for (const [k, spec] of Object.entries(p.args)) console.log(`    ${k}${spec.required ? "" : "?"}  ${spec.description ?? ""}`);
-  }
-  return 0;
-}
-
-function cmdStatus(f: Flags): number {
-  const home = resolveHome(f.agent);
-  const store = openSqliteStore(home.dbPath);
-  try {
-    const name = nameOf(home) ?? "(unregistered)";
-    console.log(`${bold(name)} ${isRunning(home.lockPath) ? "running" : "stopped"}  ${dim(home.root)}`);
-    const world = worldModel(store);
-    console.log(bold("\nworld"));
-    if (Object.keys(world).length === 0) console.log(dim("  (empty)"));
-    else if (isEntryMap(world)) {
-      for (const s of Object.keys(world).sort()) {
-        const e = world[s]!;
-        console.log(`  ${light(e.state)} ${s.padEnd(24)} ${e.summary}`);
-      }
-    } else {
-      console.log(JSON.stringify(world, null, 2).split("\n").map((l) => `  ${l}`).join("\n"));
-    }
-    const open = openIncidents(store);
-    console.log(bold("\nopen"));
-    if (open.length === 0) console.log(dim("  none"));
-    for (const fr of open) console.log(`  ${fr.incident}  ${fr.summary}`);
-    console.log(bold("\nrecent"));
-    for (const fr of recentFrames(store, 15)) console.log("  " + fmtFrame(fr));
-    return 0;
-  } finally {
-    store.close();
-  }
-}
-
-function light(state: string): string {
-  return { green: "●", yellow: "◐", red: "○", gray: "·" }[state] ?? "·";
-}
-
-function cmdWhy(f: Flags): number {
-  const home = resolveHome(f.agent);
-  const thing = f.rest.join(" ");
-  if (!thing) return (console.error("usage: endo why <thing>"), 2);
-  const store = openSqliteStore(home.dbPath);
-  try {
-    const frames = framesAbout(store, thing);
-    if (frames.length === 0) console.log(dim(`nothing about "${thing}"`));
-    for (const fr of frames) console.log(fmtFrame(fr));
-    return 0;
-  } finally {
-    store.close();
-  }
-}
-
-function cmdReplay(f: Flags): number {
-  const home = resolveHome(f.agent);
-  const incident = f.rest[0];
-  if (!incident) return (console.error("usage: endo replay <incident>"), 2);
-  const store = openSqliteStore(home.dbPath);
-  try {
-    for (const fr of framesOfIncident(store, incident)) {
-      console.log(fmtFrame(fr));
-      const payload = fr.payload as { messages?: { type: string; name?: string; kind?: string; input?: unknown; value?: unknown }[] } | undefined;
-      for (const m of payload?.messages ?? []) {
-        if (m.type === "action") console.log(dim(`    ${m.kind} ${m.name}: ${JSON.stringify(m.kind === "request" ? m.input : m.value)?.slice(0, 300)}`));
-      }
-    }
-    return 0;
-  } finally {
-    store.close();
-  }
-}
-
-/** A battery's session: through the inbox when running, in-process otherwise. */
-async function cmdSession(name: string, home: HomePaths, loaded: LoadedDeclaration, f: Flags): Promise<number> {
-  const ask = f.rest.join(" ").trim();
-  if (isRunning(home.lockPath)) {
-    const incident = newIncident();
-    writeMessage(home.inboxDir, { v: PROTOCOL_VERSION, kind: "request", incident, from: principal(), text: ask, session: name, at: Date.now() });
-    console.log(`${name} session requested (${incident}); waiting…`);
-    return waitAndPrint(home, incident, f.timeout ?? 3600);
-  }
-  const agent = await openAgent({ home, loaded, onFrame: (input) => console.log(fmtFrame({ ...input, seq: 0 })) });
-  try {
-    const outcome = await agent.session(name, ask || undefined);
-    console.log(outcome.summary);
-    return outcome.completion === "error" ? 1 : 0;
-  } finally {
-    await agent.stop();
-  }
-}
-
-function cmdReply(f: Flags): number {
-  const home = resolveHome(f.agent);
-  const [incident, ...text] = f.rest;
-  if (!incident || text.length === 0) return (console.error("usage: endo reply <incident> [--failed] <text…>"), 2);
-  writeMessage(home.inboxDir, { v: PROTOCOL_VERSION, kind: "reply", incident, ok: !f.failed, text: text.join(" "), from: principal(), at: Date.now() });
-  warnIfDown(home);
-  return 0;
-}
-
-/**
- * `endo world set <key> [value…]`: the value is JSON when it parses, else
- * text. With --state/--kind/--data the value is a generic-map entry
- * ({kind, state, summary, data, updatedAt}) for agents on the default world.
- * `endo world clear <key…>` removes top-level keys.
- */
-function cmdWorld(f: Flags): number {
-  const home = resolveHome(f.agent);
-  const [op, key, ...rest] = f.rest;
-  const usage = "usage: endo world set <key> [value…] [--state s --kind k --data json] | world clear <key…>";
-  if ((op !== "set" && op !== "clear") || !key) return (console.error(usage), 2);
-  const patch: { set?: Record<string, unknown>; clear?: string[] } = {};
-  if (op === "clear") {
-    patch.clear = [key, ...rest];
-  } else {
-    const text = rest.join(" ");
-    if (f.state || f.kind || f.data) {
-      const state = f.state === "green" || f.state === "yellow" || f.state === "red" || f.state === "gray" ? f.state : "gray";
-      patch.set = {
-        [key]: { kind: f.kind ?? key.split(":")[0] ?? "entry", state, summary: text, data: f.data ? (JSON.parse(f.data) as Record<string, unknown>) : {}, updatedAt: Date.now() },
-      };
-    } else {
-      let value: unknown = text;
-      try {
-        value = JSON.parse(text);
-      } catch {}
-      patch.set = { [key]: value };
-    }
-  }
-  writeMessage(home.inboxDir, { v: PROTOCOL_VERSION, kind: "world", incident: "", ...patch, from: principal(), at: Date.now() });
-  warnIfDown(home);
-  return 0;
-}
-
-function cmdReset(f: Flags): number {
-  const home = resolveHome(f.agent);
-  if (!f.force) return (console.error(`this wipes ${home.agentDir} (frame log, inbox, src). Re-run with --force.`), 2);
-  if (isRunning(home.lockPath)) return (console.error("agent is running; stop it first"), 2);
-  rmSync(home.agentDir, { recursive: true, force: true });
-  createHome(home.root, home.declaration);
-  console.log(`reset ${home.root}: agent/ is empty; declaration link and env kept`);
-  return 0;
-}
-
-async function cmdDoctor(f: Flags): Promise<number> {
-  let problems = 0;
-  const note = (ok: boolean, msg: string) => {
-    console.log(`${ok ? "ok " : "!! "} ${msg}`);
-    if (!ok) problems++;
-  };
-  const entries = listRegistry();
-  console.log(bold("registry"));
-  for (const e of entries) note(e.exists, `${e.name} -> ${e.home}${e.exists ? "" : " (missing — run endo up from its new location)"}`);
-  if (entries.length === 0) console.log(dim("  none"));
-  let home: HomePaths | undefined;
-  try {
-    home = resolveHome(f.agent);
-  } catch (err) {
-    console.log(dim(`\n(no agent in scope: ${err instanceof Error ? err.message : err})`));
-    return problems ? 1 : 0;
-  }
-  console.log(bold(`\n${home.root}`));
-  note(true, `declaration -> ${home.declaration}`);
-  const name = nameOf(home);
-  note(name !== undefined, name ? `registered as ${name}` : "not registered (run endo up)");
-  note(true, isRunning(home.lockPath) ? "running (lock held)" : "stopped");
-  if (existsSync(home.needsHumanPath)) {
-    note(false, `needs a human: ${(await Bun.file(home.needsHumanPath).text()).trim().split("\n").slice(-1)[0]} — fix the declaration or playbook and \`endo up\`, or \`endo reset --force\``);
-  }
-  if (name) {
-    const svc = serviceInfo(name);
-    if (!svc.installed) note(true, "no service unit (foreground only)");
-    else {
-      const unit = await Bun.file(svc.file).text();
-      note(unit.includes(home.root), unit.includes(home.root) ? `service unit ${svc.file}` : `service unit ${svc.file} points elsewhere — run \`endo up -d\` here`);
-    }
-  }
-  note(existsSync(home.envPath) || !!process.env.ANTHROPIC_API_KEY || !!process.env.OPENAI_API_KEY, `credentials: ${existsSync(home.envPath) ? "env file present" : "no env file; relying on the environment"}`);
-  try {
-    const entriesLoaded = await loadPlaybook(home.srcDir);
-    note(true, `playbook: ${entriesLoaded.length} entries`);
-  } catch (err) {
-    note(false, `playbook does not load: ${err instanceof Error ? err.message : err}`);
-  }
-  return problems ? 1 : 0;
-}
-
-/** `endo <name>` contributed by a battery — a command or a session: needs the declaration. */
-async function cmdBattery(command: string, f: Flags): Promise<number> {
-  const home = resolveHome(f.agent);
-  const loaded = await loadDeclaration(home.declaration);
-  if (loaded.definition.sessions[command]) return cmdSession(command, home, loaded, f);
-  const found: CliCommand | undefined = loaded.definition.batteries.flatMap((b) => b.commands ?? []).find((c) => c.name === command);
-  if (!found) {
-    const sessions = Object.entries(loaded.definition.sessions).map(([n, s]) => `  endo ${n} [ask…]  ${s.description}`);
-    console.error(`unknown command "${command}"\n\n${USAGE}${sessions.length ? `\nsessions declared by ${loaded.definition.name}'s batteries:\n${sessions.join("\n")}\n` : ""}`);
-    return 2;
-  }
-  const store = openSqliteStore(home.dbPath);
-  try {
-    return await found.run(f.rest, { name: loaded.definition.name, home, store, playbook: await loadPlaybook(home.srcDir) });
-  } finally {
-    store.close();
-  }
-}
-
-async function gitRef(cwd: string): Promise<string | undefined> {
-  try {
-    const head = Bun.spawn(["git", "rev-parse", "--short", "HEAD"], { cwd, stdout: "pipe", stderr: "ignore" });
-    const dirty = Bun.spawn(["git", "status", "--porcelain"], { cwd, stdout: "pipe", stderr: "ignore" });
-    const [sha, status] = await Promise.all([new Response(head.stdout as ReadableStream).text(), new Response(dirty.stdout as ReadableStream).text()]);
-    if ((await head.exited) !== 0) return undefined;
-    return `${sha.trim()}${status.trim() ? "-dirty" : ""}`;
+    return JSON.parse(readFileSync(paths.status, "utf8"));
   } catch {
-    return undefined;
+    return null;
   }
 }
 
-main().then(
+async function commands(flags: Flags): Promise<number> {
+  const paths = target(flags);
+  if (!paths) return 1;
+  const status = readStatus(paths);
+  if (!status) {
+    console.error("the agent has not been up yet (no status.json); `endo up` first");
+    return 1;
+  }
+  for (const c of status.commands ?? []) {
+    const args = Object.keys(c.args).map((k) => (c.required.includes(k) ? `${k}=<${k}>` : `[${k}=…]`)).join(" ");
+    say(`${c.name}${args ? ` ${args}` : ""}\n    ${c.description}`);
+  }
+  return 0;
+}
+
+async function status(flags: Flags): Promise<number> {
+  const paths = target(flags);
+  if (!paths) return 1;
+  const s = readStatus(paths);
+  const up = isLocked(paths.lock);
+  say(s ? `${s.name}: ${up ? (s.active ? "up, active" : "up, idle") : "down"}, ${s.open.length} open request(s), ${s.runs.length} running procedure(s) (as of ${new Date(s.at).toISOString()})` : "never up");
+  try {
+    const { inceptionStatus } = await import("../inception/incept.ts");
+    const i = await inceptionStatus(paths, { load: false });
+    if (i.changed.length) say(`  inputs changed since inception ${i.n}: ${i.changed.join(", ")} (an inception is due: \`endo incept\`)`);
+    if (i.programEdited) say(`  program/agent.ts was edited by hand since inception ${i.n}`);
+  } catch {}
+  if (existsSync(paths.db)) {
+    const store = openSqliteStore(paths.db);
+    for (const f of allFrames(store, Math.max(0, store.lastSeq() - 10))) say(`  ${f.seq}  ${f.type.padEnd(11)} ${f.summary}`);
+    store.close();
+  }
+  return 0;
+}
+
+async function charter(flags: Flags): Promise<number> {
+  const paths = target(flags);
+  if (!paths) return 1;
+  const { importGrant } = await import("../harness/agent.ts");
+  const { ensureStateDir } = await import("../harness/paths.ts");
+  const { grantActions } = await import("../grant/core.ts");
+  const { renderGrant } = await import("../inception/workspace.ts");
+  ensureStateDir(paths);
+  const grant = await importGrant(paths);
+  const actions = grantActions(grant, { name: grant.name, cwd: resolve(paths.agentDir, grant.cwd), charter: notRunning }, { reply: () => "not running" });
+  say(renderGrant({ paths, grant, actions, n: 0, version: "" }).trimEnd());
+  return 0;
+}
+
+async function replay(flags: Flags): Promise<number> {
+  const paths = target(flags);
+  if (!paths) return 1;
+  if (!existsSync(paths.db)) {
+    say("no frames yet");
+    return 0;
+  }
+  const store = openSqliteStore(paths.db);
+  const frames = [...allFrames(store)];
+  store.close();
+  const id = flags.rest[0];
+  for (const f of id ? framesAbout(frames, id) : frames) printFrame(f, true, say);
+  return 0;
+}
+
+async function why(flags: Flags): Promise<number> {
+  if (!flags.rest[0]) return usage();
+  return replay(flags);
+}
+
+async function reset(flags: Flags): Promise<number> {
+  const paths = target(flags);
+  if (!paths) return 1;
+  if (isLocked(paths.lock)) {
+    console.error("the agent is running; `endo down` (or Ctrl-C the foreground) first");
+    return 1;
+  }
+  if (!existsSync(paths.state)) {
+    say("nothing to reset");
+    return 0;
+  }
+  if (!flags.force) {
+    const answer = prompt(`delete ${paths.state} (the frame log, the program, src, snapshots)? the next \`endo up\` incepts a fresh agent [y/N]:`) ?? "";
+    if (!/^y(es)?$/i.test(answer.trim())) return 1;
+  }
+  let name: string | undefined;
+  try {
+    name = await agentName(paths);
+  } catch {}
+  rmSync(paths.state, { recursive: true, force: true });
+  if (name) release(name);
+  say(`${paths.state} removed${name ? `; ${name} unregistered` : ""}`);
+  return 0;
+}
+
+async function doctor(flags: Flags): Promise<number> {
+  const paths = target(flags);
+  if (!paths) return 1;
+  let bad = 0;
+  const note = (ok: boolean, text: string) => {
+    if (!ok) bad++;
+    say(`${ok ? "ok  " : "FAIL"} ${text}`);
+  };
+  let name: string | undefined;
+  try {
+    name = await agentName(paths);
+    note(true, `grant loads: ${name}`);
+  } catch (err) {
+    note(false, `grant does not load: ${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
+  note(existsSync(paths.program), existsSync(paths.program) ? "program present" : "no program: `endo up` incepts one");
+  const entry = lookup(name);
+  note(!!entry && entry.exists && realpathSync(entry.dir) === realpathSync(paths.agentDir), entry ? `registry: ${name} → ${entry.dir}${entry.exists ? "" : " (gone)"}` : `registry: ${name} not registered (\`endo up\` registers)`);
+  const svc = serviceInfo(name);
+  if (svc.installed) {
+    const unit = readFileSync(svc.file, "utf8");
+    note(unit.includes(paths.agentDir), unit.includes(paths.agentDir) ? `unit ${svc.file}` : `unit ${svc.file} points elsewhere; \`endo up\` here rewrites it`);
+    note(true, `service ${(await serviceRunning(name).catch(() => false)) ? "running" : "not running"}`);
+  } else note(true, `no service unit (${isLocked(paths.lock) ? "a foreground up is running" : "down"})`);
+  const { loadEnv } = await import("../harness/env.ts");
+  const keys = loadEnv(paths);
+  note(true, keys.length ? `env: ${keys.join(", ")}` : "env: no .endo/env (credentials must come from the environment)");
+  const { describeProcedures } = await import("../procedures/describe.ts");
+  const described = await describeProcedures(paths.procedures);
+  note(described.failures.length === 0, `procedures: ${described.procedures.map((p) => p.name).join(", ") || "(none)"}${described.failures.length ? `; failing: ${described.failures.map((f) => `${f.name} (${f.error.split("\n")[0]})`).join("; ")}` : ""}`);
+  if (existsSync(paths.program)) {
+    const { inceptionStatus } = await import("../inception/incept.ts");
+    const status = await inceptionStatus(paths);
+    note(!status.loadError, status.loadError ? `program does not load: ${status.loadError}; run \`endo incept\`` : `program loads (inception ${status.n})`);
+    note(true, status.changed.length ? `inputs changed since inception ${status.n}: ${status.changed.join(", ")}; an inception is due` : `inputs unchanged since inception ${status.n}`);
+    if (status.programEdited) note(false, "program/agent.ts differs from what inception recorded: it was edited by hand");
+  }
+  return bad ? 1 : 0;
+}
+
+function usage(): number {
+  console.error(USAGE);
+  return 2;
+}
+
+const { command, flags } = parse(process.argv.slice(2));
+const handlers: Record<string, (f: Flags) => Promise<number>> = { up, down, logs, incept: inceptCommand, send, call, wait, commands, status, charter, replay, why, reset, doctor };
+const run = command ? handlers[command] : listAgents;
+if (!run) process.exit(usage());
+run(flags).then(
   (code) => process.exit(code),
-  (err) => {
-    console.error(err instanceof Error ? err.message : err);
+  (err: unknown) => {
+    console.error(err instanceof Error ? err.message : String(err));
     process.exit(1);
   },
 );

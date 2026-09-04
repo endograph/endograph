@@ -1,23 +1,28 @@
 /**
- * endograph — embedded agents on projector.
- *
- * A declaration (`endograph.ts`) exports `defineAgent({...})`; batteries
- * contribute states, tools, sensors, hooks, and commands. Everything a
- * declaration needs is exported from here so one copy of projector and one
- * copy of zod are in play.
+ * endograph: embedded agents on projector. Everything a grant, a program,
+ * or a procedure imports comes from here (projector's primitives, and zod
+ * for schemas), so one copy of each is in play and an agent directory
+ * needs no dependencies of its own.
  */
-export { defineAgent, type AgentConfig, type AgentDefinition, type Battery, type CliCommand, type CommandContext, type ExecutorSpec, type StatusLine } from "./agent/define.ts";
-export type { RuntimeContext } from "./agent/runtime.ts";
-export { LateBound } from "./agent/runtime.ts";
-export { aisdk, type AiSdkOptions } from "./judge/executor.ts";
-export { evolvable } from "./judge/evolve.ts";
+export { defineAgent, type AgentConfig, type Battery, type BatteryContext, type Grant, type TickContext } from "./grant/define.ts";
+export { aisdk, type AiSdkOptions, type ExecutorSpec } from "./grant/executor.ts";
 export { bash } from "./batteries/bash.ts";
-export { inbox } from "./batteries/inbox.ts";
-export { playbook } from "./batteries/playbook.ts";
-export { budget, type BudgetOptions } from "./batteries/budget.ts";
-export type { Drift, Sensor, Outcome } from "./loop/types.ts";
-export type { Frame, FrameInput, FrameStore } from "./store/types.ts";
-export type { Migrator, MigrationInput } from "./world/migrate.ts";
-export type { WorldEntry, WorldModel, WorldPatch, WorldSpec } from "./world/model.ts";
-export { actionResult, createAction, createNode, createState, recencyRegion, text, tool, type AnyAction, type AnySchema, type Node, type ProjectorExecutor, type StateDescriptor } from "@projectors/core";
+export { evolve } from "./batteries/evolve.ts";
+export { scheduler } from "./batteries/scheduler.ts";
+export { defineProgram, type Program, type ProgramResult, type Provisions } from "./program/define.ts";
+export {
+  action,
+  command,
+  createAction,
+  createComputedPart,
+  createHistoryProjectionFunction,
+  createLayout,
+  createNode,
+  createSlot,
+  createSourceInstance,
+  createState,
+  include,
+  text,
+  tool,
+} from "@projectors/core";
 export { z } from "zod";

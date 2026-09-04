@@ -1,20 +1,20 @@
 /**
- * The storage seam — deliberately tiny: append frames, read from a
- * sequence number, write/read a snapshot. No backend capability
- * (reactivity, pubsub) may leak into this interface. One agent per store.
+ * The storage seam, deliberately tiny: append frames, read from a sequence
+ * number, write and read one snapshot. No backend capability (reactivity,
+ * pubsub) may leak through it. One agent per store. An append failure is
+ * fatal to the caller: the log is the agent.
  */
 
+/** The endograph envelope: mirrored into columns, and carried as `frame.metadata.endo` on machine frames. */
 export interface FrameInput {
-  /** Frame class: "drift", "action", "outcome", "activation", "note", ... */
+  /** "request", "call", "reply", "activation", "inception", "error", ... */
   type: string;
-  /** World-model entry or topic the frame concerns, if any. */
-  subject?: string;
   /** One-line human-readable account. */
   summary: string;
-  /** Structured payload; JSON-serializable. */
+  /** The request or call this frame is about, when there is exactly one. */
+  id?: string;
+  /** JSON-serializable. The full projector frame when there is one. */
   payload?: unknown;
-  /** Groups frames into an incident for `endo replay`. */
-  incident?: string;
   at: number;
 }
 
@@ -42,7 +42,7 @@ export interface FrameStore {
 }
 
 /** Walk the log from a seq (exclusive) in batches. */
-export function* allFrames(store: FrameStore, batch = 1000, fromSeq = 0): Generator<Frame> {
+export function* allFrames(store: FrameStore, fromSeq = 0, batch = 1000): Generator<Frame> {
   let from = fromSeq;
   for (;;) {
     const frames = store.read(from, batch);
