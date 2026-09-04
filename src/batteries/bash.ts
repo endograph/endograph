@@ -1,29 +1,112 @@
-import { createAction } from "@projectors/core";
+import { createAction, type AnyAction } from "@projectors/core";
+import { spawn } from "node:child_process";
 import { z } from "zod";
-import type { Battery } from "../agent/define.ts";
-import { LateBound, type RuntimeContext } from "../agent/runtime.ts";
-import { runShell } from "../playbook/run.ts";
+import type { Battery } from "../grant/define.ts";
+
+declare module "../program/define.ts" {
+  interface GrantedActions {
+    bash: AnyAction;
+  }
+}
 
 /**
- * Plain bash under the agent's working directory: the agent can do what
- * its user can. Sandbox notches (loopback only, allowlisted hosts,
- * offline) arrive here as options; the model's API call never runs
- * inside them.
+ * The one place shell runs. The child leads its own process group so a
+ * timeout kills the whole tree (a `make` under a `sh`), not just the shell.
+ */
+
+export interface ShellResult {
+  code: number;
+  /** The last `tailLines` of stdout and stderr, in arrival order. */
+  output: string;
+  timedOut: boolean;
+}
+
+export interface ShellOptions {
+  cwd: string;
+  env?: Record<string, string | undefined>;
+  timeoutMs?: number;
+  tailLines?: number;
+}
+
+export function runShell(script: string, opts: ShellOptions): Promise<ShellResult> {
+  const timeoutMs = opts.timeoutMs ?? 120_000;
+  const tailLines = opts.tailLines ?? 40;
+  return new Promise((resolve) => {
+    const child = spawn("sh", ["-c", script], {
+      cwd: opts.cwd,
+      env: { ...process.env, FORCE_COLOR: "0", ...opts.env } as NodeJS.ProcessEnv,
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    let timedOut = false;
+    child.stdout.on("data", (d: Buffer) => (output += d.toString()));
+    child.stderr.on("data", (d: Buffer) => (output += d.toString()));
+    const timer = setTimeout(() => {
+      timedOut = true;
+      if (child.pid) {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          child.kill("SIGKILL");
+        }
+      }
+    }, timeoutMs);
+    const finish = (code: number, note?: string) => {
+      clearTimeout(timer);
+      if (note) output += `\n${note}`;
+      resolve({ code, output: output.trim().split("\n").slice(-tailLines).join("\n"), timedOut });
+    };
+    child.on("error", (err) => finish(127, err.message));
+    child.on("close", (code, signal) =>
+      finish(code ?? 128, timedOut ? `timed out after ${timeoutMs / 1000}s (${signal ?? "killed"})` : undefined),
+    );
+  });
+}
+
+/**
+ * The bash battery: one action, a shell in the grant's `cwd`. The agent can
+ * do what its user can; the sandbox, when it lands, wraps the whole process.
  */
 export function bash(): Battery {
-  const runtime = new LateBound<RuntimeContext>();
-  const tool = createAction({
-    state: null,
+  return {
     name: "bash",
-    description:
-      "Run a shell command in the working directory. Use for diagnosis " +
-      "(read files, check hosts/ports/processes) and for repairs. Long " +
-      "operations (builds, deploys) are fine: set timeout_s.",
-    inputSchema: z.object({ cmd: z.string(), timeout_s: z.number().positive().max(3600).optional() }),
-    run: async ({ cmd, timeout_s }) => {
-      const result = await runShell(cmd, runtime.get().scripts, { timeoutMs: (timeout_s ?? 120) * 1000, tailLines: 80 });
-      return `exit ${result.code}\n${result.detail ?? ""}`.trimEnd();
-    },
-  });
-  return { name: "bash", tools: [tool], bind: (ctx) => runtime.bind(ctx) };
+    guide: GUIDE,
+    actions: ({ cwd }) => [
+      createAction({
+        state: null,
+        name: "bash",
+        description:
+          "Run a shell command in the working directory. Long operations (builds, " +
+          "deploys) are fine: set timeout_s. You see the last 80 lines of output.",
+        inputSchema: z.object({ cmd: z.string(), timeout_s: z.number().positive().max(3600).optional() }),
+        run: async ({ cmd, timeout_s }) => {
+          const result = await runShell(cmd, { cwd, timeoutMs: (timeout_s ?? 120) * 1000, tailLines: 80 });
+          return `exit ${result.code}\n${result.output}`.trimEnd();
+        },
+      }),
+    ],
+  };
 }
+
+const GUIDE = `# bash
+
+One action, \`bash({ cmd, timeout_s? })\`: a shell in the grant's \`cwd\`
+with the agent's own environment. Output is the exit code and the last 80
+lines of stdout and stderr; a timeout (default 120 s, at most an hour)
+kills the whole process tree.
+
+Idioms:
+
+- It is how the agent reads and writes files under \`src\` (notes, its
+  README, a procedure it is drafting) and how it looks at the systems it
+  tends. Nothing else in the grant reads files.
+- Anything the agent runs twice belongs in a procedure, not in a bash
+  call it repeats from memory: a procedure has a schema, a name peers
+  can call, and its output stays out of the model's history.
+- Long or noisy jobs (builds, deploys, test runs) belong in procedures
+  for the same reason. A bash call's output is paid for on every
+  activation until the next compaction.
+- Instructions should say what bash is for in this agent, not that it
+  exists; the model sees the tool.
+`;

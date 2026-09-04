@@ -2,26 +2,24 @@ import { Database } from "bun:sqlite";
 import type { Frame, FrameInput, FrameStore, Snapshot } from "./types.ts";
 
 /**
- * SQLite backend: one file at the heart of the agent's home. Copy it, back
- * it up, attach it to a bug report; the frame log is a plain table for
- * `sqlite3`. The endograph envelope is mirrored into columns; the payload
- * column holds the full projector frame.
+ * SQLite backend: one file in the state directory. Copy it, back it up,
+ * attach it to a bug report; the frame log is a plain table for `sqlite3`.
+ * The envelope is mirrored into columns; the payload column holds the full
+ * projector frame.
  */
 export function openSqliteStore(path: string): FrameStore {
   const db = new Database(path, { create: true });
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec(`
     CREATE TABLE IF NOT EXISTS frames (
-      seq      INTEGER PRIMARY KEY AUTOINCREMENT,
-      at       INTEGER NOT NULL,
-      type     TEXT NOT NULL,
-      subject  TEXT,
-      summary  TEXT NOT NULL,
-      incident TEXT,
-      payload  TEXT
+      seq     INTEGER PRIMARY KEY AUTOINCREMENT,
+      at      INTEGER NOT NULL,
+      type    TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      id      TEXT,
+      payload TEXT
     );
-    CREATE INDEX IF NOT EXISTS frames_subject ON frames (subject, seq);
-    CREATE INDEX IF NOT EXISTS frames_incident ON frames (incident, seq);
+    CREATE INDEX IF NOT EXISTS frames_id ON frames (id, seq);
     CREATE TABLE IF NOT EXISTS snapshot (
       id        INTEGER PRIMARY KEY CHECK (id = 1),
       as_of_seq INTEGER NOT NULL,
@@ -29,21 +27,14 @@ export function openSqliteStore(path: string): FrameStore {
       state     TEXT NOT NULL
     );
   `);
-  const insert = db.prepare(
-    `INSERT INTO frames (at, type, subject, summary, incident, payload)
-     VALUES (?, ?, ?, ?, ?, ?) RETURNING seq`,
-  );
-  const select = db.prepare(
-    `SELECT seq, at, type, subject, summary, incident, payload
-     FROM frames WHERE seq > ? ORDER BY seq ASC LIMIT ?`,
-  );
+  const insert = db.prepare(`INSERT INTO frames (at, type, summary, id, payload) VALUES (?, ?, ?, ?, ?) RETURNING seq`);
+  const select = db.prepare(`SELECT seq, at, type, summary, id, payload FROM frames WHERE seq > ? ORDER BY seq ASC LIMIT ?`);
   const toFrame = (row: Record<string, unknown>): Frame => ({
     seq: row.seq as number,
     at: row.at as number,
     type: row.type as string,
-    subject: (row.subject as string | null) ?? undefined,
     summary: row.summary as string,
-    incident: (row.incident as string | null) ?? undefined,
+    id: (row.id as string | null) ?? undefined,
     payload: row.payload == null ? undefined : JSON.parse(row.payload as string),
   });
 
@@ -52,9 +43,8 @@ export function openSqliteStore(path: string): FrameStore {
       const row = insert.get(
         frame.at,
         frame.type,
-        frame.subject ?? null,
         frame.summary,
-        frame.incident ?? null,
+        frame.id ?? null,
         frame.payload === undefined ? null : JSON.stringify(frame.payload),
       ) as { seq: number };
       return { ...frame, seq: row.seq };
