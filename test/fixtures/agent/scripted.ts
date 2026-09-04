@@ -62,4 +62,5 @@ export const answer = async (turn: Turn) => {
   }
 };
 
-export const scriptedSpec: ExecutorSpec = { description: "scripted (test)", create: () => scripted(answer) };
+const scriptedSpec: ExecutorSpec = { description: "scripted (test)", create: () => scripted(answer) };
+export default scriptedSpec;

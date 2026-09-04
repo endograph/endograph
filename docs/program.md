@@ -20,8 +20,8 @@ the second inception on it also holds `BASELINE/`, `DIFF.md`,
 
 An agent is three files' worth of intent and one directory of self:
 
-- `endograph.ts` and `manifest.md` are the owner's. You read them. You
-  never write them.
+- `endograph.toml` and the manifest (`manifest.md`, or inline in the
+  grant) are the owner's. You read them. You never write them.
 - `.endo/program/agent.ts` is yours. It is the agent's mind: which
   projector nodes exist, what they say, what they carry, how memory is
   shaped. The running agent never edits it; neither does the owner.
@@ -43,7 +43,7 @@ the protocol, and the rules in §5. Everything else is a decision, and
 
 ```ts
 // .endo/program/agent.ts — written by inception 1 (2026-09-04). Do not edit:
-// change manifest.md or endograph.ts and run `endo incept`.
+// change manifest.md or endograph.toml and run `endo incept`.
 import { defineProgram, createNode, createSourceInstance, createState, tool, text, z } from "endograph";
 
 type Notes = { standing: string[] };

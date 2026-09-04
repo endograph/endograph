@@ -8,17 +8,16 @@ When an entry lands, it moves into the plan and out of this file.
 
 ## 1. Sandbox policy
 
-**What.** A `sandbox` field in the grant, applied once to the agent
+**What.** A `[sandbox]` table in the grant, applied once to the agent
 process and therefore to everything it spawns: bash, procedures, the
 model call. Agent-authored JS runs in-process with no escape because
 there is no outside to escape to.
 
-```ts
-sandbox: {                    // omitted = no sandbox at all
-  network: ["stout"],         // "full" | "loopback" | "offline" | hosts; executor host always added
-  write: ["../.."],           // beyond the state directory; omitted = unrestricted
-  env: ["FROGGY_DEPLOY_KEY"], // what the process tree sees; omitted = everything
-}
+```toml
+[sandbox]                     # omitted = no sandbox at all
+network = ["stout"]           # "full" | "loopback" | "offline" | hosts; executor host always added
+write = ["../.."]             # beyond the state directory; omitted = unrestricted
+env = ["FROGGY_DEPLOY_KEY"]   # what the process tree sees; omitted = everything
 ```
 
 - `network`: the notches, loosest first: full → allowlist → loopback →
@@ -128,7 +127,7 @@ per-procedure and per-sender totals are enough.
 
 ## 4. Activation attempts and timeout in the grant
 
-**What.** `activation: { attempts, timeout }` in `defineAgent`, bounding
+**What.** An `[activation]` table (`attempts`, `timeout`) in the grant, bounding
 how many times an interrupted request is re-driven and when a running
 activation is aborted.
 

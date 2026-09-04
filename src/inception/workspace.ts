@@ -1,7 +1,7 @@
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { normalizeSchema, type AnyAction } from "@projectors/core";
-import type { Grant } from "../grant/define.ts";
+import type { Grant } from "../grant/grant.ts";
 import type { Paths } from "../harness/paths.ts";
 import { CONSUMER_DOC } from "../cli/usage.ts";
 
@@ -41,7 +41,7 @@ export function renderWorkspace(input: WorkspaceInput): string {
   const dir = paths.workspace;
   rmSync(dir, { recursive: true, force: true });
   mkdirSync(join(dir, "batteries"), { recursive: true });
-  writeFileSync(join(dir, "MANIFEST.md"), readFileSync(resolve(paths.agentDir, grant.manifest), "utf8"));
+  writeFileSync(join(dir, "MANIFEST.md"), grant.manifest.text);
   writeFileSync(join(dir, "GRANT.md"), renderGrant(input));
   writeFileSync(join(dir, "PROGRAM.md"), readFileSync(PROGRAM_DOC, "utf8"));
   writeFileSync(join(dir, "CLI.md"), CONSUMER_DOC);
@@ -51,7 +51,7 @@ export function renderWorkspace(input: WorkspaceInput): string {
     mkdirSync(join(dir, "BASELINE"), { recursive: true });
     cpSync(join(baseline.dir, "agent.ts"), join(dir, "BASELINE", "agent.ts"));
     if (existsSync(join(baseline.dir, "src"))) cpSync(join(baseline.dir, "src"), join(dir, "BASELINE", "src"), { recursive: true });
-    writeFileSync(join(dir, "DIFF.md"), `# DIFF: owner inputs at inception ${input.n - 1} versus now\n\n${baseline.diff.trim() ? "```diff\n" + baseline.diff.trimEnd() + "\n```" : "(no change to manifest.md, endograph.ts, or the endograph version)"}\n`);
+    writeFileSync(join(dir, "DIFF.md"), `# DIFF: owner inputs at inception ${input.n - 1} versus now\n\n${baseline.diff.trim() ? "```diff\n" + baseline.diff.trimEnd() + "\n```" : "(no change to manifest.md, endograph.toml, or the endograph version)"}\n`);
     if (baseline.errors) writeFileSync(join(dir, "ERRORS.md"), `# ERRORS: the current program does not load\n\n${baseline.errors}\n`);
     if (baseline.instance !== undefined) writeFileSync(join(dir, "instance.json"), `${JSON.stringify(baseline.instance, null, 2)}\n`);
     writeFileSync(join(dir, "EVOLUTION.md"), baseline.evolution);
@@ -64,7 +64,7 @@ export function renderGrant({ grant, actions, version }: WorkspaceInput): string
   const lines: string[] = [
     `# GRANT: ${grant.name}`,
     "",
-    "Everything this agent may ever do. Written from `endograph.ts`; you cannot widen it.",
+    "Everything this agent may ever do. Written from `endograph.toml`; you cannot widen it.",
     "",
     `- name: \`${grant.name}\``,
     `- executor: ${grant.executor.description ?? "(custom)"}${grant.executor.executorConfig ? ` with executorConfig ${JSON.stringify(grant.executor.executorConfig)}` : ""}`,
@@ -139,7 +139,7 @@ Then write:
 
    \`\`\`
    // .endo/program/agent.ts — written by inception ${n} (${today()}). Do not edit:
-   // change manifest.md or endograph.ts and run \`endo incept\`.
+   // change manifest.md or endograph.toml and run \`endo incept\`.
    \`\`\`
 
 2. \`${rel(paths, paths.src)}/\` — seed it: procedures under \`procedures/\` for what the
@@ -158,7 +158,7 @@ procedure that fails to describe fails validation here. If validation
 fails you get \`ERRORS.md\` in this workspace with the stage and the error,
 and another round.
 
-Do not edit \`endograph.ts\` or \`manifest.md\`. Do not run \`endo up\`.
+Do not edit \`endograph.toml\` or the manifest. Do not run \`endo up\`.
 `;
 }
 
@@ -175,8 +175,8 @@ export function writeSnapshot(paths: Paths, grant: Grant, n: number): string {
   const dir = join(paths.snapshots, String(n));
   rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir, { recursive: true });
-  cpSync(paths.grant, join(dir, "endograph.ts"));
-  cpSync(resolve(paths.agentDir, grant.manifest), join(dir, "manifest.md"));
+  cpSync(paths.grant, join(dir, "endograph.toml"));
+  writeFileSync(join(dir, "manifest.md"), grant.manifest.text);
   cpSync(paths.program, join(dir, "agent.ts"));
   if (existsSync(paths.src)) cpSync(paths.src, join(dir, "src"), { recursive: true });
   return dir;

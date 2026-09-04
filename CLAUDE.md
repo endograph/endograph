@@ -10,11 +10,12 @@ archaeology only. Do not resurrect v1 or v2 structure: no loop, drift,
 judge, sessions, evolvable, home/declaration split, playbook, or
 frontmatter.
 
-An agent is two owner files, `endograph.ts` (the grant: `defineAgent`)
-and `manifest.md`, plus `.endo/` (everything the agent is: the frame
+An agent is two owner files, `endograph.toml` (the grant: data, validated
+at load) and `manifest.md` (or the manifest inline in the grant), plus `.endo/` (everything the agent is: the frame
 log, `program/agent.ts` written by inception, `src/` written by the
-agent, the inbox/outbox wire, snapshots, `node_modules/endograph` linked
-by `endo up`, `env`). `endo up` runs in the agent directory and runs the
+agent, the inbox/outbox wire, snapshots, `inceptions/<n>/` (how each
+inception went, round by round), `node_modules/endograph` linked by
+`endo up`, `env`). `endo up` runs in the agent directory and runs the
 agent as a launchd/systemd service (`--foreground` to run in the
 terminal); with no program it runs inception first, a coding agent
 (Claude Code or Codex, headless or `endo incept --manual`) writing the
@@ -36,8 +37,8 @@ outside `src/` imports `@projectors/core`.
 - `src/store/` — carried from v2: append, read from seq, snapshot; SQLite.
 - `src/protocol/` — the wire: request/call/reply JSON files, atomic
   writes, `from` stamped by the binding, client-minted ids, outbox.
-- `src/grant/` — `defineAgent`, the core actions (`reply`, `compact`,
-  `update_state`), battery types, the executor spec (carried).
+- `src/grant/` — `loadGrant` (endograph.toml), the core actions (`reply`,
+  `compact`, `update_state`), battery types, the executor spec (carried).
 - `src/program/` — loader: describe procedures, invoke the program
   function against the provisions, assemble the charter, hydrate, replay.
 - `src/harness/` — the running agent: the router (call → procedure
@@ -55,9 +56,12 @@ outside `src/` imports `@projectors/core`.
   hook; it constrains shape, never behavior.
 - `src/cli/` — `up [--foreground] [--template] | down | logs | incept |
   send | call | wait | commands | status | why | replay | reset | doctor
-  | charter`, the registry, `usage.ts` (the consumer half is rendered
+  | charter | observatory`, the registry, `usage.ts` (the consumer half is rendered
   into every workspace as `CLI.md`); units (carried) run `endo up
   --service`.
+- `src/observatory/` — the read-only localhost observatory: a Bun-served React
+  UI (its pinned runtime lazily installed in `~/.endograph/observatory/`), live
+  frame log, projector state tree, and inception history with captured artifacts.
 
 ## Norms
 

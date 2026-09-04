@@ -1,6 +1,6 @@
 import { actionResult, createAction, createNode, tool, type AnyAction, type Node, type RuntimeTrigger } from "@projectors/core";
 import { z } from "zod";
-import type { Battery, BatteryContext } from "../grant/define.ts";
+import type { Battery, BatteryContext } from "../grant/grant.ts";
 
 declare module "../program/define.ts" {
   interface GrantedActions {

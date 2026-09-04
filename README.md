@@ -12,8 +12,8 @@ reads), and `docs/v3-future.md` (designs deliberately held back).
 
 ```
 project/agents/endofrog/
-  endograph.ts        # the grant: defineAgent({ name, manifest, executor, cwd, batteries })
-  manifest.md         # the owner's intent, in prose
+  endograph.toml      # the grant: name, executor, batteries by name, inception options
+  manifest.md         # the owner's intent, in prose (or inline in the grant under [manifest])
   .endo/              # gitignored; everything the agent is
     agent.db          #   the frame log and machine snapshot
     program/agent.ts  #   the program, written at inception
@@ -26,6 +26,16 @@ a launchd or systemd unit, and starts it. With no program it runs
 inception first: a coding agent (Claude Code or Codex) writes
 `program/agent.ts` from the manifest. Credentials go in `.endo/env`. Endograph is the harness, the protocol, the program contract,
 procedures, and batteries. What an agent does is decided at inception.
+
+`endo observatory` opens a live, read-only view on localhost. It puts the
+projector frame log beside the current machine state and the full inception
+history—what inputs changed, what shape was produced, the inceptor's brief,
+and the captured program and owner files. Pass `--agent <name|dir>` from
+elsewhere, `--port <n>` to choose the port, or `--no-open` to serve without
+opening a browser. The interface is React, bundled by Bun when the command
+starts. Its pinned React runtime installs lazily under
+`~/.endograph/observatory/` on the first launch, not into the agent or its
+application.
 
 ## Develop
 

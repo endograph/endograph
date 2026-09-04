@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { existsSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import { openAgent, AlreadyRunning, NoProgram } from "../harness/agent.ts";
 import { isLocked } from "../harness/lock.ts";
 import { pathsOf } from "../harness/paths.ts";
@@ -24,6 +24,8 @@ interface Flags {
   foreground: boolean;
   service: boolean;
   force: boolean;
+  noOpen: boolean;
+  port?: number;
   template?: string;
   id?: string;
   ref?: string;
@@ -31,7 +33,7 @@ interface Flags {
 }
 
 function parse(argv: string[]): { command: string; flags: Flags } {
-  const flags: Flags = { manual: false, accept: false, wait: false, follow: false, foreground: false, service: false, force: false, rest: [] };
+  const flags: Flags = { manual: false, accept: false, wait: false, follow: false, foreground: false, service: false, force: false, noOpen: false, rest: [] };
   let command = "";
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
@@ -44,6 +46,8 @@ function parse(argv: string[]): { command: string; flags: Flags } {
     else if (a === "--foreground") flags.foreground = true;
     else if (a === "--service") flags.service = true;
     else if (a === "--force") flags.force = true;
+    else if (a === "--no-open") flags.noOpen = true;
+    else if (a === "--port") flags.port = Number(argv[++i]);
     else if (a === "--template") flags.template = argv[++i];
     else if (a === "--id") flags.id = argv[++i];
     else if (a === "--ref") flags.ref = argv[++i];
@@ -60,39 +64,39 @@ const notRunning = () => {
 
 /** The agent directory a command targets: `--agent`, else the current directory. It must hold a grant. */
 function target(flags: Flags): ReturnType<typeof pathsOf> | null {
-  const dir = flags.agent ? resolveAgent(flags.agent) : existsSync(resolve("endograph.ts")) ? process.cwd() : null;
+  const dir = flags.agent ? resolveAgent(flags.agent) : existsSync(resolve("endograph.toml")) ? process.cwd() : null;
   if (dir) return pathsOf(dir);
-  console.error(flags.agent ? `no agent "${flags.agent}": not a registered name and no endograph.ts at that path` : `no endograph.ts in ${process.cwd()}; run in the agent directory or pass --agent <name|dir>`);
+  console.error(flags.agent ? `no agent "${flags.agent}": not a registered name and no endograph.toml at that path` : `no endograph.toml in ${process.cwd()}; run in the agent directory or pass --agent <name|dir>`);
   return null;
 }
 
 /** Load the grant once to learn the name (claiming the registry needs it before the harness runs). */
 async function agentName(paths: ReturnType<typeof pathsOf>): Promise<string> {
-  const { importGrant } = await import("../harness/agent.ts");
+  const { loadGrant } = await import("../grant/grant.ts");
   const { ensureStateDir } = await import("../harness/paths.ts");
   ensureStateDir(paths);
-  return (await importGrant(paths)).name;
+  return (await loadGrant(paths)).name;
 }
 
 async function up(flags: Flags): Promise<number> {
-  if (!flags.agent && !existsSync(resolve("endograph.ts"))) {
+  if (!flags.agent && !existsSync(resolve("endograph.toml"))) {
     if (flags.template) {
       const err = fromTemplate(process.cwd(), flags.template);
       if (err) {
         console.error(err);
         return 1;
       }
-      say(`endograph.ts and manifest.md copied from ${flags.template}`);
+      say(`grant (and manifest) copied from ${flags.template}`);
     } else if (flags.service) {
-      console.error(`no endograph.ts in ${process.cwd()}`);
+      console.error(`no endograph.toml in ${process.cwd()}`);
       return 0;
     } else {
-      say(`no endograph.ts in ${process.cwd()}: setting up a new agent here`);
+      say(`no endograph.toml in ${process.cwd()}: setting up a new agent here`);
       await interactiveSetup(process.cwd(), async (q, fallback) => {
         const answer = (prompt(`${q}${fallback ? ` [${fallback}]` : ""}:`) ?? "").trim();
         return answer || fallback || "";
       });
-      say("wrote endograph.ts and manifest.md; edit manifest.md before inception if the stub is not enough");
+      say("wrote endograph.toml and manifest.md; edit manifest.md before inception if the stub is not enough");
     }
   }
   const paths = target(flags);
@@ -330,12 +334,12 @@ async function status(flags: Flags): Promise<number> {
 async function charter(flags: Flags): Promise<number> {
   const paths = target(flags);
   if (!paths) return 1;
-  const { importGrant } = await import("../harness/agent.ts");
+  const { loadGrant } = await import("../grant/grant.ts");
   const { ensureStateDir } = await import("../harness/paths.ts");
   const { grantActions } = await import("../grant/core.ts");
   const { renderGrant } = await import("../inception/workspace.ts");
   ensureStateDir(paths);
-  const grant = await importGrant(paths);
+  const grant = await loadGrant(paths);
   const actions = grantActions(grant, { name: grant.name, cwd: resolve(paths.agentDir, grant.cwd), charter: notRunning }, { reply: () => "not running" });
   say(renderGrant({ paths, grant, actions, n: 0, version: "" }).trimEnd());
   return 0;
@@ -427,13 +431,48 @@ async function doctor(flags: Flags): Promise<number> {
   return bad ? 1 : 0;
 }
 
+async function observatory(flags: Flags): Promise<number> {
+  const paths = target(flags);
+  if (!paths) return 1;
+  if (flags.port !== undefined && (!Number.isInteger(flags.port) || flags.port < 0 || flags.port > 65535)) {
+    console.error("--port must be an integer from 0 to 65535");
+    return 2;
+  }
+  const name = readStatus(paths)?.name ?? basename(paths.agentDir);
+  const [{ prepareObservatoryUi }, { serveObservatory }] = await Promise.all([
+    import("../observatory/build.ts"),
+    import("../observatory/server.ts"),
+  ]);
+  const ui = await prepareObservatoryUi(say);
+  const server = serveObservatory({ paths, name, port: flags.port, ui });
+  say(`${name} observatory at ${server.url}`);
+  say("  live, read-only; Ctrl-C to stop");
+  if (!flags.noOpen) openBrowser(server.url);
+  const stop = () => {
+    server.stop();
+    process.exit(0);
+  };
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
+  await new Promise(() => {});
+  return 0;
+}
+
+function openBrowser(url: string): void {
+  const command = process.platform === "darwin" ? ["open", url] : process.platform === "win32" ? ["cmd", "/c", "start", "", url] : ["xdg-open", url];
+  try {
+    const child = Bun.spawn(command, { stdout: "ignore", stderr: "ignore" });
+    child.unref();
+  } catch {}
+}
+
 function usage(): number {
   console.error(USAGE);
   return 2;
 }
 
 const { command, flags } = parse(process.argv.slice(2));
-const handlers: Record<string, (f: Flags) => Promise<number>> = { up, down, logs, incept: inceptCommand, send, call, wait, commands, status, charter, replay, why, reset, doctor };
+const handlers: Record<string, (f: Flags) => Promise<number>> = { up, down, logs, incept: inceptCommand, send, call, wait, commands, status, charter, replay, why, reset, doctor, observatory };
 const run = command ? handlers[command] : listAgents;
 if (!run) process.exit(usage());
 run(flags).then(

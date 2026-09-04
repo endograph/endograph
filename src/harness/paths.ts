@@ -1,13 +1,12 @@
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 /** The agent directory and everything under `.endo/`, the state directory. */
 export interface Paths {
   agentDir: string;
+  /** `endograph.toml` */
   grant: string;
   state: string;
-  /** The grant as loaded: a copy under `.endo/`, so it resolves `endograph` like the program does. */
-  grantCopy: string;
   /** `.endo/node_modules/endograph` links the endograph that runs the agent. */
   modules: string;
   lock: string;
@@ -24,6 +23,8 @@ export interface Paths {
   runs: string;
   status: string;
   snapshots: string;
+  /** Per inception: the workspace as read and every round's output, writes, and errors; kept on failure. */
+  inceptions: string;
   workspace: string;
 }
 
@@ -31,9 +32,8 @@ export function pathsOf(agentDir: string): Paths {
   const state = join(agentDir, ".endo");
   return {
     agentDir,
-    grant: join(agentDir, "endograph.ts"),
+    grant: join(agentDir, "endograph.toml"),
     state,
-    grantCopy: join(state, "grant.ts"),
     modules: join(state, "node_modules"),
     lock: join(state, "lock"),
     db: join(state, "agent.db"),
@@ -47,6 +47,7 @@ export function pathsOf(agentDir: string): Paths {
     runs: join(state, "runs"),
     status: join(state, "status.json"),
     snapshots: join(state, "snapshots"),
+    inceptions: join(state, "inceptions"),
     workspace: join(state, "workspace"),
   };
 }
@@ -55,9 +56,10 @@ export function pathsOf(agentDir: string): Paths {
 export const ENDOGRAPH_ROOT = resolve(import.meta.dir, "../..");
 
 /**
- * The agent directory holds the owner's two files and nothing else. Every
- * dependency the program, the procedures, and the grant need is the one
- * package linked here by `endo up`, so they all resolve upward to it.
+ * The agent directory holds the owner's two files and nothing else. The
+ * one dependency the program and the procedures need is the package
+ * linked here by `endo up`, so they resolve upward to it; a tsconfig
+ * beside the link lets an editor and `bunx tsc` do the same.
  */
 export function ensureStateDir(paths: Paths): void {
   for (const dir of [paths.procedures, paths.inbox, paths.outbox, paths.runs, paths.snapshots, paths.modules]) mkdirSync(dir, { recursive: true });
@@ -72,11 +74,10 @@ export function ensureStateDir(paths: Paths): void {
     } catch {}
     symlinkSync(ENDOGRAPH_ROOT, link);
   }
-  // For editors and `bunx tsc` in the agent directory: `endograph` resolves to the link. Written once; the owner's from then on.
-  const tsconfig = join(paths.agentDir, "tsconfig.json");
-  if (!existsSync(tsconfig)) writeFileSync(tsconfig, `${JSON.stringify(TSCONFIG, null, 2)}\n`);
+  writeFileSync(join(paths.state, "tsconfig.json"), `${JSON.stringify(TSCONFIG, null, 2)}\n`);
 }
 
+/** `.endo/tsconfig.json`: the program and src typecheck against the linked endograph. Tooling, rewritten at every start. */
 const TSCONFIG = {
   compilerOptions: {
     target: "ESNext",
@@ -86,14 +87,7 @@ const TSCONFIG = {
     skipLibCheck: true,
     allowImportingTsExtensions: true,
     noEmit: true,
-    types: ["./.endo/node_modules/endograph/node_modules/bun-types"],
-    paths: { endograph: ["./.endo/node_modules/endograph/src/index.ts"], "endograph/procedure": ["./.endo/node_modules/endograph/src/procedures/lib.ts"] },
+    types: ["./node_modules/endograph/node_modules/bun-types"],
   },
-  include: ["endograph.ts", ".endo/program", ".endo/src"],
+  include: ["program", "src"],
 };
-
-/** Refresh the loadable copy of the grant. */
-export function copyGrant(paths: Paths): string {
-  copyFileSync(paths.grant, paths.grantCopy);
-  return paths.grantCopy;
-}

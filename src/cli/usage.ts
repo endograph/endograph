@@ -8,7 +8,7 @@ export const CONSUMER_DOC = `# Reaching an agent: the \`endo\` CLI
 
 Any process that can write a file is a client; \`endo\` is the convenience.
 \`--agent <name|dir>\` names the agent (a registered name from
-\`~/.endograph/agents/\`, or a directory holding \`endograph.ts\`); without
+\`~/.endograph/agents/\`, or a directory holding \`endograph.toml\`); without
 it, the current directory must be the agent directory.
 
     endo --agent <name> send [--id <id>] [--ref <r>] [--wait] <text>
@@ -46,8 +46,9 @@ owner:
   endo logs [-f]                              the service log
   endo incept [--manual|--accept] [--inceptor <cmd>]
                                               re-incept: headless, or render the workspace and stop / validate and record
-  endo up --template <dir>                    seed endograph.ts + manifest.md from <dir> first; with neither and no template, endo asks
+  endo up --template <dir>                    seed endograph.toml + manifest.md from <dir> first; with neither and no template, endo asks
   endo doctor                                 grant, program, registry, unit, env, procedures, inputs vs the last inception
+  endo observatory [--port <n>] [--no-open]   open a live, read-only localhost view of projector and inception
   endo charter                                the provisions as the inceptor sees them
   endo replay [<id>] | endo why <id>          the frame log, or the frames about one request or call
   endo reset [--force]                        remove .endo: the next up incepts a fresh agent
