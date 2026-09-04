@@ -16,6 +16,7 @@ import { lookup } from "../cli/registry.ts";
 import { liveRun } from "../procedures/runs.ts";
 import { loadEnv } from "./env.ts";
 import { ensureStateDir, pathsOf, type Paths } from "./paths.ts";
+import { heldElsewhere, HOST, readResidence, since } from "./residence.ts";
 
 /**
  * `endo up`, the running half: hold the lock, load the program, deliver
@@ -35,10 +36,15 @@ export interface OpenOptions {
   activationTimeoutMs?: number;
   /** One line per frame as it is recorded (what `endo logs` shows). */
   log?: (line: string) => void;
+  /** Another host took the state directory: the agent has stopped writing it and should be stopped. */
+  onAdopted?: (host: string) => void;
 }
 
 export interface Status {
   name: string;
+  /** The host that holds the state directory, and whether it still does (see residence.ts). */
+  host: string;
+  running: boolean;
   open: string[];
   runs: { id: string; procedure: string; from: string; startedAt: number }[];
   active: boolean;
@@ -68,6 +74,8 @@ export interface Agent {
 
 export class AlreadyRunning extends Error {}
 export class NoProgram extends Error {}
+/** Another host holds the state directory and has not released it. */
+export class HeldElsewhere extends Error {}
 
 const TERMINAL = (state: ReplyState | undefined) => state !== undefined && state !== "working" && state !== "submitted";
 const REQUEST_HEADER = (m: Delivered<RequestMessage>) =>
@@ -80,6 +88,8 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
   if (!lock) throw new AlreadyRunning(`${paths.agentDir} is already running`);
   try {
     if (!existsSync(paths.program)) throw new NoProgram(`no program at ${paths.program}`);
+    const held = heldElsewhere(paths);
+    if (held) throw new HeldElsewhere(`${paths.agentDir} is held by ${held.host} (as of ${since(held.at)}); \`endo down\` there, or \`endo up --adopt\` to run it here`);
     loadEnv(paths);
     const grant = await loadGrant(paths);
     const name = grant.name;
@@ -97,19 +107,40 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
     const open = new Map<string, { message: Delivered<RequestMessage>; working: boolean }>();
     const seen = new Set<string>();
     let active = false;
+    let running = true;
+    /** Set once another host's status lands: nothing is written here after that. */
+    let adopted: string | undefined;
+    let statusAt = 0;
     let loaded!: Loaded;
     let unsubscribe = () => {};
     const lastFailure = new Map<string, string>();
 
     const status = (): Status => ({
       name,
+      host: HOST,
+      running,
       open: [...open.keys()],
       runs: runs.active().map((r) => ({ id: r.id, procedure: r.procedure, from: r.from, startedAt: r.startedAt })),
       active,
       commands: loaded.procedures.filter((p) => p.expose).map((p) => ({ name: p.name, description: p.description, args: p.args, required: (p.inputSchema.required as string[]) ?? [] })),
       at: Date.now(),
     });
-    const writeStatus = () => writeFileSync(paths.status, JSON.stringify(status()));
+    const writeStatus = () => {
+      if (adopted) return;
+      const s = status();
+      statusAt = s.at;
+      writeFileSync(paths.status, JSON.stringify(s));
+    };
+    // The fence: a status newer than ours from another host means the directory moved. Record it, stop writing, hand over.
+    const fenced = (): boolean => {
+      if (adopted) return true;
+      const r = readResidence(paths);
+      if (!r || r.host === HOST || r.at <= statusAt) return false;
+      adopted = r.host;
+      record({ type: "residence", summary: `adopted by ${r.host}; stopping here`, payload: { by: r.host, at: r.at } });
+      setTimeout(() => opts.onAdopted?.(r.host), 0);
+      return true;
+    };
 
     const runs = createRuns({
       paths,
@@ -292,6 +323,7 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
     };
 
     const poll = async () => {
+      if (fenced()) return;
       const batch: Delivered<RequestMessage>[] = [];
       for (const f of readdirSync(paths.inbox).filter((f) => f.endsWith(".json") && !f.startsWith(".")).sort()) {
         const path = join(paths.inbox, f);
@@ -405,12 +437,15 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
         } catch {}
       },
       async stop() {
+        if (!running) return;
         clearInterval(timer);
         clearInterval(ticker);
         clearTimeout(reloadTimer);
         for (const w of watchers) w.close();
         await busy;
         unsubscribe();
+        running = false;
+        writeStatus();
         store.close();
         lock.release();
       },

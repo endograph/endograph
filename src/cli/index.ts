@@ -1,9 +1,10 @@
 #!/usr/bin/env bun
 import { existsSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
-import { basename, resolve } from "node:path";
-import { openAgent, AlreadyRunning, NoProgram } from "../harness/agent.ts";
+import { basename, join, resolve } from "node:path";
+import { openAgent, AlreadyRunning, HeldElsewhere, NoProgram } from "../harness/agent.ts";
 import { isLocked } from "../harness/lock.ts";
 import { pathsOf } from "../harness/paths.ts";
+import { adopt, heldElsewhere, HOST, readResidence, since } from "../harness/residence.ts";
 import { incept, InceptionFailed } from "../inception/incept.ts";
 import { newId, PROTOCOL_VERSION, waitForReply, writeMessage } from "../protocol/wire.ts";
 import { openSqliteStore } from "../store/sqlite.ts";
@@ -24,6 +25,7 @@ interface Flags {
   foreground: boolean;
   service: boolean;
   force: boolean;
+  adopt: boolean;
   noOpen: boolean;
   port?: number;
   template?: string;
@@ -33,7 +35,7 @@ interface Flags {
 }
 
 function parse(argv: string[]): { command: string; flags: Flags } {
-  const flags: Flags = { manual: false, accept: false, wait: false, follow: false, foreground: false, service: false, force: false, noOpen: false, rest: [] };
+  const flags: Flags = { manual: false, accept: false, wait: false, follow: false, foreground: false, service: false, force: false, adopt: false, noOpen: false, rest: [] };
   let command = "";
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
@@ -46,6 +48,7 @@ function parse(argv: string[]): { command: string; flags: Flags } {
     else if (a === "--foreground") flags.foreground = true;
     else if (a === "--service") flags.service = true;
     else if (a === "--force") flags.force = true;
+    else if (a === "--adopt") flags.adopt = true;
     else if (a === "--no-open") flags.noOpen = true;
     else if (a === "--port") flags.port = Number(argv[++i]);
     else if (a === "--template") flags.template = argv[++i];
@@ -122,6 +125,17 @@ async function up(flags: Flags): Promise<number> {
       return 1;
     }
   }
+  // A state directory another host holds (a copy, a synced mirror) runs here only when adopted; the move is a frame.
+  const held = heldElsewhere(paths);
+  if (held && !flags.adopt) {
+    console.error(`${name} is held by ${held.host} (as of ${since(held.at)}); \`endo down\` there, or \`endo up --adopt\` to run it here`);
+    if (flags.service) await removeService(name);
+    return flags.service ? 0 : 1;
+  }
+  if (held) {
+    adopt(paths);
+    say(`${name} adopted from ${held.host}`);
+  }
   if (!flags.foreground && !flags.service) {
     if (isLocked(paths.lock) && !(await serviceRunning(name).catch(() => false))) {
       console.error(`${name} is running in the foreground somewhere; stop it first`);
@@ -142,7 +156,16 @@ async function up(flags: Flags): Promise<number> {
     return 1;
   }
   try {
-    const agent = await openAgent({ agentDir: paths.agentDir, log: say });
+    const agent = await openAgent({
+      agentDir: paths.agentDir,
+      log: say,
+      onAdopted: async (host) => {
+        say(`${name} adopted by ${host}; stopping here`);
+        await agent.stop();
+        if (flags.service) await removeService(name);
+        process.exit(0);
+      },
+    });
     agent.start();
     say(`${agent.name} up in ${paths.agentDir} (${agent.loaded.procedures.length} procedures)`);
     const stop = async () => {
@@ -154,7 +177,8 @@ async function up(flags: Flags): Promise<number> {
     await new Promise(() => {});
     return 0;
   } catch (err) {
-    if (err instanceof AlreadyRunning || err instanceof NoProgram) console.error(err.message);
+    if (err instanceof AlreadyRunning || err instanceof NoProgram || err instanceof HeldElsewhere) console.error(err.message);
+    if (err instanceof HeldElsewhere && flags.service) await removeService(name);
     else console.error(`${err instanceof Error ? err.message : String(err)}\nrun \`endo incept\` to rewrite the program`);
     // A service exits 0 so the supervisor does not crash-loop; the foreground says what to do.
     return flags.service ? 0 : 1;
@@ -317,6 +341,8 @@ async function status(flags: Flags): Promise<number> {
   const s = readStatus(paths);
   const up = isLocked(paths.lock);
   say(s ? `${s.name}: ${up ? (s.active ? "up, active" : "up, idle") : "down"}, ${s.open.length} open request(s), ${s.runs.length} running procedure(s) (as of ${new Date(s.at).toISOString()})` : "never up");
+  const held = heldElsewhere(paths);
+  if (held) say(`  held by ${held.host}; \`endo up --adopt\` to run it here`);
   try {
     const { inceptionStatus } = await import("../inception/incept.ts");
     const i = await inceptionStatus(paths, { load: false });
@@ -415,6 +441,9 @@ async function doctor(flags: Flags): Promise<number> {
     note(unit.includes(paths.agentDir), unit.includes(paths.agentDir) ? `unit ${svc.file}` : `unit ${svc.file} points elsewhere; \`endo up\` here rewrites it`);
     note(true, `service ${(await serviceRunning(name).catch(() => false)) ? "running" : "not running"}`);
   } else note(true, `no service unit (${isLocked(paths.lock) ? "a foreground up is running" : "down"})`);
+  const held = heldElsewhere(paths);
+  note(!held, held ? `held by ${held.host} as of ${since(held.at)}: \`endo down\` there, or \`endo up --adopt\` to run it here` : `residence: ${readResidence(paths)?.host ?? HOST}`);
+  if (existsSync(join(paths.state, ".git"))) note(true, "state directory is a git checkout");
   const { loadEnv } = await import("../harness/env.ts");
   const keys = loadEnv(paths);
   note(true, keys.length ? `env: ${keys.join(", ")}` : "env: no .endo/env (credentials must come from the environment)");
