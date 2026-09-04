@@ -138,7 +138,7 @@ async function up(flags: Flags): Promise<number> {
     return 1;
   }
   try {
-    const agent = await openAgent({ agentDir: paths.agentDir });
+    const agent = await openAgent({ agentDir: paths.agentDir, log: say });
     agent.start();
     say(`${agent.name} up in ${paths.agentDir} (${agent.loaded.procedures.length} procedures)`);
     const stop = async () => {

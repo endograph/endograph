@@ -69,11 +69,33 @@ test("empty state dir → inception with a fixture inceptor (two rounds) → a s
   expect((await endo(dir, "status")).out).toMatch(/inputs changed since inception 1: manifest/);
   const second = await endo(dir, "incept", "--inceptor", `${process.execPath} ${join(ROOT, "test/fixtures/inceptor.ts")}`);
   expect(second.code).toBe(0);
-  expect(readdirSync(join(dir, ".endo/workspace")).sort()).toEqual(["BASELINE", "CLI.md", "DIFF.md", "GRANT.md", "MANIFEST.md", "PROGRAM.md", "TASK.md", "batteries", "instance.json"]);
+  expect(readdirSync(join(dir, ".endo/workspace")).sort()).toEqual(["BASELINE", "CHANGES.md", "CLI.md", "DIFF.md", "EVOLUTION.md", "GRANT.md", "MANIFEST.md", "PROGRAM.md", "TASK.md", "batteries", "instance.json"]);
+  expect(readFileSync(join(dir, ".endo/workspace/EVOLUTION.md"), "utf8")).toMatch(/nothing: no spawn/);
   expect(readFileSync(join(dir, ".endo/workspace/DIFF.md"), "utf8")).toMatch(/\+Also: be brief/);
   expect(readFileSync(join(dir, ".endo/workspace/TASK.md"), "utf8")).toMatch(/revising it, not starting over/);
   expect(readdirSync(join(dir, ".endo/snapshots")).sort()).toEqual(["1", "2"]);
   expect(existsSync(join(dir, ".endo/src/README.md"))).toBe(true);
+
+  // The first up after inception 2 delivers the inceptor's brief as a request from inceptor:2, once.
+  const again = Bun.spawn([process.execPath, ENDO, "up", "--foreground"], { cwd: dir, env, stdout: "pipe", stderr: "pipe" });
+  try {
+    let briefed: { text: string } | undefined;
+    for (let i = 0; i < 100 && !briefed; i++) {
+      await Bun.sleep(100);
+      const s = openSqliteStore(join(dir, ".endo/agent.db"));
+      briefed = [...allFrames(s)].filter((f) => f.type === "reply").map((f) => f.payload as { text: string }).find((r) => r.text === "seen from inceptor:2");
+      s.close();
+    }
+    expect(briefed?.text).toBe("seen from inceptor:2");
+  } finally {
+    again.kill("SIGTERM");
+    await again.exited;
+  }
+  {
+    const s = openSqliteStore(join(dir, ".endo/agent.db"));
+    expect([...allFrames(s)].filter((f) => f.type === "request" && f.summary.startsWith("inceptor:2")).length).toBe(1);
+    s.close();
+  }
 
   // Reset wipes the state directory and the registration.
   expect((await endo(dir, "reset", "--force")).code).toBe(0);

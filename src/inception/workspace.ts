@@ -31,6 +31,8 @@ export interface WorkspaceInput {
     errors?: string;
     /** The persisted instance, serialized. */
     instance?: unknown;
+    /** EVOLUTION.md: every reshaping since the last inception, with reasons. */
+    evolution: string;
   };
 }
 
@@ -52,6 +54,7 @@ export function renderWorkspace(input: WorkspaceInput): string {
     writeFileSync(join(dir, "DIFF.md"), `# DIFF: owner inputs at inception ${input.n - 1} versus now\n\n${baseline.diff.trim() ? "```diff\n" + baseline.diff.trimEnd() + "\n```" : "(no change to manifest.md, endograph.ts, or the endograph version)"}\n`);
     if (baseline.errors) writeFileSync(join(dir, "ERRORS.md"), `# ERRORS: the current program does not load\n\n${baseline.errors}\n`);
     if (baseline.instance !== undefined) writeFileSync(join(dir, "instance.json"), `${JSON.stringify(baseline.instance, null, 2)}\n`);
+    writeFileSync(join(dir, "EVOLUTION.md"), baseline.evolution);
   }
   writeFileSync(join(dir, "TASK.md"), renderTask(input));
   return dir;
@@ -104,10 +107,19 @@ This agent exists: you are revising it, not starting over (PROGRAM.md §9).
 Beside this file: \`BASELINE/\` (the program and src as inception ${n - 1}
 left them), \`DIFF.md\` (the owner's inputs then versus now)${baseline.errors ? `,
 \`ERRORS.md\` (why the current program no longer loads: fix that first)` : ""}${baseline.instance !== undefined ? `,
-and \`instance.json\` (the persisted instance; leave it alone unless the new
-program cannot hydrate it, then change the minimum)` : ""}. The current
-program and src are in place under \`.endo/\`; the agent's own procedures
-and notes are preserved unless the new intent forbids them.
+\`instance.json\` (the persisted instance: what the agent has made of
+itself; migrate it to the new program, PROGRAM.md §9)` : ""}, and
+\`EVOLUTION.md\` (every spawn, cede, transition, and state update since
+inception ${n - 1}, with what triggered it and the reason the agent gave:
+the context for that migration). The current program and src are in
+place under \`.endo/\`; the agent's own procedures and notes are
+preserved unless the new intent forbids them.
+
+Before you finish, write \`CHANGES.md\` in this workspace: a short brief
+to the agent, in the second person, saying what changed in its program,
+what of its own work was absorbed or moved, and what it should do
+differently. The agent reads it as its first request after this
+inception.
 `
     : "";
   return `# TASK: inception ${n} of ${grant.name}

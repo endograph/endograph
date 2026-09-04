@@ -179,3 +179,11 @@ function alive(pid: number): boolean {
   }
 }
 
+/** The procedure behind a run id in some agent's state directory, while that run lives. */
+export function liveRun(paths: Paths, id: string): string | undefined {
+  try {
+    return (JSON.parse(readFileSync(join(paths.runs, `${id}.json`), "utf8")) as { procedure?: string }).procedure;
+  } catch {
+    return undefined;
+  }
+}

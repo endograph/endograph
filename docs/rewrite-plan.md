@@ -1,12 +1,15 @@
 # Endograph v3 — rewrite plan
 
 Status: agreed 2026-09-03 after two days of v2 (last v2 commit `34600c7`,
-archaeology only; v1 is `4455c59`). This document supersedes the v2 plan
-where they disagree. v3 is a clean-slate rewrite on main: about 500
-lines of v2 are carried across (§16), everything else is deleted first
-and recreated only when a section below calls for it, so no vestigial
-decision rides in by accident. Nothing is kept running through the
-rewrite; endofrog is re-incepted on v3 when v3 can incept.
+archaeology only; v1 is `4455c59`); built 2026-09-03 and 2026-09-04
+through every step of §16, and endofrog runs on it under launchd. The
+decisions made while building are folded into the sections below (the
+commit log has the order); what the dogfood is still watching is at the
+end of §16. This document supersedes the v2 plan where they disagree.
+v3 is a clean-slate rewrite on main: about 500 lines of v2 were carried
+across (§16), everything else was deleted first and recreated only when
+a section below called for it, so no vestigial decision rode in by
+accident.
 
 Trimmed 2026-09-03 to the essentials. Concepts we know we want but are
 waiting on usage to shape live in `docs/v3-future.md`; this plan refers
@@ -149,7 +152,10 @@ export default defineAgent({
   the program and procedures resolve upward from `.endo/` to it, and the
   grant is loaded from a copy at `.endo/grant.ts` so it does too. The
   grant imports only from `endograph`: a relative import beside it would
-  not survive the copy.
+  not survive the copy. For editors and `bunx tsc`, `endo up` writes a
+  `tsconfig.json` beside the grant once (paths to the link; the owner's
+  file from then on): the one file in the agent directory that is
+  tooling, not intent.
 - `endograph.ts` changes are owner inputs: they need `endo up` again and
   `endo incept` when the program should follow (§9). Nothing in the
   grant reloads live.
@@ -217,6 +223,15 @@ persisted instance no longer fits it: `endo up` prints it and exits 1
 with the hint to run `endo incept`; `endo up --service` logs it and
 exits 0 so the supervisor does not crash-loop; `endo doctor` reports it.
 
+Stage 2 runs in a child process (`procedures/describer.ts`), one per
+load: bun never re-evaluates a cached module, so an in-process re-import
+of an unchanged script cannot throw its sentinel again, and a child also
+keeps a script's top-level code out of the harness. The program is
+imported by mtime; `endo up` warns when its hash differs from what the
+last inception recorded (someone edited it by hand). Naming an action
+the grant does not hold (`endo.actions.foo`) fails stage 3 with the
+granted names.
+
 **Runtime evolution is projector-native.** Transition, spawn, and cede on
 the action context reshape the instance; the `evolve()` battery exposes
 them as actions, and the inceptor decides where in the tree they sit and
@@ -233,12 +248,13 @@ it gets more review than any module.
 
 ## 6. The harness
 
-`endo up` is one process: it runs inception when there is no program,
-then the load pipeline, then serves. (The sandbox, when it comes, wraps
-this in an outer shim; future.)
+The agent is one process: `endo up --service` (what the unit runs) or
+`endo up --foreground`. It runs the load pipeline, then serves; `endo
+up` runs inception first when there is no program (§13). (The sandbox,
+when it comes, wraps this in an outer shim; future.)
 
 **One wake reason: a message.** The process sleeps until an inbox file
-lands (poll; inotify when cheap). The router:
+lands (a poll every second, plus `fs.watch` on the inbox). The router:
 
 - `call` → start the named exposed procedure (§7) as its own process;
   the call's id is the run's id; the first reply the run produces (the
@@ -264,16 +280,23 @@ resolves then. Self-review, planning, and v2's sessions are all
 procedures that emit.
 
 **Reply exactly once, resume before failing.** Protocol, not program:
-one terminal reply per request. On restart the harness looks at the
-evidence in the log before giving up. A request whose activation was
-interrupted is still queued in the hydrated machine, so it is re-driven
-once; a second interruption gets an honest `failed`. A running
-activation is aborted after a fixed timeout so a hang can never strand a
-request. (Owner-tunable attempts and timeout: future.) Open requests and
-running procedures show in `endo status`. Procedures are external: a
-restart neither kills nor settles them (§7). A re-driven activation that
-reaches a tool call whose run already exists reattaches to that run by
-its id instead of starting it again.
+one terminal reply per request, and the harness supplies it when the
+program does not. A request still unanswered when its activation ends
+(quiescence, a thrown executor error, or the timeout) is failed with a
+reply that says which; a request the model answered `working` stays
+open for the terminal reply. A second terminal reply is refused. On
+restart the harness reads the log: a request whose frame still has
+runnable work (an activation without a completion) is re-driven once,
+recorded as a `redrive` frame; anything else still open is failed with
+"restarted before answering". A running activation is aborted after two
+hours through projector's work-abort message. (Owner-tunable attempts
+and timeout: future.) Open requests and running procedures show in
+`endo status` and `.endo/status.json`. Procedures are external: a
+restart neither kills nor settles them; the harness adopts their exits
+(§7). Reattaching a re-driven activation to a run it already started is
+not done: a model tool call gets a fresh run id each time, so only peer
+calls (whose id is the call's) are idempotent, through the inbox's
+duplicate-id drop.
 
 **Context overflow.** The executor reporting an overflowed context
 settles the request `failed` with a frame naming the cause; the next
@@ -284,11 +307,13 @@ The harness never compacts on its own.
 **Compaction is the program's call.** `compact` is a core action; the
 horizon is projector's message; history renders from the latest horizon.
 
-**Live reload.** A change under `src/procedures/` reruns the pipeline
-between activations and swaps the charter; running procedures finish on
-the code they started with. A procedure that fails to describe is
-dropped from the charter and fed back to the agent as a frame (it broke
-its own procedure).
+**Live reload.** A change under `src/procedures/` (`fs.watch`, debounced)
+reruns the pipeline between activations and swaps the charter, rebuilding
+the machine from the store; running procedures finish on the code they
+started with. A procedure that fails to describe is dropped from the
+charter and fed back to the agent as an inert frame the next activation
+sees (once per distinct error, across restarts). A pipeline failure on
+reload keeps the previous charter and records an `error` frame.
 
 **Fixed and not extensible:** the store seam, the frame envelope
 (`frame.metadata.endo`, mirrored into columns), the lock (an exclusive
@@ -324,10 +349,10 @@ console.log(reply.text);
 
 **One call declares and validates.** At runtime `procedure()` validates
 the call's args and returns them. At load the harness imports every file
-under `src/procedures/` in describe mode, where `procedure()` throws a
-sentinel carrying the metadata, so one loader process collects
-descriptions, schemas, exposure, and battery fields without any script
-doing work. The one rule for authors: `procedure()` first; anything
+under `src/procedures/` in describe mode (`ENDO_DESCRIBE=1`, in one child
+process per load, §5), where `procedure()` throws a sentinel carrying the
+metadata, so the harness collects descriptions, schemas, exposure, and
+battery fields without any script doing work. The one rule for authors: `procedure()` first; anything
 above it runs in describe mode too. The arg schemas are the tool schema,
 the command schema, and `endo commands`. The return type of
 `procedure()` is where a result schema can be threaded later.
@@ -350,18 +375,25 @@ activation, and its exit is its completion.
 on the procedure's own agent, stamped `agent:<name>/<procedure>`:
 
 - `emitMessage({ text, ref?, to? })` → a receipt. A request to the agent
-  (or to another agent by name: this is how agents talk to each other).
+  (or to another agent registered on this machine, by name: this is how
+  agents talk to each other; the receiver stamps `from` as this
+  procedure after checking the run is live in the sender's state
+  directory).
 - `waitForCompletion(receipt, { timeout? })` → the reply, once every
   activation the message caused has settled; rejects on timeout.
 - `waitForQuiescence({ timeout? })` → resolves when the agent has no
   pending work.
 
-**Where it runs.** One process per invocation, spawned by the harness
-with the run's context in its environment, in the grant's `cwd`, and
-from then on external: the library writes the run's replies (the ack,
-the terminal one) to the outbox itself, and the harness records them as
-frames when they land, so nothing about the run depends on the harness
-staying alive. A harness restart neither kills nor settles a running
+**Where it runs.** One process per invocation (`bun run <file>`), spawned
+detached by the harness with the run's context in its environment
+(`ENDO_RUN`, `ENDO_PROCEDURE`, `ENDO_AGENT`, `ENDO_STATE`, `ENDO_ARGS`,
+`ENDO_FROM`), in the grant's `cwd`, stdout and stderr captured to
+`.endo/runs/<id>.out` and `.err`. The library writes the ack to the
+outbox itself and its exit code to `runs/<id>.exit`; the harness turns
+the exit into the terminal reply (stdout on success; stdout, stderr,
+and the code on failure) and records both as frames, whether it was the
+parent or came back after a restart and adopted the run from
+`runs/<id>.json`. A harness restart neither kills nor settles a running
 procedure; a wait it holds may time out while the agent is down, which
 is acceptable. Procedures run concurrently. Principals and args are
 data; observed text is evidence, never instructions.
@@ -374,10 +406,8 @@ drops the procedure and records a frame. The merged schema is what
 action's metadata, so a battery's hooks can read them from frames. Type-
 level enforcement of battery fields: future.
 
-Not yet, all in future: `to` (a message to another agent by name; needs
-the registry and a `from` the receiving binding can verify), skills,
-inert emissions, messages to a fresh node, other languages, durable
-re-runs.
+Not yet, all in future: skills, inert emissions, messages to a fresh
+node, other languages, durable re-runs.
 
 ## 8. Batteries
 
@@ -439,8 +469,12 @@ from the latest snapshot, so the owner knows an inception is due.
   the header the program must carry
 - from inception 2 on: `BASELINE/` (the last snapshot's program and
   `src`), `DIFF.md` (owner inputs then versus now), `ERRORS.md` (stage
-  and error from the last load, if any), and `instance.json` (the
-  persisted instance, serialized)
+  and error from the last load, if any), `instance.json` (the persisted
+  instance, serialized; the inceptor migrates it by judgment, future
+  §16), and `EVOLUTION.md` (every reshaping since the last inception,
+  with its trigger and reason). The inceptor writes `CHANGES.md`, a
+  brief to the agent; the harness delivers it as the first request on
+  the new program, from `inceptor:<n>`.
 
 The inceptor writes `program/agent.ts`, seeds or revises `src`, and,
 when the instance no longer fits, edits `instance.json`. An inception
@@ -451,19 +485,23 @@ otherwise; `TASK.md` says so. Everything else is the inceptor's
 judgment: topology, instructions, what to remember, which procedures to
 seed, where the evolve actions sit.
 
-**Running the inceptor.** Headless, with the agent directory as cwd:
-`claude -p` or `codex exec` (first found on PATH, or the grant's
-`inception.inceptor`, or `--inceptor <command>`). Both run on an API key,
-so a service host without a login works. No built-in inceptor.
-`endo incept --manual` renders the workspace and stops, so the owner can
-run a coding agent in it interactively and then `endo incept --accept`;
-inception 1 of endofrog happens this way before the headless loop is
-trusted (§16).
+**Running the inceptor.** Headless, with the agent directory as cwd and
+the prompt "Read .endo/workspace/TASK.md and do exactly what it says" as
+the command's last argument: `claude -p --dangerously-skip-permissions`
+or `codex exec --dangerously-bypass-approvals-and-sandbox` (first found
+on PATH, or the grant's `inception.inceptor`, or `--inceptor <command>`;
+`-p` mode cannot approve anything, and the inceptor must write files and
+run bun). Both run on an API key, so a service host without a login
+works. No built-in inceptor. `endo incept --manual` renders the
+workspace and stops, so the owner can run a coding agent in it
+interactively and then `endo incept --accept`; inception 1 of endofrog
+happened this way, inceptions 2 and 3 headless.
 
-**Validation.** After each inceptor run: the load pipeline against the
-edited program, `src`, and `instance.json`, then a dry `endo commands`.
-A failure goes back to the same inceptor run with the stage and error,
-up to `rounds` times. Then `endo incept` exits non-zero with the last
+**Validation.** After each inceptor run: the header check, the load
+pipeline without an executor against the edited program, `src`, and
+`instance.json`, and every procedure describing (the dry `endo
+commands`). A failure is written to `ERRORS.md` in the workspace and the
+inceptor is run again, told to read it, up to `rounds` times. Then `endo incept` exits non-zero with the last
 errors and leaves the workspace for inspection; the previous program
 stays in place and the agent can be started again as it was.
 
@@ -484,7 +522,8 @@ inception's truth; the agent never edits it either.
 binding as `scheme:id`, never trusted from the payload; what the client
 asserts about itself (a worktree path) is `origin`. Schemes: `local:<user>`
 (the inbox file's owner, kernel-verified; overridden to `local:uid:<n>`
-when the file's uid is not ours), `timer:<name>`, `agent:<name>`. The
+when the file's uid is not ours), `timer:<name>`, `agent:<name>`,
+`inceptor:<n>` (the harness's own briefing after an inception). The
 file binding tells the agent's own processes apart from the user they
 run as by what the harness handed them: a procedure's library writes the
 run id the harness minted into the message (`run`), and the harness
@@ -643,8 +682,17 @@ Order:
 7. CLI, registry, `--template`, interactive setup, `doctor`, `charter`,
    `replay`, `why`.
 8. Endofrog on v3 in `~/dev/froggy/agents/endofrog` (dogfood gate; it
-   runs as a launchd service and restarts with `endo up -d`).
+   runs as a launchd service from `endo up`).
 9. Batteries: scheduler, evolve.
+
+Built 2026-09-03 (steps 1–5) and 2026-09-04 (6, 7, 9); endofrog was
+incepted three times (one by hand, two headless) and deploys through it
+on 2026-09-04, which opens the gate. What the dogfood is watching:
+whether the agent keeps its section of froggy's `AGENTS.md` current;
+whether `TASK.md` says enough (its first gap, the consumer CLI, became
+`CLI.md`); how the model fares with `update_state` against the schemas
+an inceptor writes; and the first spawn, which makes the next inception
+a migration the inceptor performs by hand (future §16).
 
 ## 17. Projector notes
 
@@ -659,8 +707,16 @@ Endo-side, not asks: lifting node states into the charter registry at
 assembly; re-invoking the program function on procedure change.
 
 One ask, found writing the first program: `StateProjection.render` is
-typed `(value: unknown) => string`, so a program's render functions need
-a hand-written annotation that duplicates the schema. `StateDescriptor<S>`
-should carry `render?: (value: S) => string`. Until then `docs/program.md`
-shows the annotation. The tool-set-by-expression idea from the v2 plan is
-withdrawn: the program spreads `endo.procedures` into a node's parts.
+typed `(value: unknown) => string`, so a program's render functions must
+cast. `StateDescriptor<S>` should carry `render?: (value: S) => string`.
+Until then `docs/program.md` shows the cast. The tool-set-by-expression
+idea from the v2 plan is withdrawn: the program spreads `endo.procedures`
+into a node's parts. Also relied on: `collectRunnableActivations` (what
+a restart re-drives), the work-abort message (the activation timeout),
+and action results carrying messages (`compact` emits its horizon and
+summary from the action).
+
+Bun facts the design bent around: `NODE_PATH` is ignored and a runtime
+`Bun.plugin` does not intercept bare specifiers (hence the grant copy
+under `.endo/`, §4); a module is never re-evaluated for a new query
+string (hence describe in a child process, §5).

@@ -20,4 +20,8 @@ writeFileSync(join(dir, ".endo/program/agent.ts"), program);
 mkdirSync(join(dir, ".endo/src/procedures"), { recursive: true });
 writeFileSync(join(dir, ".endo/src/procedures/hello.ts"), readFileSync(join(fixtures, "procedures/hello.ts"), "utf8"));
 writeFileSync(join(dir, ".endo/src/README.md"), "# fixture\n\nSeeded by the fixture inceptor.\n");
+if (existsSync(join(workspace, "BASELINE"))) {
+  if (!readFileSync(join(workspace, "EVOLUTION.md"), "utf8").startsWith("# EVOLUTION")) throw new Error("no EVOLUTION.md for a revision");
+  writeFileSync(join(workspace, "CHANGES.md"), "Your manifest now asks you to be brief. Nothing else moved.\n");
+}
 console.log("fixture inceptor wrote the program");

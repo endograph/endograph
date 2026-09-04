@@ -7,12 +7,14 @@ import { grantActions } from "../grant/core.ts";
 import { isGrant, type Grant } from "../grant/define.ts";
 import { loadAgent, LoadError, type Loaded } from "../program/load.ts";
 import { createRuns, type Runs, type RunRequest } from "../procedures/runs.ts";
-import { PROTOCOL_VERSION, writeReply, type CallMessage, type Delivered, type Message, type Reply, type ReplyState, type RequestMessage } from "../protocol/wire.ts";
+import { newId, PROTOCOL_VERSION, writeReply, type CallMessage, type Delivered, type Message, type Reply, type ReplyState, type RequestMessage } from "../protocol/wire.ts";
 import { openSqliteStore } from "../store/sqlite.ts";
 import { allFrames, type FrameInput, type FrameStore } from "../store/types.ts";
 import { endoMeta, firstLine, frameInputOf } from "./frames.ts";
 import { acquireLock } from "./lock.ts";
 import { hashOf } from "../inception/incept.ts";
+import { lookup } from "../cli/registry.ts";
+import { liveRun } from "../procedures/runs.ts";
 import { loadEnv } from "./env.ts";
 import { copyGrant, ensureStateDir, pathsOf, type Paths } from "./paths.ts";
 
@@ -32,6 +34,8 @@ export interface OpenOptions {
   pollMs?: number;
   /** A running activation is aborted after this long. */
   activationTimeoutMs?: number;
+  /** One line per frame as it is recorded (what `endo logs` shows). */
+  log?: (line: string) => void;
 }
 
 export interface Status {
@@ -85,7 +89,12 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
     const executor = opts.executor ?? grant.executor.create();
     const activationTimeoutMs = opts.activationTimeoutMs ?? 2 * 60 * 60 * 1000;
 
-    const record = (input: Omit<FrameInput, "at"> & { at?: number }) => store.append({ ...input, at: input.at ?? Date.now() });
+    const append = (input: FrameInput) => {
+      const frame = store.append(input);
+      opts.log?.(`${String(frame.seq).padStart(4)}  ${new Date(frame.at).toISOString().slice(11, 19)}  ${frame.type.padEnd(11)} ${frame.id ?? ""}  ${frame.summary}`);
+      return frame;
+    };
+    const record = (input: Omit<FrameInput, "at"> & { at?: number }) => append({ ...input, at: input.at ?? Date.now() });
     const open = new Map<string, { message: Delivered<RequestMessage>; working: boolean }>();
     const seen = new Set<string>();
     let active = false;
@@ -135,12 +144,22 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
     };
     const fail = (id: string, text: string) => reply(id, { ok: false, state: "failed", text });
 
-    const actions = grantActions(grant, { name, cwd, charter: () => loaded.charter }, { reply });
+    const actions = grantActions(
+      grant,
+      { name, cwd, charter: () => loaded.charter },
+      {
+        reply,
+        stateSchema: (key) => {
+          const descriptor = loaded.charter.states[key];
+          return descriptor ? normalizeSchema(descriptor.schema).jsonSchema() : undefined;
+        },
+      },
+    );
 
     const attach = (next: Loaded) => {
       unsubscribe();
       loaded = next;
-      unsubscribe = next.machine.subscribe((frame) => store.append(frameInputOf(frame)));
+      unsubscribe = next.machine.subscribe((frame) => append(frameInputOf(frame)));
       for (const f of next.failures) {
         if (lastFailure.get(f.name) === f.error) continue;
         lastFailure.set(f.name, f.error);
@@ -196,6 +215,20 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
         record({ type: "redrive", id, summary: "re-driving the interrupted activation once" });
         redrive.push(id);
       } else fail(id, "the agent restarted before answering this; send it again");
+    }
+
+    // The first activation on a new program is briefed: the inceptor's CHANGES.md, once, as a request from inceptor:<n>.
+    let briefing: Delivered<RequestMessage> | undefined;
+    {
+      let last: { n: number; changes?: string } | undefined;
+      let briefed = -1;
+      for (const f of allFrames(store)) {
+        if (f.type === "inception") last = f.payload as { n: number; changes?: string };
+        if (f.type === "request") briefed = Math.max(briefed, Number((f.payload as { metadata?: { endo?: { briefing?: number } } })?.metadata?.endo?.briefing ?? -1));
+      }
+      if (last?.changes && briefed < last.n) {
+        briefing = { v: PROTOCOL_VERSION, kind: "request", id: newId(), from: `inceptor:${last.n}`, text: last.changes, at: Date.now() };
+      }
     }
 
     let busy: Promise<void> = Promise.resolve();
@@ -278,6 +311,7 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
         if (message.kind === "call") handleCall({ ...message, from });
         else batch.push({ ...message, from });
       }
+      if (briefing) (batch.unshift(briefing), (briefing = undefined));
       if (batch.length === 0) return;
       for (const m of batch) open.set(m.id, { message: m, working: false });
       const froms = [...new Set(batch.map((m) => m.from))].join(", ");
@@ -289,14 +323,22 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
           id: batch.length === 1 ? batch[0]!.id : undefined,
           ids: batch.map((m) => m.id),
           requests: batch,
+          ...(batch.some((m) => m.from.startsWith("inceptor:")) ? { briefing: Number(batch.find((m) => m.from.startsWith("inceptor:"))!.from.slice(9)) } : {}),
         }),
       });
       await drive(batch.map((m) => m.id));
     };
 
     const stamp = (message: Message | undefined, path: string): string => {
-      const run = message?.run ? runs.get(message.run) : undefined;
-      if (run) return `agent:${name}/${run.procedure}`;
+      if (message?.run && (!message.agent || message.agent === name)) {
+        const run = runs.get(message.run);
+        if (run) return `agent:${name}/${run.procedure}`;
+      } else if (message?.run && message.agent) {
+        // Another agent's procedure: its harness wrote runs/<id>.json while the run lives.
+        const entry = lookup(message.agent);
+        const procedure = entry?.exists ? liveRun(pathsOf(entry.dir), message.run) : undefined;
+        if (procedure) return `agent:${message.agent}/${procedure}`;
+      }
       try {
         const uid = statSync(path).uid;
         return uid === process.getuid?.() ? `local:${userInfo().username}` : `local:uid:${uid}`;
@@ -377,6 +419,7 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
     };
     writeStatus();
     if (redrive.length) await serially(() => drive(redrive));
+    if (briefing) await serially(poll);
     return agent;
   } catch (err) {
     lock.release();

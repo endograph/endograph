@@ -2,6 +2,7 @@ import type { StandardSchemaV1 } from "@standard-schema/spec";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { normalizeSchema, SchemaError } from "@projectors/core";
+import { lookup } from "../cli/registry.ts";
 import { newId, PROTOCOL_VERSION, readReply, writeMessage, writeReply, type Reply } from "../protocol/wire.ts";
 
 /**
@@ -44,6 +45,8 @@ export class DescribeSignal extends Error {
 
 export interface Receipt {
   id: string;
+  /** The state directory whose outbox answers it: this agent's, or the `to` agent's. */
+  state: string;
 }
 
 const env = () => ({
@@ -101,23 +104,31 @@ export function actionResult(text: string): void {
   writeReply(join(ctx.state, "outbox"), { v: PROTOCOL_VERSION, id: ctx.run, ok: true, state: "working", text, at: Date.now() });
 }
 
-/** A request to the agent. The harness stamps `from` as this procedure. */
-export function emitMessage(message: { text: string; ref?: string }): Receipt {
+/**
+ * A request to this agent, or with `to` to another agent registered on
+ * this machine. The receiving harness stamps `from` as this procedure
+ * after checking the run is live.
+ */
+export function emitMessage(message: { text: string; ref?: string; to?: string }): Receipt {
   const ctx = env();
-  if (!ctx.run || !ctx.state) throw new Error("emitMessage() outside a procedure run");
+  if (!ctx.run || !ctx.state || !ctx.agent) throw new Error("emitMessage() outside a procedure run");
   if (!acked) throw new Error("call actionResult() first, or exit without emitting");
+  let state = ctx.state;
+  if (message.to && message.to !== ctx.agent) {
+    const entry = lookup(message.to);
+    if (!entry?.exists) throw new Error(`no agent "${message.to}" is registered on this machine`);
+    state = join(entry.dir, ".endo");
+  }
   const id = newId();
-  writeMessage(join(ctx.state, "inbox"), { v: PROTOCOL_VERSION, kind: "request", id, text: message.text, ref: message.ref, run: ctx.run, at: Date.now() });
-  return { id };
+  writeMessage(join(state, "inbox"), { v: PROTOCOL_VERSION, kind: "request", id, text: message.text, ref: message.ref, run: ctx.run, agent: ctx.agent, at: Date.now() });
+  return { id, state };
 }
 
 /** The terminal reply to a message this procedure emitted. Rejects on timeout. */
 export async function waitForCompletion(receipt: Receipt, opts: { timeoutMs?: number } = {}): Promise<Reply> {
-  const ctx = env();
-  if (!ctx.state) throw new Error("waitForCompletion() outside a procedure run");
   const deadline = Date.now() + (opts.timeoutMs ?? 60 * 60 * 1000);
   for (;;) {
-    const reply = readReply(join(ctx.state, "outbox"), receipt.id);
+    const reply = readReply(join(receipt.state, "outbox"), receipt.id);
     if (reply && reply.state !== "working" && reply.state !== "submitted") return reply;
     if (Date.now() >= deadline) throw new Error(`timed out waiting for a reply to ${receipt.id}`);
     await Bun.sleep(250);

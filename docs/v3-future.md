@@ -29,7 +29,7 @@ sandbox: {                    // omitted = no sandbox at all
   procedure must write (a requester's build dir) are granted here.
 - `env`: the variables the tree sees beyond the default set, which is
   exactly `PATH`, `HOME`, `USER`, `LANG`, `TERM`, `TMPDIR`, and `ENDO_*`.
-  Credentials come from the state directory's `env` file or the service
+  Credentials come from `.endo/env` (landed, plan §13) or the service
   environment, filtered by this list; nothing passes unlisted.
 - `endo up --no-sandbox` skips the wrapper for one run and says so in
   status.
@@ -249,41 +249,40 @@ several agents. Unchanged from v2, unscheduled.
 
 **What.** Re-incepting an agent whose persisted instance has evolved
 (spawns, cedes, transitions, state updates through the evolve battery)
-without the inceptor having to guess which parts of the instance are
-default and which are the agent's intent.
+so that what the agent made of itself survives where it still applies
+and disappears where the new program absorbs it.
 
-**Already designed.**
+**Decided 2026-09-04.** Migration is the inceptor's judgment, not a
+replay. An earlier draft replayed the evolution frames onto the new
+program's fresh instance and sent only conflicts to the inceptor; it was
+dropped because the common case defeats it: an inception often exists
+because the owner saw what the agent spawned and wrote it into the
+program properly, and a replay cannot tell "absorbed" from "still
+wanted". It would re-add the helper beside its replacement, and every
+inception would compound it.
 
-- *The baseline is reproducible.* The program function is pure, so
-  re-invoking snapshot n−1's program against snapshot n−1's provisions
-  yields exactly the instance the agent started with:
-  `instance.initial.json` in the workspace beside `instance.json`.
-- *Every self-modification is a frame with provenance.* `EVOLUTION.md`
-  in the workspace lists each spawn, cede, transition, and state update
-  since the last inception, with the activation that made it, that
-  activation's trigger, and the reason the agent gave. Default versus
-  intentional is never in doubt.
-- *Mechanical replay first.* Before the inceptor sees a conflict, the
-  harness hydrates the new program's fresh instance and replays the
-  evolution frames onto it. Spawns compose (they reference registered
-  actions only), state updates patch unless the schema changed, cedes
-  remove what they removed. Only two things fail: a frame naming an
-  action or state the new grant dropped, and a transition, which
-  replaces a node wholesale and would overwrite the new program's
-  version of it. Those are the conflicts in `ERRORS.md`; the inceptor
-  resolves them in `instance.json` and nothing else needs its
-  attention.
-- *Evolve actions take a required `reason`* that lands in the frame, so
-  the evolution log reads as intent, not mechanics.
+- *The instruction is explicit.* `instance.json` in the workspace is
+  what the agent has made of itself; `TASK.md` and `docs/program.md` §9
+  say to migrate it to the new program: keep what the new intent does
+  not cover, drop what the new program absorbs, rename what moved,
+  preserve state values and spawned children unless the change requires
+  otherwise, change the minimum. Validation hydrates the edited file, so
+  a bad migration fails the round, not the next `up`.
+- *`EVOLUTION.md` is the context.* Every spawn, cede, transition, and
+  state update since the last inception, with the activation that made
+  it, that activation's trigger, and the reason the agent gave. The
+  evolve actions already require `reason`, so the log reads as intent,
+  not mechanics.
 - *A briefing after re-inception.* Inception n ends by emitting a
-  request to the agent, stamped `inceptor:<n>`, saying what changed and
-  why, so the first activation on the new program is briefed rather
-  than confused by tools and states that moved.
-- *`docs/program.md` says why* to prefer spawn and state updates over
-  transitioning the root: composable evolution survives re-inception
-  unread.
+  request stamped `inceptor:<n>` saying what changed, what was absorbed,
+  and what moved, so the first activation on the new program is briefed
+  rather than confused by tools, states, or children that vanished.
+- *`docs/program.md` says why* to prefer procedures, state updates, and
+  spawns over transitioning the root: they are the easiest to carry
+  across an inception, and a transition replaces a node wholesale.
 
-**Usage must tell us.** Whether agents transition the root often enough
-for the conflict path to matter, and whether the briefing message is
-read or ignored. Lands with the evolve battery.
+**Now.** The evolve battery and `instance.json` in the workspace are in
+place (plan §8, §9); `EVOLUTION.md` and the briefing are not.
 
+**Usage must tell us.** Whether inceptors migrate well from the log
+alone, and whether the briefing message is read or ignored.
