@@ -17,6 +17,8 @@ interface Envelope {
   id: string;
   /** Set by `endograph/procedure`: the run emitting this message. The harness resolves it to `agent:<name>/<procedure>`. */
   run?: string;
+  /** With `run`: the agent whose run it is, when the message goes to another agent. The receiver checks that agent's live runs. */
+  agent?: string;
   /** Client-asserted context (a worktree path). Unverified. */
   origin?: string;
   /** The thread key: what the message is about (a sha, a path, an issue). Follow-ups repeat it. */

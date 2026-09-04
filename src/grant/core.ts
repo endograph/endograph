@@ -14,6 +14,8 @@ import type { BatteryContext, Grant } from "./define.ts";
 export interface CoreRuntime {
   /** Answer a request or call. Returns an error when the id is unknown or already answered. */
   reply(id: string, reply: { ok: boolean; state: ReplyState; text: string }): string | null;
+  /** The JSON Schema of a declared state, so a rejected write can say what would have been accepted. */
+  stateSchema?(key: string): Record<string, unknown> | undefined;
 }
 
 const REPLY_STATES = ["completed", "failed", "rejected", "input-required", "working"] as const satisfies readonly ReplyState[];
@@ -90,7 +92,9 @@ export function coreActions(runtime: CoreRuntime): AnyAction[] {
       try {
         ctx.updateStateAt(state, update);
       } catch (err) {
-        return actionResult({ success: false, error: `${state}: ${err instanceof Error ? err.message : String(err)}` });
+        const schema = runtime.stateSchema?.(state);
+        const hint = schema ? `\nthe value must satisfy this schema: ${JSON.stringify(schema)}` : "";
+        return actionResult({ success: false, error: `${state}: ${err instanceof Error ? err.message : String(err)}${hint}` });
       }
       return `${op} ${state}`;
     },

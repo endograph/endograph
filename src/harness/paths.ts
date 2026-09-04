@@ -1,4 +1,4 @@
-import { copyFileSync, lstatSync, mkdirSync, readlinkSync, rmSync, symlinkSync } from "node:fs";
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 /** The agent directory and everything under `.endo/`, the state directory. */
@@ -72,7 +72,25 @@ export function ensureStateDir(paths: Paths): void {
     } catch {}
     symlinkSync(ENDOGRAPH_ROOT, link);
   }
+  // For editors and `bunx tsc` in the agent directory: `endograph` resolves to the link. Written once; the owner's from then on.
+  const tsconfig = join(paths.agentDir, "tsconfig.json");
+  if (!existsSync(tsconfig)) writeFileSync(tsconfig, `${JSON.stringify(TSCONFIG, null, 2)}\n`);
 }
+
+const TSCONFIG = {
+  compilerOptions: {
+    target: "ESNext",
+    module: "Preserve",
+    moduleResolution: "bundler",
+    strict: true,
+    skipLibCheck: true,
+    allowImportingTsExtensions: true,
+    noEmit: true,
+    types: ["./.endo/node_modules/endograph/node_modules/bun-types"],
+    paths: { endograph: ["./.endo/node_modules/endograph/src/index.ts"], "endograph/procedure": ["./.endo/node_modules/endograph/src/procedures/lib.ts"] },
+  },
+  include: ["endograph.ts", ".endo/program", ".endo/src"],
+};
 
 /** Refresh the loadable copy of the grant. */
 export function copyGrant(paths: Paths): string {

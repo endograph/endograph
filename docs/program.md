@@ -141,7 +141,11 @@ in the charter. `instructions` is sugar for a text part in the preamble.
 **States.** `createState({ key, schema, init, scope?, projection? })`.
 `schema` is any Standard Schema (`z` from `endograph` is zod) and is validation only: no
 defaults, transforms, or coercion in it; `init` must be a complete valid
-value. `projection.render(value)` turns the value into the prose the
+value. The model is the writer, through `update_state`, and it sees the
+schema only when a write is rejected. Keep schemas loose: flat objects,
+optional fields, strings and booleans, arrays of strings; no unions, no
+required timestamps, no nested shapes it has to guess. A strict schema
+costs a failed tool call per field the model gets wrong. `projection.render(value)` turns the value into the prose the
 model sees each activation (projector types `value` as `unknown` for
 now: cast it to the schema's type inside); `projection.exposure` is `"native"` (always
 rendered), `"deferred"` (fetchable on demand through the reserved
@@ -217,7 +221,7 @@ Deploy 09171ae to stout when you get a chance.
 `from` is the sender as the transport verified it: `local:<user>` (a
 person on this machine), `timer:<procedure>` (the scheduler battery),
 `agent:<name>` or `agent:<name>/<procedure>` (this or another agent, or
-one of its procedures). A user
+one of its procedures), `inceptor:<n>` (the briefing after inception n). A user
 turn means "a message arrived", not "the agent's principal spoke". Who
 gets what is the agent's business; the harness enforces nothing about
 senders, so if the manifest wants permissions, the program has to hold
@@ -313,7 +317,7 @@ Three places, in order of durability to the model:
 - **States** for anything the model must see every activation: standing
   notes, the current target, what is in flight. Rendered by
   `projection.render`; written with `update_state`. Keep them small and
-  render them as prose, not JSON.
+  loosely typed (§3), and render them as prose, not JSON.
 - **Files under `src/`** for anything the model reads on demand: notes
   by topic, runbooks, a README for itself. Read with bash. Cheap to
   hold, invisible until fetched.
@@ -428,12 +432,24 @@ program and `src` you or a predecessor wrote last time).
   Fix that first.
 - `src/` is the agent's. Keep its procedures and notes unless the new
   intent forbids them; fix what the grant change broke.
-- `instance.json` is the persisted instance. Leave it alone unless the
-  new program cannot hydrate it (a node key renamed, a state schema
-  changed, a carried action gone). When you must edit it, preserve state
-  values and spawned children; change the minimum.
+- `instance.json` is the persisted instance: what the agent has made of
+  itself, in state values and in children it spawned. Migrate it to the
+  new program by judgment, with `EVOLUTION.md` (every reshaping since
+  the last inception, with its trigger and the agent's reason) as the
+  context: keep what the new intent does not cover, drop what the new
+  program absorbs (a helper you have now written into the program
+  proper), rename what moved, preserve state values and spawned children
+  unless the change requires otherwise, change the minimum. Nothing is
+  replayed for you; if you leave a spawned child beside the node that
+  replaced it, the agent runs both.
+- Write `CHANGES.md` in the workspace: a short brief to the agent, in
+  the second person, saying what changed, what of its own work was
+  absorbed or moved, and what to do differently. The harness delivers
+  it as the agent's first request after this inception, from
+  `inceptor:<n>`.
 - Write the new program as a revision of the baseline, not from
   scratch, unless the manifest changed beyond recognition. The header's
   inception number goes up.
 - The agent will wake up with a different mind. Put a short note in its
-  `README.md` under a dated heading saying what changed and why.
+  `README.md` under a dated heading saying what changed and why;
+  `CHANGES.md` is the same story told to the agent directly.

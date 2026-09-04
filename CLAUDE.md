@@ -1,10 +1,11 @@
 # endograph
 
-Embedded agents on `@projectors/core`. CLI is `endo`. **v3 rewrite in
-progress** (agreed 2026-09-03): read `docs/rewrite-plan.md` first, then
-`docs/program.md` (the contract and idioms an inceptor reads) and
-`docs/v3-future.md` (designs deliberately held back; check it before
-re-proposing anything). v2 is at commit `34600c7` and v1 at `4455c59`,
+Embedded agents on `@projectors/core`. CLI is `endo`. **v3** (agreed
+2026-09-03, built 2026-09-03/04, dogfooding since): read
+`docs/rewrite-plan.md` first (its status paragraph says what is built
+and what the dogfood is watching), then `docs/program.md` (the contract
+and idioms an inceptor reads) and `docs/v3-future.md` (designs
+deliberately held back; check it before re-proposing anything). v2 is at commit `34600c7` and v1 at `4455c59`,
 archaeology only. Do not resurrect v1 or v2 structure: no loop, drift,
 judge, sessions, evolvable, home/declaration split, playbook, or
 frontmatter.
@@ -12,10 +13,12 @@ frontmatter.
 An agent is two owner files, `endograph.ts` (the grant: `defineAgent`)
 and `manifest.md`, plus `.endo/` (everything the agent is: the frame
 log, `program/agent.ts` written by inception, `src/` written by the
-agent, the inbox/outbox wire, snapshots). `endo up` runs in the agent
-directory; with no program it runs inception, a coding agent (Claude
-Code or Codex, headless or `endo incept --manual`) writing the program
-from the manifest. Endograph is the harness, the protocol, the program
+agent, the inbox/outbox wire, snapshots, `node_modules/endograph` linked
+by `endo up`, `env`). `endo up` runs in the agent directory and runs the
+agent as a launchd/systemd service (`--foreground` to run in the
+terminal); with no program it runs inception first, a coding agent
+(Claude Code or Codex, headless or `endo incept --manual`) writing the
+program from the manifest. Endograph is the harness, the protocol, the program
 contract, procedures, and batteries. What an agent does is decided at
 inception.
 
@@ -28,7 +31,7 @@ or output schema; defaults belong in `init` or in code. Endograph
 re-exports every projector primitive a grant or program needs; nothing
 outside `src/` imports `@projectors/core`.
 
-## Layout (target; see the plan's §16 for the order it lands in)
+## Layout
 
 - `src/store/` — carried from v2: append, read from seq, snapshot; SQLite.
 - `src/protocol/` — the wire: request/call/reply JSON files, atomic
@@ -37,20 +40,24 @@ outside `src/` imports `@projectors/core`.
   `update_state`), battery types, the executor spec (carried).
 - `src/program/` — loader: describe procedures, invoke the program
   function against the provisions, assemble the charter, hydrate, replay.
-- `src/harness/` — `endo up`: the router (call → procedure process;
-  request → frame → `runMachine` to quiescence), reply-once with one
-  re-drive, live reload of procedures, the lock.
+- `src/harness/` — the running agent: the router (call → procedure
+  process; request → frame → `runMachine` to quiescence), reply-once
+  with harness-supplied failures and one re-drive after a restart, live
+  reload of procedures, the lock, `env`, the frame envelope.
 - `src/procedures/` — `endograph/procedure` (the script-side library:
   `procedure()`, `actionResult`, `emitMessage`, `waitForCompletion`,
-  `waitForQuiescence`), describe mode, the run supervisor.
+  `waitForQuiescence`), describe mode (a child process per load), the
+  run supervisor (detached processes, output to `.endo/runs/`).
 - `src/inception/` — workspace rendering, inceptor invocation,
   validation rounds, the inception frame and snapshots.
-- `src/batteries/` — bash (on the carried `runShell`), later scheduler
-  and evolve. A battery is a guide + grant contributions + procedure
-  fields + hooks + commands; it constrains shape, never behavior.
-- `src/cli/` — `up [-d] [--template] | down | incept | send | call |
-  wait | commands | status | why | replay | reset | doctor | charter`;
-  units (carried) run `endo up --service`.
+- `src/batteries/` — bash (on the carried `runShell`), evolve, scheduler.
+  A battery is a guide + grant contributions + procedure fields + a tick
+  hook; it constrains shape, never behavior.
+- `src/cli/` — `up [--foreground] [--template] | down | logs | incept |
+  send | call | wait | commands | status | why | replay | reset | doctor
+  | charter`, the registry, `usage.ts` (the consumer half is rendered
+  into every workspace as `CLI.md`); units (carried) run `endo up
+  --service`.
 
 ## Norms
 
@@ -63,7 +70,8 @@ outside `src/` imports `@projectors/core`.
 - Keep tests sparse, focused on outwardly observable behavior. The
   end-to-end path (empty state dir → inception → a served request) runs
   under `bun test` with a fixture inceptor behind `--inceptor`.
-- Dogfood: endofrog (`~/dev/froggy/agents/endofrog`) is **down** until
-  v3 can incept it (plan §16 step 8). Its inception 1 is done by hand
-  with `endo incept --manual` in Claude Code; what `TASK.md` needs to
-  say is learned there.
+- Dogfood: endofrog (`~/dev/froggy/agents/endofrog`) runs on v3 as a
+  launchd service and deploys Froggy to stout. Its frame log is the
+  evidence for what to change next (`endo --agent endofrog replay`);
+  a gap that confuses an inceptor there is a gap in `docs/program.md`,
+  `TASK.md`, or `CLI.md` before it is anything else.

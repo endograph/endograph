@@ -10,6 +10,7 @@ import { ensureStateDir, pathsOf, type Paths } from "../harness/paths.ts";
 import { loadAgent, LoadError, type Loaded } from "../program/load.ts";
 import { openSqliteStore } from "../store/sqlite.ts";
 import { allFrames } from "../store/types.ts";
+import { renderEvolution } from "./evolution.ts";
 import { renderWorkspace, writeSnapshot } from "./workspace.ts";
 
 /**
@@ -97,11 +98,12 @@ export async function incept(opts: InceptOptions): Promise<InceptResult | { work
   try {
     const loaded = await loadAgent({ paths, grant, store, actions, cwd, startRun: dryStart, instance: editedInstance(paths) });
     const hashes = { manifest: hashOf(resolve(paths.agentDir, grant.manifest)), grant: hashOf(paths.grant), program: hashOf(paths.program) };
+    const changes = existsSync(join(paths.workspace, "CHANGES.md")) ? readFileSync(join(paths.workspace, "CHANGES.md"), "utf8").trim() : undefined;
     store.append({
       type: "inception",
       summary: `inception ${n}${opts.accept ? " (manual)" : ""} after ${rounds} round${rounds === 1 ? "" : "s"}`,
       at: Date.now(),
-      payload: { n, ...hashes, version: VERSION, inceptor: opts.accept ? "manual" : (opts.inceptor ?? grant.inception.inceptor ?? "default"), rounds },
+      payload: { n, ...hashes, version: VERSION, inceptor: opts.accept ? "manual" : (opts.inceptor ?? grant.inception.inceptor ?? "default"), rounds, ...(changes ? { changes } : {}) },
     });
     store.writeSnapshot({ asOfSeq: store.lastSeq(), at: Date.now(), state: serializeInstance(loaded.machine.instance, loaded.charter) });
   } finally {
@@ -157,6 +159,8 @@ interface InceptionRecord {
   grant: string;
   program: string;
   version: string;
+  /** The inception frame's seq: where "since the last inception" starts. */
+  seq: number;
 }
 
 function lastInception(paths: Paths): InceptionRecord | null {
@@ -164,7 +168,7 @@ function lastInception(paths: Paths): InceptionRecord | null {
   const store = openSqliteStore(paths.db);
   try {
     let last: InceptionRecord | null = null;
-    for (const f of allFrames(store)) if (f.type === "inception") last = f.payload as InceptionRecord;
+    for (const f of allFrames(store)) if (f.type === "inception") last = { ...(f.payload as Omit<InceptionRecord, "seq">), seq: f.seq };
     return last;
   } finally {
     store.close();
@@ -198,8 +202,9 @@ async function baselineOf(paths: Paths, grant: Grant, actions: Loaded["provision
   const errors = existsSync(paths.program) ? await validate(paths, grant, actions, cwd) : `program: nothing at ${paths.program}`;
   const store = openSqliteStore(paths.db);
   const instance = store.readSnapshot()?.state;
+  const evolution = renderEvolution(store, last.seq, last.n);
   store.close();
-  return { dir, diff: diffs.join("\n"), errors: errors ?? undefined, instance };
+  return { dir, diff: diffs.join("\n"), errors: errors ?? undefined, instance, evolution };
 }
 
 export interface InceptionStatus {

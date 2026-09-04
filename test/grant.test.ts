@@ -23,6 +23,7 @@ test("core actions: reply once through the runtime, compact emits a horizon, upd
   const replies: unknown[] = [];
   const [reply, compact, updateState] = coreActions({
     reply: (id, r) => (replies.push([id, r]), replies.length > 1 ? `${id} already answered` : null),
+    stateSchema: (key) => (key === "notes" ? { type: "object", properties: { lines: { type: "array" } } } : undefined),
   });
   expect(await reply!.run!({ id: "r1", ok: true, text: "done" }, {})).toBe("replied to r1");
   expect(replies[0]).toEqual(["r1", { ok: true, state: "completed", text: "done" }]);
@@ -37,7 +38,7 @@ test("core actions: reply once through the runtime, compact emits a horizon, upd
   expect(await updateState!.run!({ state: "notes", op: "patch", value: { standing: ["x"] } }, ctx)).toBe("patch notes");
   expect(writes[0]).toEqual(["notes", { op: "patch", value: { standing: ["x"] }, path: undefined }]);
   const rejecting = { updateStateAt: () => { throw new SchemaError([{ message: "expected array" }]); } };
-  expect(await updateState!.run!({ state: "notes", op: "replace", value: 1 }, rejecting)).toMatchObject({ success: false, error: expect.stringMatching(/notes: expected array/) });
+  expect(await updateState!.run!({ state: "notes", op: "replace", value: 1 }, rejecting)).toMatchObject({ success: false, error: expect.stringMatching(/notes: expected array\nthe value must satisfy this schema: \{"type":"object"/) });
 });
 
 test("the bash battery runs in the granted cwd", async () => {

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -49,7 +49,8 @@ const wait = (agent: Agent, id: string, terminal = true) => waitForReply(agent.p
 
 test("calls, requests, procedures that emit, reply-once, live reload, and recovery after a restart", async () => {
   const dir = scaffold();
-  let agent = await openAgent({ agentDir: dir, executor: scripted(answer), pollMs: 50, activationTimeoutMs: 800 });
+  const log: string[] = [];
+  let agent = await openAgent({ agentDir: dir, executor: scripted(answer), pollMs: 50, activationTimeoutMs: 800, log: (l) => log.push(l) });
   expect(agent.loaded.procedures.map((p) => p.name)).toEqual(["ask", "hello", "nightly"]);
   expect(agent.loaded.failures.map((f) => f.name)).toEqual(["broken"]);
   agent.start();
@@ -80,6 +81,18 @@ test("calls, requests, procedures that emit, reply-once, live reload, and recove
     await agent.tick(Date.now());
     for (let i = 0; i < 100 && agent.runs.active().length; i++) await Bun.sleep(50);
 
+    // A message from another agent's live run is stamped as that agent's procedure, checked through the registry.
+    process.env.ENDOGRAPH_HOME = mkdtempSync(join(tmpdir(), "endo-home-"));
+    const other = mkdtempSync(join(tmpdir(), "endo-other-"));
+    writeFileSync(join(other, "endograph.ts"), "");
+    mkdirSync(join(other, ".endo/runs"), { recursive: true });
+    writeFileSync(join(other, ".endo/runs/r9.json"), JSON.stringify({ id: "r9", procedure: "deploy" }));
+    (await import("../src/cli/registry.ts")).claim("other", other);
+    writeMessage(agent.paths.inbox, { v: PROTOCOL_VERSION, kind: "request", id: "from-other", text: "2+2?", run: "r9", agent: "other", at: Date.now() });
+    expect((await wait(agent, "from-other"))?.text).toBe("4");
+    writeMessage(agent.paths.inbox, { v: PROTOCOL_VERSION, kind: "request", id: "from-dead", text: "who am i", run: "gone", agent: "other", at: Date.now() });
+    expect((await wait(agent, "from-dead"))?.text).toMatch(/^seen from local:/);
+
     // A duplicate id is dropped; a second terminal reply is refused.
     const first = send(agent, "2+2?");
     expect((await wait(agent, first))?.text).toBe("4");
@@ -95,6 +108,7 @@ test("calls, requests, procedures that emit, reply-once, live reload, and recove
   } finally {
     await agent.stop();
   }
+  expect(log.find((l) => l.includes("request"))).toMatch(/^ *\d+  \d\d:\d\d:\d\d  request     \w+  local:/);
 
   const store = openSqliteStore(join(dir, ".endo/agent.db"));
   const frames = [...allFrames(store)];
@@ -102,6 +116,8 @@ test("calls, requests, procedures that emit, reply-once, live reload, and recove
   expect(emitted?.summary).toBe("agent:fixture/ask: what is 2+2?");
   expect(frames.find((f) => f.type === "procedure")?.summary).toMatch(/broken failed to describe/);
   expect(frames.find((f) => f.type === "call" && f.summary.startsWith("timer:"))?.summary).toBe("timer:nightly: nightly");
+  expect(frames.find((f) => f.type === "request" && f.id === "from-other")?.summary).toBe("agent:other/deploy: 2+2?");
+  expect(existsSync(join(dir, "tsconfig.json"))).toBe(true);
   expect(frames.filter((f) => f.type === "reply").map((f) => (f.payload as { text: string }).text)).toContain("checked");
   expect(frames.filter((f) => f.type === "request" && f.summary.includes("2+2 again"))).toEqual([]);
   // Simulate a crash: a request frame whose activation never completed, and one whose activation completed without a reply.
