@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
-import { openSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, openSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { newId, PROTOCOL_VERSION, readReply, writeReply, type Reply } from "../protocol/wire.ts";
+import { newId, PROTOCOL_VERSION, readReply, type Reply } from "../protocol/wire.ts";
 import type { Paths } from "../harness/paths.ts";
 import type { ProcedureSpec } from "./describe.ts";
 
@@ -36,8 +36,11 @@ export type RunStarter = (request: RunRequest) => Run;
 
 export interface Runs {
   start: RunStarter;
+  /** Detach observers without stopping children or removing their recovery
+   * files. Outstanding promises stay pending; a new supervisor recovers them. */
+  close(): void;
   /** Runs started by a previous harness process: adopt their exits. */
-  recover(): Run[];
+  recover(): void;
   active(): Run[];
   /** The run behind a call id, while it runs. */
   get(id: string): Run | undefined;
@@ -57,11 +60,14 @@ export function createRuns(opts: {
   paths: Paths;
   name: string;
   cwd: string;
-  /** Every reply a run produces, as it lands: record it. */
-  onReply(run: Run, reply: Reply): void;
+  /** The harness commits and publishes the reply, returning its canonical value.
+   * Recovery files are retained until this succeeds. */
+  onReply(run: Run, reply: Reply): Reply;
 }): Runs {
   const active = new Map<string, Run>();
-  const { paths } = opts;
+  let closed = false;
+  const detached = new Promise<never>(() => {});
+  const { paths, name, cwd } = opts;
   const file = (id: string, ext: string) => join(paths.runs, `${id}.${ext}`);
 
   const settle = (record: RunRecord, code: number): Reply => {
@@ -70,30 +76,46 @@ export function createRuns(opts: {
     const ok = code === 0;
     const text = ok ? out.trimEnd() : [out.trimEnd(), err.trimEnd(), `${record.procedure} exited ${code}`].filter(Boolean).join("\n");
     const reply: Reply = { v: PROTOCOL_VERSION, id: record.id, ok, state: ok ? "completed" : "failed", text, at: Date.now() };
-    writeReply(paths.outbox, reply);
-    for (const ext of ["json", "out", "err", "exit"]) rmSync(file(record.id, ext), { force: true });
     return reply;
   };
 
   const track = (record: RunRecord, exited: Promise<number>): Run => {
     const terminal = exited.then((code) => {
-      const reply = settle(record, code);
+      if (closed) return detached;
+      let reply: Reply;
+      try { reply = opts.onReply(run, settle(record, code)); }
+      catch (error) {
+        // A failed durable callback can synchronously detach the supervisor.
+        // Recovery owns this result now; leave its files and promises alone.
+        if (closed) return detached;
+        throw error;
+      }
+      // Keep the recovery record and captured output until the terminal
+      // reply has been committed and published successfully.
+      for (const ext of ["json", "out", "err", "exit"]) rmSync(file(record.id, ext), { force: true });
+      rmSync(join(paths.runs, "acks", `${record.id}.json`), { force: true });
       active.delete(record.id);
-      opts.onReply(run, reply);
       return reply;
     });
-    const ack = (async () => {
+    // Defer observation until the run below has been registered. An async
+    // IIFE executes its first iteration immediately and mistakes a new run
+    // for a finished one, leaving model tool calls waiting for its exit.
+    const ack = Promise.resolve().then(async () => {
       for (;;) {
-        const reply = readReply(paths.outbox, record.id);
-        if (reply?.state === "working") return reply;
+        if (closed) return detached;
         if (!active.has(record.id)) return terminal;
+        const reply = readReply(join(paths.runs, "acks"), record.id);
+        if (reply?.state === "working") {
+          try { return opts.onReply(run, reply); }
+          catch (error) {
+            if (closed) return detached;
+            throw error;
+          }
+        }
         await Bun.sleep(100);
       }
-    })();
-    const first = Promise.race([ack, terminal]).then((reply) => {
-      if (reply.state === "working") opts.onReply(run, reply);
-      return reply;
     });
+    const first = Promise.race([ack, terminal]);
     const run: Run = { id: record.id, procedure: record.procedure, from: record.from, startedAt: record.startedAt, first, terminal };
     active.set(record.id, run);
     return run;
@@ -103,6 +125,7 @@ export function createRuns(opts: {
   const adoptedExit = (record: RunRecord): Promise<number> =>
     (async () => {
       for (;;) {
+        if (closed) return detached;
         const exit = read(file(record.id, "exit"));
         if (exit) return Number(exit) || 0;
         if (!alive(record.pid)) {
@@ -114,26 +137,39 @@ export function createRuns(opts: {
     })();
 
   return {
+    close() { closed = true; },
     start(request) {
+      if (closed) throw new Error("procedure supervisor is closed");
       const id = request.id ?? newId();
       const spec = request.procedure;
-      const from = request.from ?? `agent:${opts.name}`;
+      const from = request.from ?? `agent:${name}`;
       const record: RunRecord = { id, procedure: spec.name, file: spec.file, from, args: request.args, startedAt: Date.now(), pid: 0 };
-      const child = spawn(process.execPath, ["run", spec.file], {
-        cwd: opts.cwd,
-        detached: true,
-        stdio: ["ignore", openSync(file(id, "out"), "w"), openSync(file(id, "err"), "w")],
-        env: {
-          ...process.env,
-          FORCE_COLOR: "0",
-          ENDO_RUN: id,
-          ENDO_PROCEDURE: spec.name,
-          ENDO_AGENT: opts.name,
-          ENDO_STATE: paths.state,
-          ENDO_ARGS: JSON.stringify(request.args),
-          ENDO_FROM: from,
-        },
-      });
+      const stdout = openSync(file(id, "out"), "w");
+      let stderr: number | undefined;
+      let child: ReturnType<typeof spawn>;
+      try {
+        stderr = openSync(file(id, "err"), "w");
+        child = spawn(process.execPath, ["run", spec.file], {
+          cwd,
+          detached: true,
+          stdio: ["ignore", stdout, stderr],
+          env: {
+            ...process.env,
+            FORCE_COLOR: "0",
+            ENDO_RUN: id,
+            ENDO_PROCEDURE: spec.name,
+            ENDO_AGENT: name,
+            ENDO_STATE: paths.state,
+            ENDO_ARGS: JSON.stringify(request.args),
+            ENDO_FROM: from,
+          },
+        });
+      } finally {
+        // spawn duplicates these descriptors into the child; the parent
+        // must release its copies, including when spawning fails.
+        closeSync(stdout);
+        if (stderr !== undefined) closeSync(stderr);
+      }
       child.unref();
       record.pid = child.pid ?? 0;
       writeFileSync(file(id, "json"), JSON.stringify(record));
@@ -147,14 +183,13 @@ export function createRuns(opts: {
       return track(record, exited);
     },
     recover() {
-      const adopted: Run[] = [];
+      if (closed) throw new Error("procedure supervisor is closed");
       for (const f of readdirSync(paths.runs).filter((f) => f.endsWith(".json"))) {
         try {
           const record = JSON.parse(readFileSync(join(paths.runs, f), "utf8")) as RunRecord;
-          if (!active.has(record.id)) adopted.push(track(record, adoptedExit(record)));
+          if (!active.has(record.id)) track(record, adoptedExit(record));
         } catch {}
       }
-      return adopted;
     },
     active: () => [...active.values()],
     get: (id) => active.get(id),

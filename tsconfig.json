@@ -3,8 +3,12 @@
     "target": "ESNext",
     "module": "Preserve",
     "moduleResolution": "bundler",
-    "lib": ["ESNext"],
-    "types": ["bun-types"],
+    "lib": [
+      "ESNext"
+    ],
+    "types": [
+      "bun-types"
+    ],
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noFallthroughCasesInSwitch": true,
@@ -13,5 +17,10 @@
     "verbatimModuleSyntax": true,
     "noEmit": true
   },
-  "include": ["src", "test"]
+  "include": [
+    "scripts",
+    "src",
+    "test",
+    "packages"
+  ]
 }

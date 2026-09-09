@@ -15,7 +15,7 @@ function fixture() {
   const dir = mkdtempSync(join(tmpdir(), "endo-observatory-"));
   const paths = pathsOf(dir);
   mkdirSync(join(paths.snapshots, "1", "src", "procedures"), { recursive: true });
-  writeFileSync(join(dir, "endograph.toml"), 'name = "fixture"\nmanifest = "manifest.md"\n');
+  writeFileSync(join(dir, "endograph.toml"), 'name = "fixture"\nmanifest = "manifest.md"\n[executor]\nprovider="openai"\nmodel="unused"\n');
   writeFileSync(join(dir, "manifest.md"), "# Fixture\n");
   writeFileSync(join(paths.snapshots, "1", "manifest.md"), "# Fixture\n");
   writeFileSync(join(paths.snapshots, "1", "endograph.toml"), "grant\n");

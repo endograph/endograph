@@ -1,10 +1,10 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, statSync } from "node:fs";
+import { mkdtempSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openSqliteStore } from "../src/store/sqlite.ts";
+import { archivePath, openSqliteStore } from "../src/store/sqlite.ts";
 
-test("appends gapless seqs, reads from a seq, keeps one snapshot, and checkpoints at the snapshot", () => {
+test("appends gapless seqs, reads from a seq, and archives frames and instance checkpoints", () => {
   const path = join(mkdtempSync(join(tmpdir(), "endo-")), "agent.db");
   const store = openSqliteStore(path);
   const a = store.append({ type: "note", summary: "one", at: 1 });
@@ -15,7 +15,7 @@ test("appends gapless seqs, reads from a seq, keeps one snapshot, and checkpoint
   store.writeSnapshot({ asOfSeq: 2, at: 3, state: { s: 1 } });
   store.writeSnapshot({ asOfSeq: 2, at: 4, state: { s: 2 } });
   expect(store.readSnapshot()).toEqual({ asOfSeq: 2, at: 4, state: { s: 2 } });
-  // The WAL is folded into agent.db at every snapshot: a copy of that one file is the whole log.
-  expect(statSync(`${path}-wal`).size).toBe(0);
+  // Each completed write is immutable; SQLite remains a rebuildable index.
+  expect(readdirSync(archivePath(path)).filter((name) => name.endsWith(".json"))).toHaveLength(4);
   store.close();
 });

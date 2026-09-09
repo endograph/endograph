@@ -15,6 +15,7 @@ import {
   type StateDescriptor,
 } from "@projectors/core";
 import type { Grant } from "../grant/grant.ts";
+import type { RuntimeBindings } from "../grant/bind.ts";
 import type { Paths } from "../harness/paths.ts";
 import { compileProcedure, describeProcedures, type DescribeFailure, type ProcedureSpec } from "../procedures/describe.ts";
 import type { RunStarter } from "../procedures/runs.ts";
@@ -24,8 +25,8 @@ import { isProgram, type Program, type ProgramResult, type Provisions } from "./
 /**
  * The load pipeline: import the program, describe procedures, invoke the
  * program against the provisions, assemble the charter, hydrate the
- * snapshot, replay the frames after it. Every `up` and every procedure
- * change runs it. A failure names its stage.
+ * snapshot, restore its conversation history, replay the frames after it.
+ * Every `up` and every procedure change runs it. A failure names its stage.
  */
 
 export type Stage = "program" | "invoke" | "charter" | "hydrate" | "replay";
@@ -43,6 +44,7 @@ export class LoadError extends Error {
 export interface LoadInput {
   paths: Paths;
   grant: Grant;
+  bindings: RuntimeBindings;
   store: FrameStore;
   /** Absent for a dry load (inception validation, `endo replay`): the machine hydrates but cannot run. */
   executor?: ProjectorExecutor;
@@ -68,7 +70,7 @@ export interface Loaded {
 }
 
 export async function loadAgent(input: LoadInput): Promise<Loaded> {
-  const { paths, grant, store } = input;
+  const { paths, grant, bindings, store } = input;
   const program = await stage("program", async () => {
     const path = realpathSync(paths.program);
     const mod = (await import(`${pathToFileURL(path).href}?t=${statSync(path).mtimeMs}`)) as { default?: unknown };
@@ -76,15 +78,15 @@ export async function loadAgent(input: LoadInput): Promise<Loaded> {
     return mod.default;
   });
 
-  const described = await describeProcedures(paths.procedures, grant.batteries);
+  const described = await describeProcedures(paths.procedures, bindings.batteries);
   const procedures = described.procedures.map((spec) => ({ ...spec, action: compileProcedure(spec, input.startRun) }));
 
   const provisions: Provisions = {
     name: grant.name,
     cwd: input.cwd,
-    executorConfig: grant.executor.executorConfig,
+    executorConfig: bindings.executor.executorConfig,
     actions: granted(input.actions),
-    states: Object.fromEntries(grant.states.map((s) => [s.key, s])),
+    states: Object.fromEntries(bindings.states.map((s) => [s.key, s])),
     procedures: procedures.map((p) => p.action),
   };
 
@@ -99,7 +101,7 @@ export async function loadAgent(input: LoadInput): Promise<Loaded> {
       key: grant.name,
       nodes: result.nodes,
       actions: [...input.actions, ...provisions.procedures],
-      states: liftStates(grant.states, result),
+      states: liftStates(bindings.states, result),
       ...(result.layouts ? { layouts: result.layouts } : {}),
       ...(result.computedParts ? { computedParts: result.computedParts } : {}),
       ...(result.discriminators ? { discriminators: result.discriminators } : {}),
@@ -114,9 +116,21 @@ export async function loadAgent(input: LoadInput): Promise<Loaded> {
     resolveStates(i);
     return i;
   });
-  const machine = createMachine({ id: grant.name, instance, charter, executor: input.executor });
-
   let replayedTo = snapshot?.asOfSeq ?? 0;
+  const history = await stage("replay", () => {
+    const frames: ProjectorFrame[] = [];
+    for (const stored of allFrames(store)) {
+      if (stored.seq > replayedTo) break;
+      const payload = stored.payload as ProjectorFrame | undefined;
+      if (payload && Array.isArray(payload.messages)) frames.push(payload);
+    }
+    return frames;
+  });
+  // A snapshot replaces state replay, not history. Passing prior frames as
+  // history preserves messages and compaction horizons without reapplying
+  // their state/instance mutations against the hydrated (or migrated) instance.
+  const machine = createMachine({ id: grant.name, instance, charter, executor: input.executor, frames: history });
+
   await stage("replay", () => {
     for (const stored of allFrames(store, replayedTo)) {
       replayedTo = stored.seq;

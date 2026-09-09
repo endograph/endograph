@@ -113,12 +113,54 @@ export async function serviceRunning(name: string): Promise<boolean> {
   return (await run(["systemctl", "--user", "is-active", "--quiet", `${serviceLabel(name)}.service`])) === null;
 }
 
+/** What the supervisor knows about the unit: enough to tell a crash loop from a clean exit from nothing installed. */
+export interface ServiceState {
+  /** The unit file exists. */
+  installed: boolean;
+  /** The supervisor has the unit loaded (it would restart a crash). */
+  loaded: boolean;
+  /** The process is alive now. */
+  pid: number | null;
+  /** The last exit status; null when it has not exited (launchd) or is unknown. */
+  lastExit: number | null;
+  /** How many times the supervisor has started it (launchd: runs; systemd: restarts). */
+  runs: number | null;
+}
+
+export async function serviceState(name: string): Promise<ServiceState> {
+  const state: ServiceState = { installed: serviceInfo(name).installed, loaded: false, pid: null, lastExit: null, runs: null };
+  const num = (m: RegExpExecArray | null) => (m ? Number(m[1]) : null);
+  if (platform() === "darwin") {
+    const out = await output(["launchctl", "print", `${domain()}/${serviceLabel(name)}`]);
+    if (out === null) return state;
+    state.loaded = true;
+    state.pid = num(/^\s*pid = (\d+)/m.exec(out));
+    state.lastExit = num(/^\s*last exit code = (-?\d+)/m.exec(out));
+    state.runs = num(/^\s*runs = (\d+)/m.exec(out));
+  } else {
+    const out = await output(["systemctl", "--user", "show", "-p", "LoadState,MainPID,ExecMainStatus,NRestarts", `${serviceLabel(name)}.service`]);
+    if (out === null || /^LoadState=not-found/m.test(out)) return state;
+    state.loaded = true;
+    state.pid = num(/^MainPID=(\d+)/m.exec(out)) || null;
+    state.lastExit = num(/^ExecMainStatus=(\d+)/m.exec(out));
+    state.runs = num(/^NRestarts=(\d+)/m.exec(out));
+  }
+  return state;
+}
+
 function domain(): string {
   return `gui/${process.getuid?.() ?? 501}`;
 }
 
 async function launchctl(args: string[]): Promise<string | null> {
   return run(["launchctl", ...args]);
+}
+
+/** Stdout on success, null on failure. */
+async function output(cmd: string[]): Promise<string | null> {
+  const child = Bun.spawn(cmd, { stdout: "pipe", stderr: "ignore" });
+  const [code, out] = await Promise.all([child.exited, new Response(child.stdout as ReadableStream).text()]);
+  return code === 0 ? out : null;
 }
 
 /** Null on success, stderr on failure. */

@@ -1,22 +1,13 @@
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { basename, join, relative, resolve } from "node:path";
-import { isLocked } from "../harness/lock.ts";
+import { basename, join, relative } from "node:path";
+import { inspectAgent, type Inspection } from "../harness/inspect.ts";
+import type { Status } from "../harness/residence.ts";
 import type { Paths } from "../harness/paths.ts";
-import { openSqliteStore } from "../store/sqlite.ts";
+import { hasPersistedStore, openSqliteStore } from "../store/sqlite.ts";
 import { allFrames, type Frame } from "../store/types.ts";
 
 const FRAME_LIMIT = 500;
-const ENDOGRAPH_VERSION = (JSON.parse(readFileSync(resolve(import.meta.dir, "../../package.json"), "utf8")) as { version: string }).version;
-
-interface StatusFile {
-  name: string;
-  open: string[];
-  runs: { id: string; procedure: string; from: string; startedAt: number }[];
-  active: boolean;
-  at: number;
-}
-
 interface InceptionPayload {
   n: number;
   manifest?: string;
@@ -36,7 +27,9 @@ export interface ObservatorySnapshot {
     running: boolean;
     active: boolean;
     open: string[];
-    runs: StatusFile["runs"];
+    runs: Status["runs"];
+    phase: Inspection["phase"];
+    reason: string | null;
     statusAt?: number;
   };
   log: {
@@ -54,6 +47,7 @@ export interface ObservatorySnapshot {
     changed: string[];
     programEdited: boolean;
     loadError: string | null;
+    inputError: string | null;
     history: InceptionView[];
     attempts: InceptionAttempt[];
   };
@@ -110,11 +104,12 @@ interface FileChange {
 
 /** Build the read-only payload consumed by the observatory browser. */
 export async function readObservatorySnapshot(paths: Paths, fallbackName = basename(paths.agentDir)): Promise<ObservatorySnapshot> {
-  const status = readJson<StatusFile>(paths.status);
+  const inspection = await inspectAgent(paths, fallbackName);
+  const status = inspection.status;
   let frames: Frame[] = [];
   let inceptionFrames: Frame[] = [];
   let machine: ObservatorySnapshot["machine"] = null;
-  if (existsSync(paths.db)) {
+  if (hasPersistedStore(paths.db)) {
     const store = openSqliteStore(paths.db);
     try {
       const all = [...allFrames(store)];
@@ -133,22 +128,29 @@ export async function readObservatorySnapshot(paths: Paths, fallbackName = basen
     view.attempt = attempts.find((attempt) => attempt.n === view.n);
     return view;
   });
-  const drift = driftOf(paths, history.at(-1));
+  const revision = inspection.inception;
 
   const total = frames.length ? Math.max(frames.at(-1)!.seq, frames.length) : 0;
   return {
     agent: {
-      name: status?.name ?? fallbackName,
+      name: inspection.name,
       dir: paths.agentDir,
-      running: isLocked(paths.lock),
-      active: status?.active ?? false,
+      running: inspection.phase !== "down",
+      active: inspection.phase === "active",
+      phase: inspection.phase,
+      reason: inspection.reason,
       open: status?.open ?? [],
       runs: status?.runs ?? [],
-      ...(status ? { statusAt: status.at } : {}),
+      ...(status?.at ? { statusAt: status.at } : {}),
     },
     log: { frames, total, truncated: total > frames.length },
     machine,
-    inception: { latest: drift.n, changed: drift.changed, programEdited: drift.programEdited, loadError: drift.loadError, history, attempts },
+    inception: {
+      latest: revision?.n ?? history.at(-1)?.n ?? 0,
+      changed: revision?.changed ?? [], programEdited: revision?.programEdited ?? false,
+      loadError: inspection.failure?.error ?? null, inputError: inspection.inputError,
+      history, attempts,
+    },
     generatedAt: Date.now(),
   };
 }
@@ -187,28 +189,6 @@ function readInceptionAttempts(paths: Paths): InceptionAttempt[] {
     });
   }
   return attempts;
-}
-
-function driftOf(paths: Paths, latest?: InceptionView) {
-  if (!latest) return { n: 0, changed: [] as string[], programEdited: false, loadError: null };
-  const changed: string[] = [];
-  let manifest: unknown = "manifest.md";
-  try {
-    manifest = (Bun.TOML.parse(readText(paths.grant) ?? "") as { manifest?: unknown }).manifest ?? "manifest.md";
-  } catch {}
-  const manifestHash =
-    typeof manifest === "object" && manifest && typeof (manifest as { text?: unknown }).text === "string"
-      ? createHash("sha256").update((manifest as { text: string }).text).digest("hex").slice(0, 16)
-      : fileHash(resolve(paths.agentDir, typeof manifest === "string" ? manifest : "manifest.md"));
-  if (manifestHash !== latest.manifest) changed.push("manifest");
-  if (fileHash(paths.grant) !== latest.grant) changed.push("grant");
-  if (ENDOGRAPH_VERSION !== latest.version) changed.push("endograph");
-  return {
-    n: latest.n,
-    changed,
-    programEdited: existsSync(paths.program) && fileHash(paths.program) !== latest.program,
-    loadError: null,
-  };
 }
 
 function inceptionView(paths: Paths, frame: Frame, previous?: Frame): InceptionView {

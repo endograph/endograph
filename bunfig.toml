@@ -1,0 +1,3 @@
+[install]
+# Agent tsconfigs resolve Bun types through the root package.
+linker = "hoisted"

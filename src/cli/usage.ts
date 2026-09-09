@@ -29,9 +29,13 @@ it, the current directory must be the agent directory.
   exposed procedures.
 - \`wait <id>\` blocks until the terminal reply to a request or call and
   prints its text.
+- The inbox is a mailbox: \`send\` and \`call\` queue whether or not the
+  agent is up, and what queued is served when it comes up. When it is not
+  up (inception holds it, the service crashed, nothing runs it) they say so
+  on stderr, with the reason; \`--wait\` then waits until it is.
 - \`commands\` lists the exposed procedures with their arguments.
-- \`status\` prints whether the agent is up, open requests, running
-  procedures, and the last frames.
+- \`status\` prints whether the agent is up (and why not, when it is not),
+  open requests, running procedures, and the last frames.
 
 Exit codes: 0 when the reply says ok (or \`send\`/\`call\` returned an id or
 an ack), 1 when the reply is failed or rejected, 2 for usage. Replies also
@@ -41,7 +45,7 @@ sit in \`.endo/outbox/<id>.json\` as \`{ id, ok, state, text, at }\`.
 export const USAGE = `endo — embedded agents
 
 owner:
-  endo up [--foreground] [--inceptor <cmd>]   run this directory's agent under launchd/systemd (incepting first when there is no program)
+  endo up [--foreground] [--inceptor <cmd>]   run this directory's agent under launchd/systemd (incepting first if its program is missing or cannot load)
   endo up --adopt                             run a state directory another host still holds (a copy, a synced mirror); the move is a frame
   endo down                                   stop the service and remove its unit
   endo logs [-f]                              the service log
@@ -52,6 +56,7 @@ owner:
   endo observatory [--port <n>] [--no-open]   open a live, read-only localhost view of projector and inception
   endo charter                                the provisions as the inceptor sees them
   endo replay [<id>] | endo why <id>          the frame log, or the frames about one request or call
+  endo snapshot <directory>                  copy durable agent files and a fixed archive prefix while running
   endo reset [--force]                        remove .endo: the next up incepts a fresh agent
   endo                                        list registered agents
 

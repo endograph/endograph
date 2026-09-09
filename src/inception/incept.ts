@@ -1,17 +1,21 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { serializeInstance, type SerializedInstance } from "@projectors/core";
 import { grantActions } from "../grant/core.ts";
 import { loadGrant, type Grant } from "../grant/grant.ts";
-import { isLocked } from "../harness/lock.ts";
+import { bindRuntime } from "../grant/bind.ts";
+import type { HostClient } from "../host/client.ts";
+import { acquireLock } from "../harness/lock.ts";
 import { ensureStateDir, pathsOf, type Paths } from "../harness/paths.ts";
-import { loadAgent, LoadError, type Loaded } from "../program/load.ts";
-import { openSqliteStore } from "../store/sqlite.ts";
+import { loadAgent, LoadError } from "../program/load.ts";
+import type { DescribeFailure } from "../procedures/describe.ts";
+import { hasPersistedStore, openSqliteStore } from "../store/sqlite.ts";
 import { allFrames } from "../store/types.ts";
+import { promote, recoverPromotion } from "./promotion.ts";
 import { renderEvolution } from "./evolution.ts";
 import { openRecord } from "./record.ts";
-import { renderWorkspace, writeSnapshot } from "./workspace.ts";
+import { describeGrant, renderWorkspace, writeSnapshot } from "./workspace.ts";
 
 /**
  * Inception: a coding agent writes the program from the owner's inputs,
@@ -26,13 +30,33 @@ import { renderWorkspace, writeSnapshot } from "./workspace.ts";
  */
 
 export interface InceptOptions {
+  /** The caller (the running harness) already holds the lock. */
+  lock?: "held";
+  /** What set this inception off; recorded in the frame. Default "owner" (`endo incept`, or `endo up` with no loadable program). */
+  trigger?: "owner" | "auto";
   agentDir: string;
   /** The inceptor command; default from the grant, else the first of claude, codex on PATH. */
   inceptor?: string;
   manual?: boolean;
   accept?: boolean;
   log?: (line: string) => void;
+  /** Load generated code in an isolated runtime, rather than this inceptor process. */
+  loadRuntime?: RuntimeLoader;
 }
+
+export interface RuntimeLoadInput {
+  /** Candidate program/procedures and live store paths. */
+  paths: Paths;
+  /** Original owner grant/executor locations, even when paths points at a candidate. */
+  ownerPaths: Paths;
+  cwd: string;
+  instance?: SerializedInstance;
+}
+export interface RuntimeLoadResult {
+  state: SerializedInstance;
+  failures: DescribeFailure[];
+}
+export type RuntimeLoader = (input: RuntimeLoadInput) => Promise<RuntimeLoadResult>;
 
 export interface InceptResult {
   n: number;
@@ -59,99 +83,177 @@ const DEFAULT_INCEPTORS = [
 ] as const;
 
 export async function incept(opts: InceptOptions): Promise<InceptResult | { workspace: string; manual: true }> {
-  const log = opts.log ?? (() => {});
   const paths = pathsOf(resolve(opts.agentDir));
   ensureStateDir(paths);
-  if (isLocked(paths.lock)) throw new Error(`${paths.agentDir} is running; stop it first (endo down)`);
+  // Inception owns the state directory while it runs: the harness's own lock, so no `endo up` loads a
+  // half-written program and no second inception races this one. A manual inception releases it at
+  // once; its open record (inceptions/<n>/inception.json without `finished`) is what marks it open.
+  if (opts.lock === "held") return inceptHolding(paths, opts);
+  const lock = acquireLock(paths.lock);
+  if (!lock) {
+    const open = openInception(paths);
+    if (open) throw new Error(`inception ${open.n} is already running in ${paths.agentDir} (since ${open.started})`);
+    const auto = await loadGrant(paths).then((g) => g.inception.mode === "auto", () => false);
+    throw new Error(`${paths.agentDir} is running; stop it first (endo down)${auto ? ", or leave it: in auto mode it incepts by itself once idle" : ""}`);
+  }
+  try {
+    return await inceptHolding(paths, opts);
+  } finally {
+    lock.release();
+  }
+}
+
+async function inceptHolding(paths: Paths, opts: InceptOptions): Promise<InceptResult | { workspace: string; manual: true }> {
+  recoverPromotion(paths);
+  const log = opts.log ?? (() => {});
   const grant = await loadGrant(paths);
-  const cwd = resolve(paths.agentDir, grant.cwd);
-  const actions = grantActions(grant, { name: grant.name, cwd, charter: notRunning }, { reply: () => "not running" });
+  const grantHash = hashOf(paths.grant);
   const last = lastInception(paths);
   const n = (last?.n ?? 0) + 1;
   const started = Date.now();
   const inceptor = opts.accept || opts.manual ? "manual" : (opts.inceptor ?? grant.inception.inceptor ?? (await defaultInceptor()));
 
   if (!opts.accept) {
-    const baseline = last ? await baselineOf(paths, grant, actions, cwd, last) : undefined;
-    const workspace = renderWorkspace({ paths, grant, actions, n, version: VERSION, baseline });
+    const baseline = last ? await baselineOf(paths, grant, last, opts.loadRuntime) : undefined;
+    const workspace = renderWorkspace({ paths, grant, description: describeGrant(paths, grant), n, version: VERSION, baseline });
     log(`workspace rendered at ${workspace} (inception ${n})`);
+    const candidate = prepareCandidate(paths);
     if (opts.manual) {
-      openRecord(paths, { n, version: VERSION, inceptor });
-      return { workspace, manual: true };
+      openRecord({ ...candidate, inceptions: paths.inceptions }, { n, version: VERSION, inceptor });
+      return { workspace: candidate.workspace, manual: true };
     }
   }
+  const candidate = candidatePaths(paths);
+  if (!existsSync(candidate.workspace)) throw new Error("no staged inception; run endo incept --manual first");
+  // Validate against live state and runtime cwd, while importing only candidate code.
+  if (hashOf(candidate.grant) !== grantHash || readFileSync(join(candidate.workspace, "MANIFEST.md"), "utf8") !== grant.manifest.text)
+    throw new Error("owner inputs changed since the candidate was prepared; start a new inception");
+  const staged = { ...candidate, db: paths.db, snapshots: paths.snapshots, inceptions: paths.inceptions };
   // --accept keeps the record --manual opened, so the workspace as rendered survives.
-  const record = openRecord(paths, { n, version: VERSION, inceptor, ...(opts.accept ? {} : { prompt: PROMPT }) }, { keep: opts.accept });
+  const record = openRecord(staged, { n, version: VERSION, inceptor, ...(opts.accept ? {} : { prompt: PROMPT }) }, { keep: opts.accept });
 
   let rounds = 0;
-  let errors: string | null = null;
-  if (opts.accept) {
-    rounds = 1;
-    const t = Date.now();
-    errors = await validate(paths, grant, actions, cwd);
-    record.round(1, { validateMs: Date.now() - t, errors });
-  } else {
-    for (rounds = 1; rounds <= grant.inception.rounds; rounds++) {
+  let state: SerializedInstance;
+  const maxRounds = opts.accept ? 1 : grant.inception.rounds;
+  for (;;) {
+    rounds++;
+    let run: Awaited<ReturnType<typeof runInceptor>> | undefined;
+    if (!opts.accept) {
       log(`inceptor round ${rounds}/${grant.inception.rounds}: ${inceptor}`);
-      const prompt = errors ? `${PROMPT} Validation failed; ERRORS.md in the workspace has the stage and the error. Fix the program and src.` : PROMPT;
-      const run = await runInceptor(inceptor, prompt, paths.agentDir, log);
-      const t = Date.now();
-      errors = run.exitCode === 0 ? await validate(paths, grant, actions, cwd) : `inceptor: exited ${run.exitCode}`;
-      record.round(rounds, { ...run, validateMs: Date.now() - t, errors });
-      if (run.exitCode !== 0) {
-        record.close("failed", rounds, errors ?? undefined);
-        throw new Error(`inceptor exited ${run.exitCode}; its output is under ${record.dir}`);
-      }
-      if (!errors) break;
-      writeFileSync(join(paths.workspace, "ERRORS.md"), `# ERRORS (round ${rounds})\n\n${errors}\n`);
-      log(`validation failed: ${errors.split("\n")[0]}`);
+      const prompt = rounds > 1 ? `${PROMPT} Validation failed; ERRORS.md in the workspace has the stage and the error. Fix the program and src.` : PROMPT;
+      run = await runInceptor(inceptor, prompt, candidate.agentDir, log);
     }
-    if (errors) rounds = grant.inception.rounds;
-  }
-  if (errors) {
-    record.close("failed", rounds, errors);
-    throw new InceptionFailed(errors, paths.workspace, record.dir);
+    const t = Date.now();
+    const result: Validation = run && run.exitCode !== 0
+      ? { ok: false, error: `inceptor: exited ${run.exitCode}` }
+      : await validateProgram({ paths: staged, ownerPaths: paths, grant, candidate: true, loadRuntime: opts.loadRuntime });
+    record.round(rounds, { ...run, validateMs: Date.now() - t, errors: result.ok ? null : result.error });
+    if (result.ok) {
+      state = result.state;
+      break;
+    }
+    if (run && run.exitCode !== 0) {
+      record.close("failed", rounds, result.error);
+      throw new Error(`inceptor exited ${run.exitCode}; its output is under ${record.dir}`);
+    }
+    if (!opts.accept) {
+      writeFileSync(join(candidate.workspace, "ERRORS.md"), `# ERRORS (round ${rounds})\n\n${result.error}\n`);
+      log(`validation failed: ${result.error.split("\n")[0]}`);
+    }
+    if (rounds === maxRounds) {
+      record.close("failed", rounds, result.error);
+      throw new InceptionFailed(result.error, candidate.workspace, record.dir);
+    }
   }
 
-  // Record: the frame, a fresh machine snapshot (from the edited instance.json when there is one), and the inputs as they stand.
-  const store = openSqliteStore(paths.db);
-  try {
-    const loaded = await loadAgent({ paths, grant, store, actions, cwd, startRun: dryStart, instance: editedInstance(paths) });
-    const hashes = { manifest: hashText(grant.manifest.text), grant: hashOf(paths.grant), program: hashOf(paths.program) };
-    const changes = existsSync(join(paths.workspace, "CHANGES.md")) ? readFileSync(join(paths.workspace, "CHANGES.md"), "utf8").trim() : undefined;
-    store.append({
-      type: "inception",
-      summary: `inception ${n}${opts.accept ? " (manual)" : ""} after ${rounds} round${rounds === 1 ? "" : "s"}`,
-      at: Date.now(),
-      payload: { n, ...hashes, version: VERSION, inceptor, rounds, ms: Date.now() - started, ...(changes ? { changes } : {}) },
-    });
-    store.writeSnapshot({ asOfSeq: store.lastSeq(), at: Date.now(), state: serializeInstance(loaded.machine.instance, loaded.charter) });
-  } finally {
-    store.close();
+  // Promote the instance from the successful validation, without invoking generated code again.
+  if (hashOf(paths.grant) !== grantHash || hashOf(candidate.grant) !== grantHash || (await loadGrant(paths)).manifest.text !== grant.manifest.text) {
+    record.close("failed", rounds, "owner inputs changed during inception");
+    throw new Error("owner inputs changed during inception; retry against the current inputs");
   }
-  const snapshot = writeSnapshot(paths, grant, n);
-  rmSync(join(paths.workspace, "ERRORS.md"), { force: true });
+  const hashes = { manifest: hashText(grant.manifest.text), grant: hashOf(paths.grant), program: hashOf(candidate.program) };
+  const changes = existsSync(join(candidate.workspace, "CHANGES.md")) ? readFileSync(join(candidate.workspace, "CHANGES.md"), "utf8").trim() : undefined;
+  const snapshot = writeSnapshot(staged, grant, n, state);
+  try {
+    promote(paths, candidate, n, {
+      type: "inception",
+      summary: `inception ${n}${opts.accept ? " (manual)" : opts.trigger === "auto" ? " (auto)" : ""} after ${rounds} round${rounds === 1 ? "" : "s"}`,
+      at: Date.now(),
+      payload: { n, ...hashes, version: VERSION, inceptor, rounds, trigger: opts.trigger ?? "owner", ms: Date.now() - started, ...(changes ? { changes } : {}) },
+    }, { at: Date.now(), state });
+  } catch (err) {
+    record.close("failed", rounds, err instanceof Error ? err.message : String(err));
+    throw err;
+  }
+  rmSync(join(candidate.workspace, "ERRORS.md"), { force: true });
+  rmSync(paths.workspace, { recursive: true, force: true });
+  cpSync(candidate.workspace, paths.workspace, { recursive: true });
   record.close("recorded", rounds);
   log(`inception ${n} recorded; snapshot at ${snapshot}`);
   return { n, rounds, workspace: paths.workspace, snapshot };
 }
 
-/** The load pipeline without an executor, then the commands check. The error text, or null. */
-async function validate(paths: Paths, grant: Grant, actions: Loaded["provisions"]["actions"][string][], cwd: string): Promise<string | null> {
-  if (!existsSync(paths.program)) return `program: nothing at ${paths.program}`;
+function candidatePaths(paths: Paths): Paths {
+  return pathsOf(join(paths.state, "candidate"));
+}
+
+/** An agent-shaped work area: failed and manual edits never touch the active program or src. */
+function prepareCandidate(paths: Paths): Paths {
+  const candidate = candidatePaths(paths);
+  rmSync(candidate.agentDir, { recursive: true, force: true });
+  ensureStateDir(candidate);
+  cpSync(paths.grant, candidate.grant);
+  for (const [source, target] of [[dirname(paths.program), dirname(candidate.program)], [paths.src, candidate.src], [paths.workspace, candidate.workspace]]) {
+    if (existsSync(source!)) cpSync(source!, target!, { recursive: true });
+  }
+  // The grant/workspace carry the resolved inputs. Runtime state stays outside the work area.
+  return candidate;
+}
+
+export type Validation = { ok: true; state: SerializedInstance } | { ok: false; error: string };
+
+/** One dry load checks the program and procedures and supplies the instance to promote. */
+export async function validateProgram(opts: {
+  paths: Paths;
+  grant: Grant;
+  ownerPaths?: Paths;
+  candidate?: boolean;
+  loadRuntime?: RuntimeLoader;
+}): Promise<Validation> {
+  const { paths, grant, ownerPaths = paths } = opts;
+  if (!existsSync(paths.program)) return { ok: false, error: `program: nothing at ${paths.program}` };
   const header = readFileSync(paths.program, "utf8").split("\n").slice(0, 2);
   if (!/^\/\/ \.endo\/program\/agent\.ts — written by inception \d+ \(\d{4}-\d{2}-\d{2}\)\. Do not edit:$/.test(header[0] ?? "") || !/^\/\/ change manifest\.md or endograph\.toml and run `endo incept`\.$/.test(header[1] ?? ""))
-    return `program: the two-line header is missing or malformed (PROGRAM.md §2); got:\n${header.join("\n")}`;
-  const store = openSqliteStore(paths.db);
+    return { ok: false, error: `program: the two-line header is missing or malformed (PROGRAM.md §2); got:\n${header.join("\n")}` };
   try {
-    const loaded = await loadAgent({ paths, grant, store, actions, cwd, startRun: dryStart, instance: editedInstance(paths) });
-    if (loaded.failures.length) return loaded.failures.map((f) => `procedures: ${f.name} (${f.file}) failed to describe: ${f.error}`).join("\n");
-    return null;
+    const loaded = await runtimeLoad({
+      paths, ownerPaths, cwd: resolve(ownerPaths.agentDir, grant.cwd),
+      instance: opts.candidate ? editedInstance(paths) : undefined,
+    }, grant, opts.loadRuntime);
+    if (loaded.failures.length) return { ok: false, error: loaded.failures.map((f) => `procedures: ${f.name} (${f.file}) failed to describe: ${f.error}`).join("\n") };
+    return { ok: true, state: loaded.state };
   } catch (err) {
-    return err instanceof LoadError ? err.message : `load: ${err instanceof Error ? err.message : String(err)}`;
-  } finally {
-    store.close();
+    return { ok: false, error: err instanceof LoadError ? err.message : `load: ${err instanceof Error ? err.message : String(err)}` };
   }
+}
+
+/** Entry point for the sandbox worker. The caller must establish its process
+ * boundary before calling this function: it imports generated agent code. */
+export async function loadInceptionRuntime(input: RuntimeLoadInput, host?: HostClient): Promise<RuntimeLoadResult> {
+  const grant = await loadGrant(input.ownerPaths);
+  const bindings = await bindRuntime(input.ownerPaths, grant, host);
+  const actions = grantActions(bindings, { name: grant.name, cwd: input.cwd, charter: notRunning }, { reply: () => "not running" });
+  const store = openSqliteStore(input.paths.db);
+  try {
+    const loaded = await loadAgent({ ...input, grant, bindings, store, actions, startRun: dryStart });
+    return { state: serializeInstance(loaded.machine.instance, loaded.charter), failures: loaded.failures };
+  } finally { store.close(); }
+}
+
+async function runtimeLoad(input: RuntimeLoadInput, grant: Grant, loader?: RuntimeLoader): Promise<RuntimeLoadResult> {
+  if (loader) return loader(input);
+  if (grant.sandbox) throw new Error("sandboxed inception validation requires an isolated runtime loader");
+  return loadInceptionRuntime(input);
 }
 
 const notRunning = () => {
@@ -186,7 +288,7 @@ interface InceptionRecord {
 }
 
 function lastInception(paths: Paths): InceptionRecord | null {
-  if (!existsSync(paths.db)) return null;
+  if (!hasPersistedStore(paths.db)) return null;
   const store = openSqliteStore(paths.db);
   try {
     let last: InceptionRecord | null = null;
@@ -208,7 +310,7 @@ function editedInstance(paths: Paths): SerializedInstance | undefined {
   }
 }
 
-async function baselineOf(paths: Paths, grant: Grant, actions: Loaded["provisions"]["actions"][string][], cwd: string, last: InceptionRecord) {
+async function baselineOf(paths: Paths, grant: Grant, last: InceptionRecord, loadRuntime?: RuntimeLoader) {
   const dir = join(paths.snapshots, String(last.n));
   const diffs: string[] = [];
   mkdirSync(paths.workspace, { recursive: true });
@@ -225,12 +327,25 @@ async function baselineOf(paths: Paths, grant: Grant, actions: Loaded["provision
   }
   rmSync(nowManifest, { force: true });
   if (last.version !== VERSION) diffs.push(`endograph ${last.version} -> ${VERSION}\n`);
-  const errors = existsSync(paths.program) ? await validate(paths, grant, actions, cwd) : `program: nothing at ${paths.program}`;
+  const validation = await validateProgram({ paths, grant, loadRuntime });
   const store = openSqliteStore(paths.db);
   const instance = store.readSnapshot()?.state;
   const evolution = renderEvolution(store, last.seq, last.n);
   store.close();
-  return { dir, diff: diffs.join("\n"), errors: errors ?? undefined, instance, evolution };
+  return { dir, diff: diffs.join("\n"), errors: validation.ok ? undefined : validation.error, instance, evolution };
+}
+
+/** An inception opened and not closed: running now (it holds the lock), waiting for `--accept` (manual), or interrupted. */
+export function openInception(paths: Paths): { n: number; inceptor: string; started: string } | null {
+  if (!existsSync(paths.inceptions)) return null;
+  const n = Math.max(0, ...readdirSync(paths.inceptions).map(Number).filter(Number.isInteger));
+  if (!n) return null;
+  try {
+    const meta = JSON.parse(readFileSync(join(paths.inceptions, String(n), "inception.json"), "utf8")) as { inceptor: string; started: string; finished?: string };
+    return meta.finished ? null : { n, inceptor: meta.inceptor, started: meta.started };
+  } catch {
+    return null;
+  }
 }
 
 export interface InceptionStatus {
@@ -240,27 +355,23 @@ export interface InceptionStatus {
   changed: string[];
   /** program/agent.ts differs from what the last inception recorded. */
   programEdited: boolean;
-  /** Why the program does not load, when `load` was asked for. */
-  loadError: string | null;
+  /** The owner's inputs as they stand, in one string: equal when nothing moved. */
+  inputs: string;
 }
 
-/** Inputs versus the last inception, for `endo status` and `endo doctor`. */
-export async function inceptionStatus(paths: Paths, opts: { load?: boolean } = {}): Promise<InceptionStatus> {
+/** Compare owner inputs with the last inception. Never loads generated code. */
+export async function inceptionStatus(paths: Paths): Promise<InceptionStatus> {
   const last = lastInception(paths);
-  if (!last) return { n: 0, changed: [], programEdited: false, loadError: null };
   const grant = await loadGrant(paths);
+  const manifestHash = hashText(grant.manifest.text);
+  const grantHash = hashOf(paths.grant);
+  const inputs = `${manifestHash} ${grantHash} ${VERSION}`;
   const changed: string[] = [];
-  if (hashText(grant.manifest.text) !== last.manifest) changed.push("manifest");
-  if (hashOf(paths.grant) !== last.grant) changed.push("grant");
-  if (VERSION !== last.version) changed.push("endograph");
-  const programEdited = existsSync(paths.program) && hashOf(paths.program) !== last.program;
-  let loadError: string | null = null;
-  if (opts.load !== false) {
-    const cwd = resolve(paths.agentDir, grant.cwd);
-    const actions = grantActions(grant, { name: grant.name, cwd, charter: notRunning }, { reply: () => "not running" });
-    loadError = await validate(paths, grant, actions, cwd);
-  }
-  return { n: last.n, changed, programEdited, loadError };
+  if (last && manifestHash !== last.manifest) changed.push("manifest");
+  if (last && grantHash !== last.grant) changed.push("grant");
+  if (last && VERSION !== last.version) changed.push("endograph");
+  const programEdited = !!last && existsSync(paths.program) && hashOf(paths.program) !== last.program;
+  return { n: last?.n ?? 0, changed, programEdited, inputs };
 }
 
 export function hashOf(path: string): string {
@@ -270,4 +381,3 @@ export function hashOf(path: string): string {
 export function hashText(text: string): string {
   return createHash("sha256").update(text).digest("hex").slice(0, 16);
 }
-

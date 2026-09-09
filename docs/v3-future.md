@@ -8,106 +8,26 @@ When an entry lands, it moves into the plan and out of this file.
 
 ## 1. Sandbox policy
 
-**What.** A `[sandbox]` table in the grant, applied once to the agent
-process and therefore to everything it spawns: bash, procedures, the
-model call. Agent-authored JS runs in-process with no escape because
-there is no outside to escape to.
-
-```toml
-[sandbox]                     # omitted = no sandbox at all
-network = ["stout"]           # "full" | "loopback" | "offline" | hosts; executor host always added
-write = ["../.."]             # beyond the state directory; omitted = unrestricted
-env = ["FROGGY_DEPLOY_KEY"]   # what the process tree sees; omitted = everything
-```
-
-- `network`: the notches, loosest first: full → allowlist → loopback →
-  offline. The executor's host is always added. Each dimension is
-  independent, so `network: "full"` with a `write` list is valid.
-- `write`: paths writable beyond the state directory. This is what turns
-  the plan's write rule from convention into enforcement; paths a
-  procedure must write (a requester's build dir) are granted here.
-- `env`: the variables the tree sees beyond the default set, which is
-  exactly `PATH`, `HOME`, `USER`, `LANG`, `TERM`, `TMPDIR`, and `ENDO_*`.
-  Credentials come from `.endo/env` (landed, plan §13) or the service
-  environment, filtered by this list; nothing passes unlisted.
-- `endo up --no-sandbox` skips the wrapper for one run and says so in
-  status.
-
-**Why it matters.** An agent with deploy keys and a shell is the owner's
-blast radius. Everything else in endograph assumes the agent can be
-trusted with what it holds; the policy is what makes that assumption
-cheap. This is the most important entry in this file, held back only
-because it is orthogonal to the inception bet and the dogfood agent runs
-on the owner's own machine today.
-
-**Implementation, already decided.** `@anthropic-ai/sandbox-runtime`
-(Seatbelt on macOS, bubblewrap on Linux, an allowlist proxy for hosts),
-pinned. This is the shape it was built for: Claude Code itself runs
-under it with its API host allowed. Sandboxes do not nest, so the agent
-cannot tighten the policy for one tool, and `endo up` becomes two
-processes: an outer shim that runs unsandboxed (applies the policy, runs
-inception, which needs the inceptor's network and write access,
-supervises the inner) and an inner that is the agent. Exit codes from
-the inner tell the outer what to do: 0 stop, 78 (EX_CONFIG) incept me
-and restart, 1 failure. The two processes exist whether or not a policy
-is declared; the policy only decides what wraps the inner. Profiles are
-tested, never hand-written per agent.
-
-**Measured** on macOS Seatbelt (`sandbox-exec`), 2026-09-01:
-
-| Profile | internet | DNS | localhost TCP | ssh | fs r/w | bun/git/sqlite/pgrep |
-|---|---|---|---|---|---|---|
-| allow default, deny network | blocked | blocked | blocked | blocked | ok | ok |
-| loopback only + mDNSResponder socket | blocked | ok | ok | blocked | ok | ok |
-
-Findings still true: a naive `(local ip "localhost:*")` rule leaked all
-outbound; `ps` failed under the offline profile.
-
-**Open.** Should the inceptor run under a (looser) policy of its own?
-Today it would run unsandboxed with the owner's credentials, like any
-coding agent the owner runs.
-
-**Usage must tell us.** Which notch endofrog actually needs, and whether
-the write list is per grant or per procedure.
+Built with the host-action broker. `endo up` runs a trusted outer process
+and a worker, with the worker's process tree restricted when `[sandbox]`
+is declared. Host actions and model-provider access cross dedicated IPC
+pipes; inception stays outside and validates generated code in workers.
+See `docs/sandbox.md` for the supported policy and authoring API.
 
 ## 2. Automatic re-inception
 
-**What.** The harness noticing that the owner's inputs (manifest, grant,
-endograph version) changed and running an inception without `endo
-incept`.
-
-**Why.** An owner edits the manifest and expects the agent to follow. A
-new endograph version breaks the load pipeline and the agent should
-recover without a human.
-
-**Already designed.**
-
-- *Triggers.* A load-pipeline failure while the owner's inputs differ
-  from the latest snapshot (breaking: now, on `up` or the inner's exit
-  78); the inputs differ and the pipeline passes (non-breaking: pending,
-  shown in `endo status` with its age).
-- *Catch, don't predict.* The load pipeline is the detector. A separate
-  "is this breaking" check would reimplement its stages and drift from
-  them.
-- *Whose fault.* A load failure triggers inception only if the owner's
-  inputs changed since the last snapshot. Otherwise the failure came
-  from the agent: keep the previous charter, feed the error back as a
-  frame, do not summon the inceptor. (With the program inception-owned
-  and procedure failures non-fatal, this rule mostly collapses: a
-  program that fails to load is always an owner or endograph change.)
-- *Cadence.* Non-breaking runs when the inputs have been stable for
-  `debounce`, the agent is idle, and `minInterval` has passed since the
-  last inception. Grant fields: `inception: { attempts, debounce,
-  minInterval }`, where `attempts` is fresh inceptor runs (new context)
-  after `rounds` is exhausted.
-- *Giving up.* `needs-human` written in the state directory with the
-  last errors; `endo doctor` reports it, `endo up --service` exits 0 so
-  the supervisor does not crash-loop, `endo incept` retries, `endo reset
-  --force` wipes. A change to the owner's inputs clears it.
-
-**Usage must tell us.** Whether non-breaking re-inception should run at
-all without the owner asking. The cadence defaults were a guess. Revisit
-after a month of endofrog on manual `endo incept`.
+**Built (2026-09-04)**, as `inception.mode = "auto"` (the default): the
+running harness requests outer-process inception at quiescence when the owner's inputs
+changed, keeps the old program on failure, and retries only when the
+inputs move again (`docs/rewrite-plan.md` §9). Deliberately without the
+cadence knobs once designed here (`debounce`, `minInterval`, `attempts`):
+one inception at a time at quiescence is the rate limit, and a failed
+inception waiting for the inputs is the give-up rule. Whether a change is
+material is the inceptor's decision, made with `DIFF.md`, never the
+running agent's. Still held back: the "whose fault" gate (incept on a
+load failure only when the inputs changed); in practice a program that
+stops loading is an endograph or owner change, and `endo up` incepts on
+any load failure.
 
 ## 3. Budget battery
 
@@ -187,8 +107,8 @@ already durable, so nothing precludes it.
 
 ## 10. Bindings beyond the file
 
-The core keeps only the seams: outbox files and `from` stamped by the
-binding.
+Core trusts inbox writers to assert `from`, derives reply `to` from accepted
+authorship, and archives addressed notifications. See `docs/server.md`.
 
 - **SSH.** Remote CLI execution: `endo --agent stout:<path> send …`
   expands to `ssh stout 'endo --agent … send --from ssh:eleven@fox …'`.
@@ -196,13 +116,11 @@ binding.
 - **MCP front door.** `endo mcp --agent <name>` (stdio): `ask` =
   request, one typed tool per exposed procedure, `wait`, status as a
   resource. The procedure arg schemas are already the MCP tool schemas.
-- **HTTP relay.** `@endograph/server`, a per-machine relay writing inbox
-  files and reading outboxes for every agent on the host; principals as
-  `scheme:name`, two rights (read, write), providers as functions,
-  separate package. Verify at the edge against the provider's secret,
-  normalize to a request with the sender's identity in `from` and
-  provider facts as data, route by a thread key into `ref`; never a
-  listener per agent. Scheme `oidc:<issuer>#<subject>`.
+- **HTTP relay.** Initial `@endograph/server` Fetch handler built: authenticated
+  admission, caller-scoped request IDs and thread keys, own-recipient reads,
+  all exposed procedures, and pull-based notification collection. See
+  `docs/server.md`. Still future: packaged provider adapters, provider push
+  delivery, delivery acknowledgements/retention, and a managed server CLI.
 - **A2A.** The first cross-machine peer beyond ssh; the reply `state`
   vocabulary is already A2A's.
 

@@ -18,8 +18,8 @@ export function fromTemplate(dir: string, template: string): string | null {
 
 export async function interactiveSetup(dir: string, ask: (question: string, fallback?: string) => Promise<string>): Promise<void> {
   const name = await ask("agent name (kebab-case)", basename(dir).toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-|-$/g, ""));
-  const provider = await ask("executor provider (anthropic | openai)", "anthropic");
-  const model = await ask("model", provider === "openai" ? "gpt-5.6-luna" : "claude-opus-5");
+  const provider = await ask("executor (anthropic | openai | codex)", "anthropic");
+  const model = await ask("model", provider === "codex" ? "" : provider === "openai" ? "gpt-5.6-luna" : "claude-opus-5");
   const manifest = await ask("manifest: a path to a markdown file, or enter to write a stub to edit", "");
   const batteries = (await ask("batteries (comma-separated: bash)", "bash")).split(",").map((b) => b.trim()).filter(Boolean);
   const grant = `name = "${name}"
@@ -27,11 +27,12 @@ manifest = "manifest.md"
 batteries = [${batteries.map((b) => `"${b}"`).join(", ")}]
 
 [executor]
-provider = "${provider}"
-model = "${model}"
+${provider === "codex" ? 'backend = "codex"' : `provider = "${provider}"`}
+${model ? `model = "${model}"` : "# model omitted: use the Codex default"}
 
 [inception]
 rounds = 5
+# mode = "auto"   # auto (default): incepts by itself when idle after manifest.md or this file changes; manual: only \`endo incept\`
 `;
   writeFileSync(join(dir, "endograph.toml"), grant);
   if (manifest) copyFileSync(resolve(manifest), join(dir, "manifest.md"));

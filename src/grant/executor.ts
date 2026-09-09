@@ -2,9 +2,9 @@ import { anthropic } from "@ai-sdk/anthropic";
 import { openai } from "@ai-sdk/openai";
 import { AiSdkExecutor } from "@projectors/aisdk-executor";
 import type { ProjectorExecutor } from "@projectors/core";
-import type { LanguageModel } from "ai";
+import type { LanguageModelV3 } from "@ai-sdk/provider";
 
-/** What the grant's `executor` field holds: a factory, plus per-node config the provisions pass on. */
+/** A bound runtime's executor factory and per-node configuration. */
 export interface ExecutorSpec {
   create(): ProjectorExecutor;
   /** For the inceptor's GRANT.md: "aisdk openai gpt-5.6-luna". */
@@ -29,7 +29,7 @@ export interface AiSdkOptions {
  * AI SDK speaks. Credentials come from the environment (ANTHROPIC_API_KEY,
  * OPENAI_API_KEY).
  */
-export function aisdk(opts: AiSdkOptions): ExecutorSpec {
+export function aisdk(opts: AiSdkOptions, model?: LanguageModelV3): ExecutorSpec {
   const node: Record<string, unknown> = {};
   if (opts.maxOutputTokens !== undefined) node.maxOutputTokens = opts.maxOutputTokens;
   if (opts.temperature !== undefined) node.temperature = opts.temperature;
@@ -38,7 +38,7 @@ export function aisdk(opts: AiSdkOptions): ExecutorSpec {
     executorConfig: Object.keys(node).length ? { aisdk: node } : undefined,
     create: () =>
       new AiSdkExecutor({
-        model: languageModelFor(opts),
+        model: model ?? languageModelFor(opts),
         maxSteps: MAX_STEPS,
         turnDeadlineMs: TURN_DEADLINE_MS,
         maxOutputTokens: opts.maxOutputTokens ?? 16000,
@@ -46,7 +46,7 @@ export function aisdk(opts: AiSdkOptions): ExecutorSpec {
   };
 }
 
-function languageModelFor(opts: AiSdkOptions): LanguageModel {
+export function languageModelFor(opts: AiSdkOptions): LanguageModelV3 {
   switch (opts.provider) {
     case "openai":
       return openai(opts.model);

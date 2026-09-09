@@ -3,7 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { normalizeSchema, SchemaError } from "@projectors/core";
 import { lookup } from "../cli/registry.ts";
-import { newId, PROTOCOL_VERSION, readReply, writeMessage, writeReply, type Reply } from "../protocol/wire.ts";
+import { newId, recipient, PROTOCOL_VERSION, waitForReply, writeMessage, writeReply, type Reply } from "../protocol/wire.ts";
 
 /**
  * `endograph/procedure`: the script-side library. A procedure is a script
@@ -11,7 +11,7 @@ import { newId, PROTOCOL_VERSION, readReply, writeMessage, writeReply, type Repl
  * imports it in describe mode, where `procedure()` throws a sentinel
  * carrying the metadata; at runtime it validates the call's args and
  * returns them. While it runs the script is a peer of its own agent on the
- * wire, stamped `agent:<name>/<procedure>` by the harness.
+ * wire, asserting `agent:<name>/<procedure>` as its author.
  */
 
 export interface ProcedureOptions<A extends Record<string, StandardSchemaV1>> {
@@ -47,6 +47,8 @@ export interface Receipt {
   id: string;
   /** The state directory whose outbox answers it: this agent's, or the `to` agent's. */
   state: string;
+  /** Notifications have no request/reply lifecycle. */
+  notification?: boolean;
 }
 
 const env = () => ({
@@ -101,38 +103,49 @@ export function actionResult(text: string): void {
   if (!ctx.run || !ctx.state) throw new Error("actionResult() outside a procedure run");
   if (acked) throw new Error("actionResult() called twice");
   acked = true;
-  writeReply(join(ctx.state, "outbox"), { v: PROTOCOL_VERSION, id: ctx.run, ok: true, state: "working", text, at: Date.now() });
+  // The harness commits this acknowledgement before publishing it in the outbox.
+  writeReply(join(ctx.state, "runs", "acks"), { v: PROTOCOL_VERSION, id: ctx.run, ok: true, state: "working", text, at: Date.now() });
 }
 
-/**
- * A request to this agent, or with `to` to another agent registered on
- * this machine. The receiving harness stamps `from` as this procedure
- * after checking the run is live.
- */
+/** Accepted caller context, separate from procedure arguments. */
+export function caller(): { from: string; id: string } {
+  const from = process.env.ENDO_FROM;
+  const id = process.env.ENDO_RUN;
+  if (!from || !id) throw new Error("caller() outside a procedure run");
+  return { from, id };
+}
+
+/** Local agents receive requests; other identities receive durable notifications. */
 export function emitMessage(message: { text: string; ref?: string; to?: string }): Receipt {
   const ctx = env();
-  if (!ctx.run || !ctx.state || !ctx.agent) throw new Error("emitMessage() outside a procedure run");
+  if (!ctx.run || !ctx.state || !ctx.agent || !ctx.procedure) throw new Error("emitMessage() outside a procedure run");
   if (!acked) throw new Error("call actionResult() first, or exit without emitting");
+  const to = recipient(message.to ?? ctx.agent);
+  const local = /^agent:([a-z][a-z0-9]*(?:-[a-z0-9]+)*)$/.exec(to);
   let state = ctx.state;
-  if (message.to && message.to !== ctx.agent) {
-    const entry = lookup(message.to);
-    if (!entry?.exists) throw new Error(`no agent "${message.to}" is registered on this machine`);
-    state = join(entry.dir, ".endo");
+  let routed = !!local;
+  if (local && local[1] !== ctx.agent) {
+    const entry = lookup(local[1]!);
+    if (entry?.exists) state = join(entry.dir, ".endo");
+    else routed = false;
   }
   const id = newId();
-  writeMessage(join(state, "inbox"), { v: PROTOCOL_VERSION, kind: "request", id, text: message.text, ref: message.ref, run: ctx.run, agent: ctx.agent, at: Date.now() });
-  return { id, state };
+  writeMessage(join(state, "inbox"), {
+    v: PROTOCOL_VERSION, kind: routed ? "request" : "notification", id,
+    from: `agent:${ctx.agent}/${ctx.procedure}`, to, cause: ctx.run,
+    text: message.text, ref: message.ref, at: Date.now(),
+  });
+  return { id, state, ...(!routed ? { notification: true } : {}) };
 }
 
 /** The terminal reply to a message this procedure emitted. Rejects on timeout. */
 export async function waitForCompletion(receipt: Receipt, opts: { timeoutMs?: number } = {}): Promise<Reply> {
-  const deadline = Date.now() + (opts.timeoutMs ?? 60 * 60 * 1000);
-  for (;;) {
-    const reply = readReply(join(receipt.state, "outbox"), receipt.id);
-    if (reply && reply.state !== "working" && reply.state !== "submitted") return reply;
-    if (Date.now() >= deadline) throw new Error(`timed out waiting for a reply to ${receipt.id}`);
-    await Bun.sleep(250);
-  }
+  if (receipt.notification) throw new Error("notifications have no completion reply; a binding must collect them");
+  const reply = await waitForReply(join(receipt.state, "outbox"), receipt.id, {
+    timeoutMs: opts.timeoutMs ?? 60 * 60 * 1000, pollMs: 250, terminal: true,
+  });
+  if (!reply) throw new Error(`timed out waiting for a reply to ${receipt.id}`);
+  return reply;
 }
 
 /** Resolves when the agent has no open requests and no running activation. */

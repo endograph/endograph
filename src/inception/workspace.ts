@@ -1,8 +1,11 @@
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { normalizeSchema, type AnyAction } from "@projectors/core";
+import { normalizeSchema, type SerializedInstance } from "@projectors/core";
 import type { Grant } from "../grant/grant.ts";
+import { loadBatteries } from "../grant/bind.ts";
+import { grantActions } from "../grant/core.ts";
 import type { Paths } from "../harness/paths.ts";
+import { readHostCatalogue } from "../host/provisions.ts";
 import { CONSUMER_DOC } from "../cli/usage.ts";
 
 /**
@@ -16,8 +19,8 @@ const PROGRAM_DOC = resolve(import.meta.dir, "../../docs/program.md");
 export interface WorkspaceInput {
   paths: Paths;
   grant: Grant;
-  /** Core, battery, and pass-through actions, as the harness would build them. */
-  actions: AnyAction[];
+  /** Plain descriptions only: no executor, host handler, or executable proxy. */
+  description: GrantDescription;
   /** This inception's number. */
   n: number;
   version: string;
@@ -36,6 +39,44 @@ export interface WorkspaceInput {
   };
 }
 
+export interface GrantDescription {
+  executor: string;
+  actions: { name: string; description?: string; inputSchema?: Record<string, unknown> }[];
+  states: { key: string; schema: Record<string, unknown> }[];
+  batteries: { name: string; guide: string; fields: { name: string; description: string; schema: Record<string, unknown> }[] }[];
+}
+
+/** Describe trusted built-ins and cached host schemas without binding an
+ * executor, importing an executor module, or constructing host proxies. */
+export function describeGrant(paths: Paths, grant: Grant): GrantDescription {
+  const batteries = loadBatteries(grant);
+  const unavailable = (): never => { throw new Error("grant description cannot execute an action"); };
+  const builtins = grantActions({ batteries, hostActions: [] },
+    { name: grant.name, cwd: resolve(paths.agentDir, grant.cwd), charter: unavailable },
+    { reply: unavailable });
+  const actions: GrantDescription["actions"] = builtins.map((action) => ({
+    name: action.name,
+    description: action.description,
+    ...(action.inputSchema ? { inputSchema: normalizeSchema(action.inputSchema).jsonSchema() } : {}),
+  }));
+  const catalogue = grant.hostActions.length ? readHostCatalogue(paths) : [];
+  for (const name of grant.hostActions) {
+    const descriptor = catalogue.find((action) => action.name === name);
+    if (!descriptor) throw new Error(`no cached description for host action "${name}"; launch through the owner host first`);
+    if (actions.some((action) => action.name === name)) throw new Error(`host action "${name}" conflicts with another granted action`);
+    actions.push(descriptor);
+  }
+  return {
+    executor: "module" in grant.executor ? `module ${grant.executor.module}` : "backend" in grant.executor ? `codex:${grant.executor.model ?? "default"}` : `${grant.executor.provider}:${grant.executor.model}`,
+    actions,
+    states: batteries.flatMap((battery) => (battery.states ?? []).map((state) => ({ key: state.key, schema: normalizeSchema(state.schema).jsonSchema() }))),
+    batteries: batteries.map((battery) => ({
+      name: battery.name, guide: battery.guide,
+      fields: Object.entries(battery.procedure?.fields ?? {}).map(([name, field]) => ({ name, description: field.description, schema: normalizeSchema(field.schema).jsonSchema() })),
+    })),
+  };
+}
+
 export function renderWorkspace(input: WorkspaceInput): string {
   const { paths, grant } = input;
   const dir = paths.workspace;
@@ -45,7 +86,7 @@ export function renderWorkspace(input: WorkspaceInput): string {
   writeFileSync(join(dir, "GRANT.md"), renderGrant(input));
   writeFileSync(join(dir, "PROGRAM.md"), readFileSync(PROGRAM_DOC, "utf8"));
   writeFileSync(join(dir, "CLI.md"), CONSUMER_DOC);
-  for (const b of grant.batteries) writeFileSync(join(dir, "batteries", `${b.name}.md`), b.guide);
+  for (const b of input.description.batteries) writeFileSync(join(dir, "batteries", `${b.name}.md`), b.guide);
   if (input.baseline) {
     const { baseline } = input;
     mkdirSync(join(dir, "BASELINE"), { recursive: true });
@@ -60,29 +101,30 @@ export function renderWorkspace(input: WorkspaceInput): string {
   return dir;
 }
 
-export function renderGrant({ grant, actions, version }: WorkspaceInput): string {
+export function renderGrant({ grant, description, version }: WorkspaceInput): string {
   const lines: string[] = [
     `# GRANT: ${grant.name}`,
     "",
-    "Everything this agent may ever do. Written from `endograph.toml`; you cannot widen it.",
+    "The supported capabilities selected by `endograph.toml`. The process sandbox controls resource access.",
     "",
     `- name: \`${grant.name}\``,
-    `- executor: ${grant.executor.description ?? "(custom)"}${grant.executor.executorConfig ? ` with executorConfig ${JSON.stringify(grant.executor.executorConfig)}` : ""}`,
+    `- executor: ${description.executor}`,
+    `- executor config: \`${JSON.stringify(grant.executor)}\``,
     `- cwd (where procedures and bash run): \`${grant.cwd}\` relative to the agent directory`,
-    `- batteries: ${grant.batteries.length ? grant.batteries.map((b) => `\`${b.name}\``).join(", ") : "(none)"}`,
+    `- batteries: ${grant.batteries.length ? grant.batteries.map((name) => `\`${name}\``).join(", ") : "(none)"}`,
     `- endograph ${version}`,
     "",
     "## Actions (`endo.actions.<name>`)",
     "",
   ];
-  for (const a of actions) {
+  for (const a of description.actions) {
     lines.push(`### ${a.name}`, "", a.description ?? "(no description)", "");
-    if (a.inputSchema) lines.push("```json", JSON.stringify(normalizeSchema(a.inputSchema).jsonSchema(), null, 2), "```", "");
+    if (a.inputSchema) lines.push("```json", JSON.stringify(a.inputSchema, null, 2), "```", "");
   }
   lines.push("## States (`endo.states.<key>`)", "");
-  if (grant.states.length === 0) lines.push("(none granted; declare your own with `createState` on the nodes that use them)", "");
-  for (const s of grant.states) {
-    lines.push(`### ${s.key}`, "", "```json", JSON.stringify(normalizeSchema(s.schema).jsonSchema(), null, 2), "```", "");
+  if (description.states.length === 0) lines.push("(none granted; declare your own with `createState` on the nodes that use them)", "");
+  for (const s of description.states) {
+    lines.push(`### ${s.key}`, "", "```json", JSON.stringify(s.schema, null, 2), "```", "");
   }
   lines.push(
     "## Procedure options",
@@ -90,9 +132,9 @@ export function renderGrant({ grant, actions, version }: WorkspaceInput): string
     "`procedure({ description, expose?, args?, ...fields })`: `description` (string, required), `expose` (boolean; peers may `endo call` it), `args` (an object of Standard Schemas, one per arg; `z` from `endograph`).",
     "",
   );
-  for (const b of grant.batteries) {
-    for (const [field, def] of Object.entries(b.procedure?.fields ?? {})) {
-      lines.push(`- \`${field}\` (${b.name}): ${def.description}`, "  ```json", `  ${JSON.stringify(normalizeSchema(def.schema).jsonSchema())}`, "  ```");
+  for (const b of description.batteries) {
+    for (const field of b.fields) {
+      lines.push(`- \`${field.name}\` (${b.name}): ${field.description}`, "  ```json", `  ${JSON.stringify(field.schema)}`, "  ```");
     }
   }
   lines.push("");
@@ -170,14 +212,16 @@ function today(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-/** After a success: the owner's inputs, the program, and src as they stand. */
-export function writeSnapshot(paths: Paths, grant: Grant, n: number): string {
+/** A candidate generation's inputs, code and migrated instance. Promotion
+ * commits its matching frame/checkpoint together before this becomes current. */
+export function writeSnapshot(paths: Paths, grant: Grant, n: number, instance: SerializedInstance): string {
   const dir = join(paths.snapshots, String(n));
   rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir, { recursive: true });
   cpSync(paths.grant, join(dir, "endograph.toml"));
   writeFileSync(join(dir, "manifest.md"), grant.manifest.text);
   cpSync(paths.program, join(dir, "agent.ts"));
+  writeFileSync(join(dir, "instance.json"), `${JSON.stringify(instance, null, 2)}\n`);
   if (existsSync(paths.src)) cpSync(paths.src, join(dir, "src"), { recursive: true });
   return dir;
 }

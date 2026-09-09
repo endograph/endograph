@@ -1,15 +1,18 @@
 #!/usr/bin/env bun
 import { existsSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
-import { openAgent, AlreadyRunning, HeldElsewhere, NoProgram } from "../harness/agent.ts";
-import { isLocked } from "../harness/lock.ts";
+import { createAgentHost } from "../host/agent.ts";
+import { acquireLock, isLocked } from "../harness/lock.ts";
 import { pathsOf } from "../harness/paths.ts";
-import { adopt, heldElsewhere, HOST, readResidence, since } from "../harness/residence.ts";
-import { incept, InceptionFailed } from "../inception/incept.ts";
+import { adopt, heldElsewhere, HOST, readResidence, readStatus, since } from "../harness/residence.ts";
+import { recoverPromotion } from "../inception/promotion.ts";
+import { incept, InceptionFailed, inceptionStatus, validateProgram } from "../inception/incept.ts";
 import { newId, PROTOCOL_VERSION, waitForReply, writeMessage } from "../protocol/wire.ts";
-import { openSqliteStore } from "../store/sqlite.ts";
+import { hasPersistedStore, openSqliteStore } from "../store/sqlite.ts";
+import { snapshotAgent } from "../store/snapshot.ts";
 import { allFrames } from "../store/types.ts";
 import { framesAbout, printFrame } from "./frames.ts";
+import { inspectAgent, whyNotServing } from "../harness/inspect.ts";
 import { claim, list, lookup, NameConflict, release, resolveAgent } from "./registry.ts";
 import { installService, removeService, serviceInfo, serviceRunning } from "./service.ts";
 import { fromTemplate, interactiveSetup } from "./setup.ts";
@@ -61,9 +64,6 @@ function parse(argv: string[]): { command: string; flags: Flags } {
 }
 
 const say = (line: string) => console.log(line);
-const notRunning = () => {
-  throw new Error("the agent is not running");
-};
 
 /** The agent directory a command targets: `--agent`, else the current directory. It must hold a grant. */
 function target(flags: Flags): ReturnType<typeof pathsOf> | null {
@@ -79,6 +79,15 @@ async function agentName(paths: ReturnType<typeof pathsOf>): Promise<string> {
   const { ensureStateDir } = await import("../harness/paths.ts");
   ensureStateDir(paths);
   return (await loadGrant(paths)).name;
+}
+
+/** The wire commands say when they queue into a mailbox nobody reads yet, and which kind of not-running it is. */
+async function noteIfDown(paths: ReturnType<typeof pathsOf>): Promise<void> {
+  try {
+    const name = await agentName(paths);
+    const why = await whyNotServing(paths, name);
+    if (why) console.error(`${name} is not serving: ${why}`);
+  } catch {}
 }
 
 async function up(flags: Flags): Promise<number> {
@@ -104,85 +113,80 @@ async function up(flags: Flags): Promise<number> {
   }
   const paths = target(flags);
   if (!paths) return 1;
-  let name: string;
-  try {
-    name = await agentName(paths);
-    claim(name, paths.agentDir);
-  } catch (err) {
-    console.error(err instanceof NameConflict ? err.message : `cannot load ${paths.grant}: ${err instanceof Error ? err.message : String(err)}`);
-    return 1;
+  // Recover an interrupted filesystem promotion before preflight reads any candidate code.
+  if (existsSync(join(paths.state, "promotion.json"))) {
+    const lock = acquireLock(paths.lock);
+    if (!lock) {
+      console.error("inception is promoting a program; the agent is already running");
+      return 1;
+    }
+    try { recoverPromotion(paths); } finally { lock.release(); }
   }
-  if (!existsSync(paths.program)) {
-    if (flags.service) {
-      console.error("no program; run `endo up` in a terminal so inception can run");
+  const host = await createAgentHost({ agentDir: paths.agentDir, inceptor: flags.inceptor, log: say });
+  try {
+    let name: string;
+    try {
+      name = (await host.grant()).name;
+      claim(name, paths.agentDir);
+    } catch (err) {
+      console.error(err instanceof NameConflict ? err.message : `cannot load ${paths.grant}: ${err instanceof Error ? err.message : String(err)}`);
+      return 1;
+    }
+    if ((flags.foreground || flags.service) && isLocked(paths.lock)) {
+      console.error((await whyNotServing(paths, name)) ?? `${name} is already running`);
+      return flags.service ? 0 : 1;
+    }
+    // No program, or one the load pipeline rejects (an endograph or grant change since it was written): incept before installing anything.
+    const status = await inceptionStatus(paths);
+    const validation = await validateProgram({ paths, grant: await host.grant(), loadRuntime: host.loadRuntime });
+    if (!validation.ok) {
+      const reason = `${validation.error}${status.changed.length ? ` (changed since inception ${status.n}: ${status.changed.join(", ")})` : ""}`;
+      if (flags.service) {
+        console.error(`${reason}; run \`endo up\` in a terminal so inception can run`);
+        return 0;
+      }
+      say(`${reason}: running inception ${status.n + 1}`);
+      try {
+        await incept({ agentDir: paths.agentDir, inceptor: flags.inceptor, log: say, loadRuntime: host.loadRuntime });
+      } catch (err) {
+        console.error(err instanceof InceptionFailed ? err.message : `inception failed: ${err instanceof Error ? err.message : String(err)}`);
+        return 1;
+      }
+    }
+    // A state directory another host holds (a copy, a synced mirror) runs here only when adopted; the move is a frame.
+    const held = heldElsewhere(paths);
+    if (held && !flags.adopt) {
+      console.error(`${name} is held by ${held.host} (as of ${since(held.at)}); \`endo down\` there, or \`endo up --adopt\` to run it here`);
+      if (flags.service) await removeService(name);
+      return flags.service ? 0 : 1;
+    }
+    if (held) {
+      adopt(paths);
+      say(`${name} adopted from ${held.host}`);
+    }
+    if (!flags.foreground && !flags.service) {
+      if (isLocked(paths.lock) && !(await serviceRunning(name).catch(() => false))) {
+        console.error((await whyNotServing(paths, name)) ?? `${name} is running in the foreground somewhere; stop it first`);
+        return 1;
+      }
+      try {
+        await installService(name, paths.agentDir);
+      } catch (err) {
+        console.error(`could not install the service: ${err instanceof Error ? err.message : String(err)}`);
+        return 1;
+      }
+      say(`${name} is up under ${process.platform === "darwin" ? "launchd" : "systemd"} from ${paths.agentDir}: now, at every login, after crashes`);
+      say(`  endo --agent ${name} status | endo logs -f | endo down`);
       return 0;
     }
-    say("no program: running inception 1");
-    try {
-      await incept({ agentDir: paths.agentDir, inceptor: flags.inceptor, log: say });
-    } catch (err) {
-      console.error(err instanceof InceptionFailed ? err.message : `inception failed: ${err instanceof Error ? err.message : String(err)}`);
+    if (flags.foreground && (await serviceRunning(name).catch(() => false))) {
+      console.error(`${name} is running as a service; \`endo down\` first, or watch it with \`endo logs -f\``);
       return 1;
     }
-  }
-  // A state directory another host holds (a copy, a synced mirror) runs here only when adopted; the move is a frame.
-  const held = heldElsewhere(paths);
-  if (held && !flags.adopt) {
-    console.error(`${name} is held by ${held.host} (as of ${since(held.at)}); \`endo down\` there, or \`endo up --adopt\` to run it here`);
-    if (flags.service) await removeService(name);
-    return flags.service ? 0 : 1;
-  }
-  if (held) {
-    adopt(paths);
-    say(`${name} adopted from ${held.host}`);
-  }
-  if (!flags.foreground && !flags.service) {
-    if (isLocked(paths.lock) && !(await serviceRunning(name).catch(() => false))) {
-      console.error(`${name} is running in the foreground somewhere; stop it first`);
-      return 1;
-    }
-    try {
-      await installService(name, paths.agentDir);
-    } catch (err) {
-      console.error(`could not install the service: ${err instanceof Error ? err.message : String(err)}`);
-      return 1;
-    }
-    say(`${name} is up under ${process.platform === "darwin" ? "launchd" : "systemd"} from ${paths.agentDir}: now, at every login, after crashes`);
-    say(`  endo --agent ${name} status | endo logs -f | endo down`);
-    return 0;
-  }
-  if (flags.foreground && (await serviceRunning(name).catch(() => false))) {
-    console.error(`${name} is running as a service; \`endo down\` first, or watch it with \`endo logs -f\``);
-    return 1;
-  }
-  try {
-    const agent = await openAgent({
-      agentDir: paths.agentDir,
-      log: say,
-      onAdopted: async (host) => {
-        say(`${name} adopted by ${host}; stopping here`);
-        await agent.stop();
-        if (flags.service) await removeService(name);
-        process.exit(0);
-      },
-    });
-    agent.start();
-    say(`${agent.name} up in ${paths.agentDir} (${agent.loaded.procedures.length} procedures)`);
-    const stop = async () => {
-      await agent.stop();
-      process.exit(0);
-    };
-    process.on("SIGINT", () => void stop());
-    process.on("SIGTERM", () => void stop());
-    await new Promise(() => {});
-    return 0;
-  } catch (err) {
-    if (err instanceof AlreadyRunning || err instanceof NoProgram || err instanceof HeldElsewhere) console.error(err.message);
-    if (err instanceof HeldElsewhere && flags.service) await removeService(name);
-    else console.error(`${err instanceof Error ? err.message : String(err)}\nrun \`endo incept\` to rewrite the program`);
-    // A service exits 0 so the supervisor does not crash-loop; the foreground says what to do.
-    return flags.service ? 0 : 1;
-  }
+    const code = await host.run();
+    if (flags.service && heldElsewhere(paths)) await removeService(name);
+    return code;
+  } finally { await host.close(); }
 }
 
 async function down(flags: Flags): Promise<number> {
@@ -223,8 +227,9 @@ async function listAgents(): Promise<number> {
     return 0;
   }
   for (const e of entries) {
-    const state = !e.exists ? "gone" : isLocked(pathsOf(e.dir).lock) ? "up" : "down";
-    say(`${e.name.padEnd(20)} ${state.padEnd(5)} ${e.dir}`);
+    const inspection = e.exists ? await inspectAgent(pathsOf(e.dir), e.name) : null;
+    const state = inspection?.phase ?? "gone";
+    say(`${e.name.padEnd(20)} ${state.padEnd(10)} ${e.dir}${inspection?.reason ? `  (${inspection.reason})` : ""}`);
   }
   return 0;
 }
@@ -232,14 +237,15 @@ async function listAgents(): Promise<number> {
 async function inceptCommand(flags: Flags): Promise<number> {
   const paths = target(flags);
   if (!paths) return 1;
+  const host = await createAgentHost({ agentDir: paths.agentDir, inceptor: flags.inceptor, log: say });
   try {
-    const result = await incept({ agentDir: paths.agentDir, inceptor: flags.inceptor, manual: flags.manual, accept: flags.accept, log: say });
-    if ("manual" in result) say(`run your coding agent in ${paths.agentDir}, then \`endo incept --accept\``);
+    const result = await incept({ agentDir: paths.agentDir, inceptor: flags.inceptor, manual: flags.manual, accept: flags.accept, log: say, loadRuntime: host.loadRuntime });
+    if ("manual" in result) say(`run your coding agent in ${resolve(result.workspace, "../..")}, then run \`endo incept --accept\` from ${paths.agentDir}`);
     return 0;
   } catch (err) {
     console.error(err instanceof Error ? err.message : String(err));
     return 1;
-  }
+  } finally { await host.close(); }
 }
 
 /** What `send` says about its caller: the current directory and its git HEAD. */
@@ -263,6 +269,7 @@ async function send(flags: Flags): Promise<number> {
   const id = flags.id ?? newId();
   const caller = callerContext();
   writeMessage(paths.inbox, { v: PROTOCOL_VERSION, kind: "request", id, text, origin: caller.origin, ref: flags.ref ?? caller.ref, at: Date.now() });
+  await noteIfDown(paths);
   if (!flags.wait) {
     say(id);
     return 0;
@@ -286,6 +293,7 @@ async function call(flags: Flags): Promise<number> {
   if (!paths) return 1;
   const id = flags.id ?? newId();
   writeMessage(paths.inbox, { v: PROTOCOL_VERSION, kind: "call", id, procedure, args, origin: callerContext().origin, at: Date.now() });
+  await noteIfDown(paths);
   return await waitAndPrint(paths.outbox, id, flags.wait);
 }
 
@@ -300,24 +308,9 @@ async function wait(flags: Flags): Promise<number> {
   const id = flags.rest[0];
   if (!id) return usage();
   const paths = target(flags);
-  return paths ? waitAndPrint(paths.outbox, id) : 1;
-}
-
-interface StatusFile {
-  name: string;
-  open: string[];
-  runs: unknown[];
-  active: boolean;
-  at: number;
-  commands?: { name: string; description: string; args: Record<string, unknown>; required: string[] }[];
-}
-
-function readStatus(paths: ReturnType<typeof pathsOf>): StatusFile | null {
-  try {
-    return JSON.parse(readFileSync(paths.status, "utf8"));
-  } catch {
-    return null;
-  }
+  if (!paths) return 1;
+  await noteIfDown(paths);
+  return waitAndPrint(paths.outbox, id);
 }
 
 async function commands(flags: Flags): Promise<number> {
@@ -338,18 +331,16 @@ async function commands(flags: Flags): Promise<number> {
 async function status(flags: Flags): Promise<number> {
   const paths = target(flags);
   if (!paths) return 1;
-  const s = readStatus(paths);
-  const up = isLocked(paths.lock);
-  say(s ? `${s.name}: ${up ? (s.active ? "up, active" : "up, idle") : "down"}, ${s.open.length} open request(s), ${s.runs.length} running procedure(s) (as of ${new Date(s.at).toISOString()})` : "never up");
-  const held = heldElsewhere(paths);
-  if (held) say(`  held by ${held.host}; \`endo up --adopt\` to run it here`);
-  try {
-    const { inceptionStatus } = await import("../inception/incept.ts");
-    const i = await inceptionStatus(paths, { load: false });
-    if (i.changed.length) say(`  inputs changed since inception ${i.n}: ${i.changed.join(", ")} (an inception is due: \`endo incept\`)`);
-    if (i.programEdited) say(`  program/agent.ts was edited by hand since inception ${i.n}`);
-  } catch {}
-  if (existsSync(paths.db)) {
+  const inspection = await inspectAgent(paths, await agentName(paths).catch(() => basename(paths.agentDir)));
+  const s = inspection.status;
+  const phase = inspection.phase === "down" ? "down" : `up, ${inspection.phase}`;
+  say(`${inspection.name}: ${phase}, ${s?.open?.length ?? 0} open request(s), ${s?.runs?.length ?? 0} running procedure(s)${s?.at ? ` (as of ${new Date(s.at).toISOString()})` : ""}`);
+  if (inspection.reason) say(`  ${inspection.reason}`);
+  if (inspection.inputError) say(`  ${inspection.inputError}`);
+  const i = inspection.inception;
+  if (i?.changed.length) say(`  inputs changed since inception ${i.n}: ${i.changed.join(", ")} (an inception is due: \`endo incept\`)`);
+  if (i?.programEdited) say(`  program/agent.ts was edited by hand since inception ${i.n}`);
+  if (hasPersistedStore(paths.db)) {
     const store = openSqliteStore(paths.db);
     for (const f of allFrames(store, Math.max(0, store.lastSeq() - 10))) say(`  ${f.seq}  ${f.type.padEnd(11)} ${f.summary}`);
     store.close();
@@ -360,21 +351,21 @@ async function status(flags: Flags): Promise<number> {
 async function charter(flags: Flags): Promise<number> {
   const paths = target(flags);
   if (!paths) return 1;
-  const { loadGrant } = await import("../grant/grant.ts");
   const { ensureStateDir } = await import("../harness/paths.ts");
-  const { grantActions } = await import("../grant/core.ts");
-  const { renderGrant } = await import("../inception/workspace.ts");
+  const { describeGrant, renderGrant } = await import("../inception/workspace.ts");
   ensureStateDir(paths);
-  const grant = await loadGrant(paths);
-  const actions = grantActions(grant, { name: grant.name, cwd: resolve(paths.agentDir, grant.cwd), charter: notRunning }, { reply: () => "not running" });
-  say(renderGrant({ paths, grant, actions, n: 0, version: "" }).trimEnd());
-  return 0;
+  const host = await createAgentHost({ agentDir: paths.agentDir, log: say });
+  try {
+    const grant = await host.grant();
+    say(renderGrant({ paths, grant, description: describeGrant(paths, grant), n: 0, version: "" }).trimEnd());
+    return 0;
+  } finally { await host.close(); }
 }
 
 async function replay(flags: Flags): Promise<number> {
   const paths = target(flags);
   if (!paths) return 1;
-  if (!existsSync(paths.db)) {
+  if (!hasPersistedStore(paths.db)) {
     say("no frames yet");
     return 0;
   }
@@ -389,6 +380,16 @@ async function replay(flags: Flags): Promise<number> {
 async function why(flags: Flags): Promise<number> {
   if (!flags.rest[0]) return usage();
   return replay(flags);
+}
+
+async function snapshot(flags: Flags): Promise<number> {
+  if (flags.rest.length !== 1) return usage();
+  const paths = target(flags);
+  if (!paths) return 1;
+  const result = snapshotAgent(paths.agentDir, flags.rest[0]!);
+  say(`snapshot through archive commit ${result.commit}: ${result.directory}`);
+  say("restore with endo up in that directory; provision credentials and dependencies separately");
+  return 0;
 }
 
 async function reset(flags: Flags): Promise<number> {
@@ -419,45 +420,45 @@ async function reset(flags: Flags): Promise<number> {
 async function doctor(flags: Flags): Promise<number> {
   const paths = target(flags);
   if (!paths) return 1;
-  let bad = 0;
-  const note = (ok: boolean, text: string) => {
-    if (!ok) bad++;
-    say(`${ok ? "ok  " : "FAIL"} ${text}`);
-  };
-  let name: string | undefined;
+  const host = await createAgentHost({ agentDir: paths.agentDir, log: say });
   try {
-    name = await agentName(paths);
-    note(true, `grant loads: ${name}`);
-  } catch (err) {
-    note(false, `grant does not load: ${err instanceof Error ? err.message : String(err)}`);
-    return 1;
-  }
-  note(existsSync(paths.program), existsSync(paths.program) ? "program present" : "no program: `endo up` incepts one");
-  const entry = lookup(name);
-  note(!!entry && entry.exists && realpathSync(entry.dir) === realpathSync(paths.agentDir), entry ? `registry: ${name} → ${entry.dir}${entry.exists ? "" : " (gone)"}` : `registry: ${name} not registered (\`endo up\` registers)`);
-  const svc = serviceInfo(name);
-  if (svc.installed) {
-    const unit = readFileSync(svc.file, "utf8");
-    note(unit.includes(paths.agentDir), unit.includes(paths.agentDir) ? `unit ${svc.file}` : `unit ${svc.file} points elsewhere; \`endo up\` here rewrites it`);
-    note(true, `service ${(await serviceRunning(name).catch(() => false)) ? "running" : "not running"}`);
-  } else note(true, `no service unit (${isLocked(paths.lock) ? "a foreground up is running" : "down"})`);
-  const held = heldElsewhere(paths);
-  note(!held, held ? `held by ${held.host} as of ${since(held.at)}: \`endo down\` there, or \`endo up --adopt\` to run it here` : `residence: ${readResidence(paths)?.host ?? HOST}`);
-  if (existsSync(join(paths.state, ".git"))) note(true, "state directory is a git checkout");
-  const { loadEnv } = await import("../harness/env.ts");
-  const keys = loadEnv(paths);
-  note(true, keys.length ? `env: ${keys.join(", ")}` : "env: no .endo/env (credentials must come from the environment)");
-  const { describeProcedures } = await import("../procedures/describe.ts");
-  const described = await describeProcedures(paths.procedures);
-  note(described.failures.length === 0, `procedures: ${described.procedures.map((p) => p.name).join(", ") || "(none)"}${described.failures.length ? `; failing: ${described.failures.map((f) => `${f.name} (${f.error.split("\n")[0]})`).join("; ")}` : ""}`);
-  if (existsSync(paths.program)) {
-    const { inceptionStatus } = await import("../inception/incept.ts");
-    const status = await inceptionStatus(paths);
-    note(!status.loadError, status.loadError ? `program does not load: ${status.loadError}; run \`endo incept\`` : `program loads (inception ${status.n})`);
-    note(true, status.changed.length ? `inputs changed since inception ${status.n}: ${status.changed.join(", ")}; an inception is due` : `inputs unchanged since inception ${status.n}`);
-    if (status.programEdited) note(false, "program/agent.ts differs from what inception recorded: it was edited by hand");
-  }
-  return bad ? 1 : 0;
+    let bad = 0;
+    const note = (ok: boolean, text: string) => {
+      if (!ok) bad++;
+      say(`${ok ? "ok  " : "FAIL"} ${text}`);
+    };
+    let name: string | undefined;
+    try {
+      name = (await host.grant()).name;
+      note(true, `grant loads: ${name}`);
+    } catch (err) {
+      note(false, `grant does not load: ${err instanceof Error ? err.message : String(err)}`);
+      return 1;
+    }
+    note(existsSync(paths.program), existsSync(paths.program) ? "program present" : "no program: `endo up` incepts one");
+    const entry = lookup(name);
+    note(!!entry && entry.exists && realpathSync(entry.dir) === realpathSync(paths.agentDir), entry ? `registry: ${name} → ${entry.dir}${entry.exists ? "" : " (gone)"}` : `registry: ${name} not registered (\`endo up\` registers)`);
+    const svc = serviceInfo(name);
+    if (svc.installed) {
+      const unit = readFileSync(svc.file, "utf8");
+      note(unit.includes(paths.agentDir), unit.includes(paths.agentDir) ? `unit ${svc.file}` : `unit ${svc.file} points elsewhere; \`endo up\` here rewrites it`);
+      note(true, `service ${(await serviceRunning(name).catch(() => false)) ? "running" : "not running"}`);
+    } else note(true, `no service unit (${isLocked(paths.lock) ? "a foreground up is running" : "down"})`);
+    const held = heldElsewhere(paths);
+    note(!held, held ? `held by ${held.host} as of ${since(held.at)}: \`endo down\` there, or \`endo up --adopt\` to run it here` : `residence: ${readResidence(paths)?.host ?? HOST}`);
+    if (existsSync(join(paths.state, ".git"))) note(true, "state directory is a git checkout");
+    const { loadEnv } = await import("../harness/env.ts");
+    const keys = loadEnv(paths);
+    note(true, keys.length ? `env: ${keys.join(", ")}` : "env: no .endo/env (credentials must come from the environment)");
+    if (existsSync(paths.program)) {
+      const status = await inceptionStatus(paths);
+      const validation = await validateProgram({ paths, grant: await host.grant(), loadRuntime: host.loadRuntime });
+      note(validation.ok, validation.ok ? `program loads (inception ${status.n})` : `program does not load: ${validation.error}; run \`endo incept\``);
+      note(true, status.changed.length ? `inputs changed since inception ${status.n}: ${status.changed.join(", ")}; an inception is due` : `inputs unchanged since inception ${status.n}`);
+      if (status.programEdited) note(false, "program/agent.ts differs from what inception recorded: it was edited by hand");
+    }
+    return bad ? 1 : 0;
+  } finally { await host.close(); }
 }
 
 async function observatory(flags: Flags): Promise<number> {
@@ -501,7 +502,7 @@ function usage(): number {
 }
 
 const { command, flags } = parse(process.argv.slice(2));
-const handlers: Record<string, (f: Flags) => Promise<number>> = { up, down, logs, incept: inceptCommand, send, call, wait, commands, status, charter, replay, why, reset, doctor, observatory };
+const handlers: Record<string, (f: Flags) => Promise<number>> = { up, down, logs, incept: inceptCommand, send, call, wait, commands, status, charter, replay, why, snapshot, reset, doctor, observatory };
 const run = command ? handlers[command] : listAgents;
 if (!run) process.exit(usage());
 run(flags).then(

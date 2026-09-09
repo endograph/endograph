@@ -1,22 +1,25 @@
-import { existsSync, readdirSync, readFileSync, statSync, unlinkSync, watch, writeFileSync, type FSWatcher } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { userInfo } from "node:os";
 import { join, resolve } from "node:path";
 import { collectRunnableActivations, normalizeSchema, runMachine, serializeInstance, type ProjectorExecutor } from "@projectors/core";
 import { grantActions } from "../grant/core.ts";
 import { loadGrant, type Grant } from "../grant/grant.ts";
+import { bindRuntime } from "../grant/bind.ts";
 import { loadAgent, LoadError, type Loaded } from "../program/load.ts";
 import { createRuns, type Runs, type RunRequest } from "../procedures/runs.ts";
-import { newId, PROTOCOL_VERSION, writeReply, type CallMessage, type Delivered, type Message, type Reply, type ReplyState, type RequestMessage } from "../protocol/wire.ts";
-import { openSqliteStore } from "../store/sqlite.ts";
+import { atomicWrite, isMessage, isTerminal, newId, PROTOCOL_VERSION, writeReply, type CallMessage, type Delivered, type Message, type Reply, type ReplyState, type RequestMessage } from "../protocol/wire.ts";
+import { openSqliteStore, StoreRecoveryRequired } from "../store/sqlite.ts";
 import { allFrames, type FrameInput, type FrameStore } from "../store/types.ts";
 import { endoMeta, firstLine, frameInputOf } from "./frames.ts";
 import { acquireLock } from "./lock.ts";
-import { hashOf } from "../inception/incept.ts";
+import { recoverPromotion } from "../inception/promotion.ts";
+import { hashOf, inceptionStatus } from "../inception/incept.ts";
 import { lookup } from "../cli/registry.ts";
 import { liveRun } from "../procedures/runs.ts";
 import { loadEnv } from "./env.ts";
+import type { HostClient } from "../host/client.ts";
 import { ensureStateDir, pathsOf, type Paths } from "./paths.ts";
-import { heldElsewhere, HOST, readResidence, since } from "./residence.ts";
+import { heldElsewhere, HOST, readResidence, since, writeLoadFailure, type Status } from "./residence.ts";
 
 /**
  * `endo up`, the running half: hold the lock, load the program, deliver
@@ -38,20 +41,17 @@ export interface OpenOptions {
   log?: (line: string) => void;
   /** Another host took the state directory: the agent has stopped writing it and should be stopped. */
   onAdopted?: (host: string) => void;
+  /** A persistence failure stopped this harness; reopen it to recover. */
+  onFailure?: (error: Error) => void;
+  /** Supplied by the host worker: the parent incepts, then replaces this process.
+   * Without a host lifecycle, openAgent runs one fixed program generation. */
+  inception?: { run(): Promise<void>; restart(): void };
+  /** The worker's connection, supplied explicitly by its bootstrap. */
+  host?: HostClient;
+  /** A hosted worker receives its environment from the trusted parent. */
+  environmentLoaded?: boolean;
 }
 
-export interface Status {
-  name: string;
-  /** The host that holds the state directory, and whether it still does (see residence.ts). */
-  host: string;
-  running: boolean;
-  open: string[];
-  runs: { id: string; procedure: string; from: string; startedAt: number }[];
-  active: boolean;
-  /** The exposed procedures: what `endo commands` prints. */
-  commands: { name: string; description: string; args: Record<string, unknown>; required: string[] }[];
-  at: number;
-}
 
 export interface Agent {
   name: string;
@@ -77,7 +77,6 @@ export class NoProgram extends Error {}
 /** Another host holds the state directory and has not released it. */
 export class HeldElsewhere extends Error {}
 
-const TERMINAL = (state: ReplyState | undefined) => state !== undefined && state !== "working" && state !== "submitted";
 const REQUEST_HEADER = (m: Delivered<RequestMessage>) =>
   `[request id=${m.id} from=${m.from}${m.ref ? ` ref=${m.ref}` : ""}${m.origin ? ` origin=${m.origin}` : ""}]`;
 
@@ -86,32 +85,46 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
   ensureStateDir(paths);
   const lock = acquireLock(paths.lock);
   if (!lock) throw new AlreadyRunning(`${paths.agentDir} is already running`);
+  let closeStore = () => {};
   try {
+    recoverPromotion(paths);
     if (!existsSync(paths.program)) throw new NoProgram(`no program at ${paths.program}`);
     const held = heldElsewhere(paths);
     if (held) throw new HeldElsewhere(`${paths.agentDir} is held by ${held.host} (as of ${since(held.at)}); \`endo down\` there, or \`endo up --adopt\` to run it here`);
-    loadEnv(paths);
+    if (!opts.environmentLoaded) loadEnv(paths);
     const grant = await loadGrant(paths);
+    const bindings = await bindRuntime(paths, grant, opts.host);
     const name = grant.name;
     const cwd = resolve(paths.agentDir, grant.cwd);
-    const store = openSqliteStore(paths.db);
-    const executor = opts.executor ?? grant.executor.create();
+    let persistenceFailure: StoreRecoveryRequired | undefined;
+    const recoveryRequired = Promise.withResolvers<void>();
+    let persistenceFailed = (error: StoreRecoveryRequired) => { persistenceFailure = error; };
+    const store = openSqliteStore(paths.db, { onRecoveryRequired: (error) => persistenceFailed(error) });
+    closeStore = () => store.close();
+    const executor = opts.executor ?? bindings.executor.create();
     const activationTimeoutMs = opts.activationTimeoutMs ?? 2 * 60 * 60 * 1000;
 
+    // A logging observer must never roll back persistence or interrupt a
+    // committed reply's publication.
+    const log = (line: string) => {
+      try { opts.log?.(line); } catch {}
+    };
     const append = (input: FrameInput) => {
       const frame = store.append(input);
-      opts.log?.(`${String(frame.seq).padStart(4)}  ${new Date(frame.at).toISOString().slice(11, 19)}  ${frame.type.padEnd(11)} ${frame.id ?? ""}  ${frame.summary}`);
+      log(`${String(frame.seq).padStart(4)}  ${new Date(frame.at).toISOString().slice(11, 19)}  ${frame.type.padEnd(11)} ${frame.id ?? ""}  ${frame.summary}`);
       return frame;
     };
     const record = (input: Omit<FrameInput, "at"> & { at?: number }) => append({ ...input, at: input.at ?? Date.now() });
-    const open = new Map<string, { message: Delivered<RequestMessage>; working: boolean }>();
-    const seen = new Set<string>();
+    const open = new Map<string, { working: boolean }>();
     let active = false;
     let running = true;
     /** Set once another host's status lands: nothing is written here after that. */
     let adopted: string | undefined;
     let statusAt = 0;
+    let incepting: number | undefined;
     let loaded!: Loaded;
+    let agent!: Agent;
+    let abortActive: ((reason: string) => void) | undefined;
     let unsubscribe = () => {};
     const lastFailure = new Map<string, string>();
 
@@ -122,6 +135,7 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
       open: [...open.keys()],
       runs: runs.active().map((r) => ({ id: r.id, procedure: r.procedure, from: r.from, startedAt: r.startedAt })),
       active,
+      ...(incepting ? { incepting } : {}),
       commands: loaded.procedures.filter((p) => p.expose).map((p) => ({ name: p.name, description: p.description, args: p.args, required: (p.inputSchema.required as string[]) ?? [] })),
       at: Date.now(),
     });
@@ -142,32 +156,62 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
       return true;
     };
 
+    const commitReply = (r: Reply): Reply => {
+      r = { ...r, from: `agent:${name}`, to: store.readMessage(r.id)?.from ?? r.to ?? `agent:${name}` };
+      const frame: FrameInput = { type: "reply", id: r.id, summary: `${r.state}: ${firstLine(r.text)}`, payload: r, at: r.at };
+      if (store.commitReply(r, frame)) log(`${String(store.lastSeq()).padStart(4)}  ${new Date(r.at).toISOString().slice(11, 19)}  reply       ${r.id}  ${frame.summary}`);
+      return store.readReply(r.id)!;
+    };
+    const publishReply = (r: Reply): Reply => {
+      const committed = commitReply(r);
+      writeReply(paths.outbox, committed);
+      return committed;
+    };
+
     const runs = createRuns({
       paths,
       name,
       cwd,
       onReply: (run, reply) => {
-        record({ type: "reply", id: run.id, summary: `${reply.state}: ${firstLine(reply.text)}`, payload: reply });
-        writeStatus();
+        const committed = publishReply({ ...reply, id: run.id, to: run.from });
+        // The supervisor removes completed runs after this durable callback.
+        queueMicrotask(() => { if (running) writeStatus(); });
+        return committed;
       },
     });
+    persistenceFailed = (error) => {
+      persistenceFailure = error;
+      recoveryRequired.resolve();
+      runs.close();
+      unsubscribe();
+      // Abort inference without attempting another write through the poisoned
+      // store. The immutable archive decides recovery on the next open.
+      try { abortActive?.(error.message); } catch {}
+      log(error.message);
+      if (agent) queueMicrotask(() => {
+        void agent.stop().finally(() => { opts.onFailure?.(error); }).catch(() => {});
+      });
+    };
     const startRun = (request: RunRequest) => {
+      if (persistenceFailure) throw persistenceFailure;
+      const id = request.id ?? newId();
       const from = request.from ?? `agent:${name}`;
       const args = Object.entries(request.args).map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`).join(" ");
-      const run = runs.start({ ...request, from });
-      record({ type: "call", id: run.id, summary: `${from}: ${request.procedure.name}${args ? ` ${args}` : ""}`, payload: { procedure: request.procedure.name, args: request.args, from } });
-      seen.add(run.id);
+      // Record dispatch before starting any effect. A crash before a run can
+      // report its identity fails the call on recovery instead of executing it twice.
+      record({ type: "call", id, summary: `${from}: ${request.procedure.name}${args ? ` ${args}` : ""}`, payload: { procedure: request.procedure.name, args: request.args, from } });
+      const run = runs.start({ ...request, id, from });
       writeStatus();
       return run;
     };
 
     const reply: Agent["reply"] = (id, r) => {
+      if (persistenceFailure) throw persistenceFailure;
       const o = open.get(id);
       if (!o) return runs.get(id) ? `${id} is a call; its procedure answers it` : `no open request ${id}`;
       const at = Date.now();
-      writeReply(paths.outbox, { v: PROTOCOL_VERSION, id, ok: r.ok, state: r.state, text: r.text, at });
-      record({ type: "reply", id, summary: `${r.state}: ${firstLine(r.text)}`, payload: { ...r, to: id }, at });
-      if (TERMINAL(r.state)) open.delete(id);
+      const committed = publishReply({ v: PROTOCOL_VERSION, id, ok: r.ok, state: r.state, text: r.text, at });
+      if (isTerminal(committed.state)) open.delete(id);
       else o.working = true;
       writeStatus();
       return null;
@@ -175,7 +219,7 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
     const fail = (id: string, text: string) => reply(id, { ok: false, state: "failed", text });
 
     const actions = grantActions(
-      grant,
+      bindings,
       { name, cwd, charter: () => loaded.charter },
       {
         reply,
@@ -203,67 +247,97 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
     };
     // The log is the evidence: what was asked, what was answered, what is still owed.
     const replies = new Map<string, ReplyState>();
-    const requests = new Map<string, Delivered<RequestMessage>>();
-    const frameOf = new Map<string, string>();
+    const requestFrames = new Map<string, string | undefined>();
     const calls = new Set<string>();
     const redriven = new Set<string>();
+    let lastInception: { n: number; program?: string; changes?: string } | undefined;
+    let briefed = -1;
     for (const f of allFrames(store)) {
-      const payload = f.payload as { id?: string; metadata?: { endo?: { requests?: Delivered<RequestMessage>[] } } } | undefined;
-      const endo = (payload?.metadata?.endo ?? {}) as { requests?: Delivered<RequestMessage>[] };
-      if (f.type === "request") for (const r of endo.requests ?? []) (requests.set(r.id, r), seen.add(r.id), payload?.id && frameOf.set(r.id, payload.id));
-      if (f.type === "call" && f.id) (calls.add(f.id), seen.add(f.id));
-      if (f.type === "reply" && f.id) replies.set(f.id, (f.payload as Reply).state);
-      if (f.type === "redrive" && f.id) redriven.add(f.id);
-      if (f.type === "procedure") {
-        const { name: n, error } = ((f.payload as { metadata?: { endo?: { name?: string; error?: string } } } | undefined)?.metadata?.endo ?? {}) as { name?: string; error?: string };
-        if (n && error) lastFailure.set(n, error);
+      const payload = f.payload as {
+        id?: string;
+        metadata?: { endo?: { requests?: Delivered<RequestMessage>[]; briefing?: number; name?: string; error?: string } };
+      } | undefined;
+      const endo = payload?.metadata?.endo;
+      switch (f.type) {
+        case "request":
+          for (const request of endo?.requests ?? []) {
+            requestFrames.set(request.id, payload?.id);
+          }
+          briefed = Math.max(briefed, Number(endo?.briefing ?? -1));
+          break;
+        case "call":
+          if (f.id) calls.add(f.id);
+          break;
+        case "redrive":
+          if (f.id) redriven.add(f.id);
+          break;
+        case "procedure":
+          if (endo?.name && endo.error) lastFailure.set(endo.name, endo.error);
+          break;
+        case "inception":
+          lastInception = f.payload as typeof lastInception;
+          break;
       }
     }
-    const load = () => loadAgent({ paths, grant, store, executor, actions, cwd, startRun });
-    attach(await load());
-    {
-      // Someone edited the program by hand: it belongs to inception. Say so, once per start.
-      let recorded: string | undefined;
-      for (const f of allFrames(store)) if (f.type === "inception") recorded = (f.payload as { program?: string }).program;
-      if (recorded && hashOf(paths.program) !== recorded) console.error(`warning: ${paths.program} differs from what the last inception wrote; run \`endo incept\` to make it inception's again`);
+    const load = () => loadAgent({ paths, grant, bindings, store, executor, actions, cwd, startRun });
+    try {
+      attach(await load());
+    } catch (err) {
+      // The program does not load: say so where every reader looks (a frame, status.json) before giving up.
+      if (err instanceof LoadError) {
+        const detail = err.message.startsWith(`${err.stage}: `) ? err.message.slice(err.stage.length + 2) : err.message;
+        record({ type: "error", summary: `program does not load at ${err.stage}: ${firstLine(detail)}`, payload: { stage: err.stage, error: detail } });
+        writeLoadFailure(paths, { stage: err.stage, error: detail, program: hashOf(paths.program), at: Date.now() });
+      }
+      throw err;
     }
+    // Someone edited the program by hand: it belongs to inception. Say so, once per start.
+    if (lastInception?.program && hashOf(paths.program) !== lastInception.program)
+      console.error(`warning: ${paths.program} differs from what the last inception wrote; run \`endo incept\` to make it inception's again`);
 
-    for (const run of runs.recover()) void run;
-    for (const id of calls) {
-      if (TERMINAL(replies.get(id)) || runs.get(id)) continue;
-      const r: Reply = { v: PROTOCOL_VERSION, id, ok: false, state: "failed", text: "the agent restarted before this procedure ran; call it again", at: Date.now() };
+    // Outbox files are a materialized view: finish publication interrupted
+    // after the durable reply commit, before recovering open work.
+    for (const r of store.replies()) {
+      replies.set(r.id, r.state);
       writeReply(paths.outbox, r);
-      record({ type: "reply", id, summary: `failed: restarted before the procedure ran`, payload: r });
+    }
+    for (const frame of allFrames(store)) {
+      if (frame.type === "notification" && frame.id)
+        atomicWrite(join(paths.outbox, "messages"), `${frame.id}.json`, frame.payload);
+    }
+    runs.recover();
+    for (const id of calls) {
+      if (isTerminal(replies.get(id)) || runs.get(id)) continue;
+      const r: Reply = { v: PROTOCOL_VERSION, id, ok: false, state: "failed", text: "the agent restarted before this procedure ran; call it again", at: Date.now() };
+      publishReply(r);
     }
     // A request whose frame still has runnable work was interrupted: re-drive it once. Anything else open is failed now.
     const runnable = new Set(collectRunnableActivations(loaded.machine).map((a) => a.sourceFrameId));
     const redrive: string[] = [];
-    for (const [id, message] of requests) {
-      if (TERMINAL(replies.get(id))) continue;
-      open.set(id, { message, working: replies.get(id) === "working" });
-      if (runnable.has(frameOf.get(id) ?? "") && !redriven.has(id)) {
+    for (const [id, frameId] of requestFrames) {
+      if (isTerminal(replies.get(id))) continue;
+      open.set(id, { working: replies.get(id) === "working" });
+      if (runnable.has(frameId ?? "") && !redriven.has(id)) {
         record({ type: "redrive", id, summary: "re-driving the interrupted activation once" });
         redrive.push(id);
       } else fail(id, "the agent restarted before answering this; send it again");
     }
 
     // The first activation on a new program is briefed: the inceptor's CHANGES.md, once, as a request from inceptor:<n>.
-    let briefing: Delivered<RequestMessage> | undefined;
-    {
-      let last: { n: number; changes?: string } | undefined;
-      let briefed = -1;
-      for (const f of allFrames(store)) {
-        if (f.type === "inception") last = f.payload as { n: number; changes?: string };
-        if (f.type === "request") briefed = Math.max(briefed, Number((f.payload as { metadata?: { endo?: { briefing?: number } } })?.metadata?.endo?.briefing ?? -1));
-      }
-      if (last?.changes && briefed < last.n) {
-        briefing = { v: PROTOCOL_VERSION, kind: "request", id: newId(), from: `inceptor:${last.n}`, text: last.changes, at: Date.now() };
-      }
-    }
+    let briefing: Delivered<RequestMessage> | undefined = lastInception?.changes && briefed < lastInception.n
+      ? { v: PROTOCOL_VERSION, kind: "request", id: newId(), from: `inceptor:${lastInception.n}`, text: lastInception.changes, at: Date.now() }
+      : undefined;
 
     let busy: Promise<void> = Promise.resolve();
-    const serially = (fn: () => Promise<void>) => (busy = busy.then(fn, fn));
-
+    let retiring = false;
+    const serially = (fn: () => Promise<void>) => {
+      const run = () => {
+        if (persistenceFailure) throw persistenceFailure;
+        if (retiring) return;
+        return fn();
+      };
+      return (busy = busy.then(run, run));
+    };
     const drive = async (ids: string[]) => {
       const machine = loaded.machine;
       active = true;
@@ -279,7 +353,11 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
         for (const id of inFlight) machine.enqueueFrame({ messages: [{ type: "work", kind: "abort", activationId: id, note }], metadata: endoMeta({ type: "abort", summary: note }) });
       };
       let timedOut = false;
-      const timer = setTimeout(() => ((timedOut = true), abortAll(`aborted: activation ran longer than ${activationTimeoutMs / 1000}s`)), activationTimeoutMs);
+      const timer = setTimeout(() => {
+        timedOut = true;
+        abortAll(`aborted: activation ran longer than ${activationTimeoutMs / 1000}s`);
+      }, activationTimeoutMs);
+      abortActive = (reason) => { clearTimeout(timer); abortAll(reason); };
       let failure: string | undefined;
       try {
         for await (const _ of runMachine(machine)) void _;
@@ -292,6 +370,7 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
           for await (const _ of runMachine(machine)) void _;
         } catch {}
       } finally {
+        abortActive = undefined;
         clearTimeout(timer);
         unsub();
       }
@@ -309,9 +388,11 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
       const spec = loaded.procedures.find((p) => p.name === call.procedure && p.expose);
       const reject = (text: string) => {
         const r: Reply = { v: PROTOCOL_VERSION, id: call.id, ok: false, state: "rejected", text, at: Date.now() };
-        record({ type: "call", id: call.id, summary: `${call.from}: ${call.procedure} (rejected)`, payload: { procedure: call.procedure, args: call.args, from: call.from } });
-        writeReply(paths.outbox, r);
-        record({ type: "reply", id: call.id, summary: `rejected: ${firstLine(text)}`, payload: r });
+        const committed = store.transaction(() => {
+          record({ type: "call", id: call.id, summary: `${call.from}: ${call.procedure} (rejected)`, payload: { procedure: call.procedure, args: call.args, from: call.from } });
+          return commitReply(r);
+        });
+        writeReply(paths.outbox, committed);
       };
       if (!spec) {
         const exposed = loaded.procedures.filter((p) => p.expose).map((p) => p.name);
@@ -322,45 +403,80 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
       startRun({ procedure: spec, args: call.args ?? {}, id: call.id, from: call.from });
     };
 
-    const poll = async () => {
-      if (fenced()) return;
-      const batch: Delivered<RequestMessage>[] = [];
+    const acceptInbox = () => {
       for (const f of readdirSync(paths.inbox).filter((f) => f.endsWith(".json") && !f.startsWith(".")).sort()) {
         const path = join(paths.inbox, f);
-        let message: Message | undefined;
+        let message: unknown;
         try {
-          message = JSON.parse(readFileSync(path, "utf8")) as Message;
+          message = JSON.parse(readFileSync(path, "utf8"));
         } catch {}
-        const from = stamp(message, path);
-        unlinkSync(path);
-        if (!message || typeof message.id !== "string" || (message.kind !== "request" && message.kind !== "call")) {
+        if (!isMessage(message)) {
           record({ type: "error", summary: `dropped a malformed inbox file: ${f}` });
+          unlinkSync(path);
           continue;
         }
-        if (seen.has(message.id)) continue;
-        seen.add(message.id);
-        if (message.kind === "call") handleCall({ ...message, from });
-        else batch.push({ ...message, from });
+        // Acceptance and sender attribution survive removal of the file.
+        // Duplicate writes retain the originally accepted payload and sender.
+        store.acceptMessage({ ...message, from: stamp(message, path) });
+        const priorReply = store.readReply(message.id);
+        if (priorReply) writeReply(paths.outbox, priorReply);
+        unlinkSync(path);
       }
-      if (briefing) (batch.unshift(briefing), (briefing = undefined));
+    };
+
+    const deliverRequests = async (batch: Delivered<RequestMessage>[]) => {
       if (batch.length === 0) return;
-      for (const m of batch) open.set(m.id, { message: m, working: false });
       const froms = [...new Set(batch.map((m) => m.from))].join(", ");
-      loaded.machine.enqueueFrame({
-        messages: batch.map((m) => ({ type: "user", text: `${REQUEST_HEADER(m)}\n${m.text}`, actor: { id: m.from, label: m.from } })),
-        metadata: endoMeta({
-          type: "request",
-          summary: batch.length === 1 ? `${batch[0]!.from}: ${firstLine(batch[0]!.text)}` : `${batch.length} requests from ${froms}`,
-          id: batch.length === 1 ? batch[0]!.id : undefined,
-          ids: batch.map((m) => m.id),
-          requests: batch,
-          ...(batch.some((m) => m.from.startsWith("inceptor:")) ? { briefing: Number(batch.find((m) => m.from.startsWith("inceptor:"))!.from.slice(9)) } : {}),
-        }),
-      });
+      const inceptor = batch.find((m) => m.from.startsWith("inceptor:"));
+      try {
+        store.transaction(() => {
+          loaded.machine.enqueueFrame({
+            messages: batch.map((m) => ({ type: "user", text: `${REQUEST_HEADER(m)}\n${m.text}`, actor: { id: m.from, label: m.from } })),
+            metadata: endoMeta({
+              type: "request",
+              summary: batch.length === 1 ? `${batch[0]!.from}: ${firstLine(batch[0]!.text)}` : `${batch.length} requests from ${froms}`,
+              id: batch.length === 1 ? batch[0]!.id : undefined,
+              ids: batch.map((m) => m.id),
+              requests: batch,
+              ...(inceptor ? { briefing: Number(inceptor.from.slice(9)) } : {}),
+            }),
+          });
+        });
+      } catch (error) {
+        // SQLite can roll back delivery, but not the machine's history and
+        // work queue. Retire this worker and recover through ordinary startup.
+        const failure = persistenceFailure ?? new StoreRecoveryRequired(error);
+        if (!persistenceFailure) persistenceFailed(failure);
+        throw failure;
+      }
+      briefing = undefined;
+      for (const m of batch) open.set(m.id, { working: false });
       await drive(batch.map((m) => m.id));
     };
 
+    const poll = async () => {
+      if (retiring || fenced()) return;
+      acceptInbox();
+      const batch: Delivered<RequestMessage>[] = [];
+      for (const message of store.pendingMessages()) {
+        if (message.kind === "notification") {
+          record({ type: "notification", id: message.id, summary: `${message.from} → ${message.to}`, payload: message });
+          atomicWrite(join(paths.outbox, "messages"), `${message.id}.json`, message);
+        } else if (message.to && message.to !== `agent:${name}`) {
+          const rejected = store.transaction(() => {
+            record({ type: "rejected-message", id: message.id, summary: `misaddressed message to ${message.to}`, payload: message });
+            return commitReply({ v: PROTOCOL_VERSION, id: message.id, ok: false, state: "rejected", text: `this inbox serves agent:${name}`, at: Date.now() });
+          });
+          writeReply(paths.outbox, rejected);
+        } else if (message.kind === "call") handleCall(message);
+        else batch.push(message);
+      }
+      if (briefing) batch.unshift(briefing);
+      await deliverRequests(batch);
+    };
+
     const stamp = (message: Message | undefined, path: string): string => {
+      if (message?.from) return message.from;
       if (message?.run && (!message.agent || message.agent === name)) {
         const run = runs.get(message.run);
         if (run) return `agent:${name}/${run.procedure}`;
@@ -378,7 +494,16 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
       }
     };
 
+    const fileInputs = (files: string[]) => JSON.stringify(files.map((file) => {
+      try { return [file, hashOf(file)]; } catch { return [file, null]; }
+    }));
+    const procedureFiles = () => existsSync(paths.procedures)
+      ? readdirSync(paths.procedures).filter((file) => file.endsWith(".ts")).sort().map((file) => join(paths.procedures, file)) : [];
+    const ownerFiles = (opts.inception ? [paths.grant, grant.manifest.path] : []).filter((file): file is string => !!file);
+    let procedureInputs = fileInputs(procedureFiles());
+    let ownerInputs = fileInputs(ownerFiles);
     const reload = async () => {
+      procedureInputs = fileInputs(procedureFiles());
       try {
         attach(await load());
       } catch (err) {
@@ -386,6 +511,36 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
         record({ type: "error", summary: `reload failed, keeping the previous charter: ${firstLine(text)}`, payload: { error: text } });
       }
       writeStatus();
+    };
+
+    // Auto inception: when the owner's inputs (manifest, grant, endograph version) differ from the last inception
+    // and nothing is open or running, ask the outer host to incept, then retire this worker. A failure keeps
+    // the program that was running and waits for the inputs to move again.
+    // The ordinary poll detects file changes; sandboxed file watchers can silently miss them.
+    let inputsDirty = true;
+    const refreshFiles = async () => {
+      if (fileInputs(procedureFiles()) !== procedureInputs) await reload();
+      const next = fileInputs(ownerFiles);
+      if (next !== ownerInputs) { ownerInputs = next; inputsDirty = true; }
+    };
+    const maybeIncept = async () => {
+      if (!opts.inception || grant.inception.mode !== "auto" || !inputsDirty || adopted || retiring || open.size || runs.active().length) return;
+      inputsDirty = false;
+      const s = await inceptionStatus(paths).catch(() => undefined);
+      if (!s || !s.changed.length) return;
+      incepting = s.n + 1;
+      writeStatus();
+      try {
+        await opts.inception.run();
+        retiring = true;
+        queueMicrotask(opts.inception.restart);
+      } catch (err) {
+        const text = err instanceof Error ? err.message : String(err);
+        record({ type: "error", summary: `inception ${s.n + 1} (auto, ${s.changed.join(", ")} changed) failed; keeping the program, waiting for the inputs to change: ${firstLine(text)}`, payload: { error: text } });
+        return;
+      } finally {
+        incepting = undefined;
+      }
     };
 
     const tick = async (now: number) => {
@@ -397,7 +552,7 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
           startRun({ procedure: spec, args, from: `timer:${procedure}` });
         },
       };
-      for (const b of grant.batteries) {
+      for (const b of bindings.batteries) {
         try {
           await b.hooks?.tick?.(now, ctx);
         } catch (err) {
@@ -406,11 +561,29 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
       }
     };
 
-    let timer: ReturnType<typeof setInterval> | undefined;
-    let ticker: ReturnType<typeof setInterval> | undefined;
-    const watchers: FSWatcher[] = [];
-    let reloadTimer: ReturnType<typeof setTimeout> | undefined;
-    const agent: Agent = {
+    let loop: Promise<void> | undefined;
+    let wake: (() => void) | undefined;
+    let stopTask: Promise<void> | undefined;
+    const serve = async () => {
+      const hasTicks = bindings.batteries.some((b) => b.hooks?.tick);
+      let nextTick = hasTicks ? Date.now() + 30_000 : Infinity;
+      while (!retiring) {
+        await agent.poll();
+        if (retiring) break;
+        const now = Date.now();
+        if (now >= nextTick) {
+          nextTick = now + 30_000;
+          await agent.tick(now);
+        }
+        if (retiring) break;
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, Math.min(opts.pollMs ?? 1000, Math.max(0, nextTick - Date.now())));
+          wake = () => { clearTimeout(timer); resolve(); };
+        });
+        wake = undefined;
+      }
+    };
+    agent = {
       name,
       paths,
       grant,
@@ -420,34 +593,33 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
         return loaded;
       },
       reply,
-      poll: () => serially(poll),
+      poll: () => serially(async () => { await refreshFiles(); await poll(); await maybeIncept(); }),
       tick: (now = Date.now()) => serially(() => tick(now)),
       reload: () => serially(reload),
       start() {
-        timer = setInterval(() => void agent.poll(), opts.pollMs ?? 1000);
-        if (grant.batteries.some((b) => b.hooks?.tick)) ticker = setInterval(() => void agent.tick(), 30_000);
-        try {
-          watchers.push(watch(paths.inbox, { persistent: false }, () => void agent.poll()));
-          watchers.push(
-            watch(paths.procedures, { persistent: false }, () => {
-              clearTimeout(reloadTimer);
-              reloadTimer = setTimeout(() => void agent.reload(), 300);
-            }),
-          );
-        } catch {}
+        if (loop || retiring) return;
+        loop = serve().catch((error) => {
+          if (persistenceFailure) return; // Its fatal callback already owns shutdown.
+          log(`agent loop failed: ${error instanceof Error ? error.message : String(error)}`);
+          void agent.stop().finally(() => opts.onFailure?.(error instanceof Error ? error : new Error(String(error)))).catch(() => {});
+        });
       },
-      async stop() {
-        if (!running) return;
-        clearInterval(timer);
-        clearInterval(ticker);
-        clearTimeout(reloadTimer);
-        for (const w of watchers) w.close();
-        await busy;
-        unsubscribe();
-        running = false;
-        writeStatus();
-        store.close();
-        lock.release();
+      stop() {
+        // Fence queued work immediately, then let the current turn finish.
+        // A poisoned store cannot wait on work whose completion requires writing it.
+        retiring = true;
+        wake?.();
+        return stopTask ??= (async () => {
+          await Promise.race([busy.catch(() => {}), recoveryRequired.promise]);
+          runs.close();
+          unsubscribe();
+          if (persistenceFailure) active = false;
+          running = false;
+          try { writeStatus(); }
+          finally {
+            try { store.close(); } finally { lock.release(); }
+          }
+        })();
       },
       status,
     };
@@ -456,6 +628,7 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
     if (briefing) await serially(poll);
     return agent;
   } catch (err) {
+    try { closeStore(); } catch {}
     lock.release();
     throw err;
   }

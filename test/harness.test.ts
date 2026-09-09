@@ -10,6 +10,8 @@ import {
   type ProjectorExecutor,
 } from "@projectors/core";
 import { HeldElsewhere, openAgent, type Agent } from "../src/harness/agent.ts";
+import { LoadError } from "../src/program/load.ts";
+import { loadFailure } from "../src/harness/inspect.ts";
 import { pathsOf } from "../src/harness/paths.ts";
 import { adopt } from "../src/harness/residence.ts";
 import { newId, PROTOCOL_VERSION, readReply, waitForReply, writeMessage } from "../src/protocol/wire.ts";
@@ -110,7 +112,7 @@ test("calls, requests, procedures that emit, reply-once, live reload, and recove
   } finally {
     await agent.stop();
   }
-  expect(log.find((l) => l.includes("request"))).toMatch(/^ *\d+  \d\d:\d\d:\d\d  request     \w+  local:/);
+  expect(log.find((l) => l.includes("request"))).toMatch(/^ *\d+  \d\d:\d\d:\d\d  request     [\w-]+  local:/);
 
   const store = openSqliteStore(join(dir, ".endo/agent.db"));
   const frames = [...allFrames(store)];
@@ -177,4 +179,40 @@ test("residence: one host runs a state directory; a copy elsewhere refuses until
   const store = openSqliteStore(join(dir, ".endo/agent.db"));
   expect([...allFrames(store)].filter((f) => f.type === "residence").map((f) => f.summary)).toEqual([expect.stringMatching(/^adopted by elsewhere/), expect.stringMatching(/^adopted from elsewhere/)]);
   store.close();
+});
+
+test("a program that does not load is recorded as a frame and in status.json; the record dies with the program that failed", async () => {
+  const dir = scaffold();
+  const paths = pathsOf(dir);
+  writeFileSync(paths.program, "throw new Error('boom');\n");
+  await expect(openAgent({ agentDir: dir, executor: scripted(answer) })).rejects.toBeInstanceOf(LoadError);
+
+  const status = JSON.parse(readFileSync(paths.status, "utf8"));
+  expect(status.running).toBe(false);
+  expect(status.failure.stage).toBe("program");
+  expect(status.failure.error).toContain("boom");
+  expect(loadFailure(paths)?.stage).toBe("program");
+  const store = openSqliteStore(paths.db);
+  const frames = [...allFrames(store)];
+  store.close();
+  expect(frames.some((f) => f.type === "error" && f.summary.startsWith("program does not load at program:"))).toBe(true);
+  expect((await import("../src/harness/lock.ts")).isLocked(paths.lock)).toBe(false);
+
+  // The program changes (an inception wrote a new one): the record no longer applies.
+  await Bun.sleep(5);
+  writeFileSync(paths.program, readFileSync(join(ROOT, "test/fixtures/program.ts"), "utf8"));
+  expect(loadFailure(paths)).toBeNull();
+
+  // A load that succeeds rewrites the status without the record. A second directory: once a module has thrown
+  // at import, bun hands back an empty namespace for that path for the rest of the process (the harness never
+  // loads twice in one process; a load failure exits it).
+  const dir2 = scaffold();
+  const paths2 = pathsOf(dir2);
+  const { hashOf } = await import("../src/inception/incept.ts");
+  writeFileSync(paths2.status, JSON.stringify({ host: hostname(), running: false, at: Date.now(), failure: { stage: "invoke", error: "old", program: hashOf(paths2.program), at: Date.now() } }));
+  expect(loadFailure(paths2)?.stage).toBe("invoke");
+  const agent = await openAgent({ agentDir: dir2, executor: scripted(answer), pollMs: 50 });
+  expect(JSON.parse(readFileSync(paths2.status, "utf8")).failure).toBeUndefined();
+  expect(loadFailure(paths2)).toBeNull();
+  await agent.stop();
 });

@@ -1,19 +1,15 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { pathToFileURL } from "node:url";
 import type { AnyAction, AnySchema, Charter, StateDescriptor } from "@projectors/core";
 import { z } from "zod";
-import { bash } from "../batteries/bash.ts";
-import { evolve } from "../batteries/evolve.ts";
-import { scheduler } from "../batteries/scheduler.ts";
+import type { HostAction } from "../host/action.ts";
 import type { Paths } from "../harness/paths.ts";
-import { aisdk, type ExecutorSpec } from "./executor.ts";
+import type { AiSdkOptions } from "./executor.ts";
 
 /**
- * The grant: `endograph.toml`, the whole universe of what the agent may
- * ever do. Data, not code: a name, an executor, batteries by name,
- * inception options. Owner-written, validated at load, never reachable
- * from the program.
+ * The grant: owner-written selections of provisions, host actions and
+ * process policy. The charter uses its provisions; the outer process
+ * enforces sandbox and host-action access independently of agent code.
  */
 
 /** A battery bundles what it contributes. It constrains shape, never behavior. */
@@ -24,6 +20,8 @@ export interface Battery {
   states?: StateDescriptor[];
   /** Actions, built at load against the resolved agent context. */
   actions?(agent: BatteryContext): AnyAction[];
+  /** Trusted definitions for a host_modules export; only selected names become worker proxies. */
+  hostActions?: readonly HostAction[];
   /** Extra `procedure()` fields: a schema per field, and a describe-time check over the values a script gave. */
   procedure?: {
     fields: Record<string, { schema: AnySchema; description: string }>;
@@ -51,23 +49,46 @@ export interface TickContext {
   call(procedure: string, args: Record<string, unknown>): void;
 }
 
+export interface CodexOptions {
+  backend: "codex";
+  model?: string;
+  command?: string;
+  effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+  maxToolCalls?: number;
+}
+export type ExecutorConfig = AiSdkOptions | CodexOptions | { module: string };
+
+/** Validated owner configuration: data only, safe to read in any process. */
 export interface Grant {
   name: string;
   /** The owner's intent, in prose: `manifest.md` beside the grant, or inline in it. */
   manifest: { text: string; path?: string };
-  executor: ExecutorSpec;
+  executor: ExecutorConfig;
   /** Relative to the agent directory. */
   cwd: string;
-  batteries: Battery[];
-  /** The batteries' states. */
-  states: StateDescriptor[];
-  inception: { inceptor?: string; rounds: number };
+  batteries: string[];
+  /** Names selected by the owner; binding them requires an explicit host connection. */
+  hostActions: string[];
+  /** Owner-managed modules exporting host actions; only the outer process imports these. */
+  hostModules: string[];
+  sandbox?: SandboxPolicy;
+  /** `mode`: "auto" (default) incepts by itself, at quiescence, when the owner's inputs changed; "manual" waits for `endo incept`. */
+  inception: { inceptor?: string; rounds: number; mode: "auto" | "manual" };
+}
+
+export interface SandboxPolicy {
+  network: "full" | "offline" | "loopback" | string[];
+  /** Additional readable/writable paths, relative to the agent directory. */
+  read: string[];
+  write: string[];
+  /** Extra environment variables forwarded from the trusted parent. */
+  env: string[];
 }
 
 /** The actions endo always contributes; no battery may reuse their names. */
 export const CORE_ACTION_NAMES = ["reply", "compact", "update_state"] as const;
 
-export const BUILTIN_BATTERIES: Record<string, () => Battery> = { bash, evolve, scheduler };
+export const BATTERY_NAMES = ["bash", "evolve", "scheduler"] as const;
 
 const NAME = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
 
@@ -77,7 +98,18 @@ const SCHEMA = z
     manifest: z.union([z.string(), z.object({ text: z.string().min(1) }).strict()]).optional(),
     cwd: z.string().optional(),
     batteries: z.array(z.string()).optional(),
+    host_actions: z.array(z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,127}$/)).optional(),
+    host_modules: z.array(z.string().min(1)).optional(),
+    sandbox: z.object({
+      network: z.union([z.enum(["full", "offline", "loopback"]), z.array(z.string().min(1))]).optional(),
+      read: z.array(z.string().min(1)).optional(),
+      write: z.array(z.string().min(1)).optional(),
+      env: z.array(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/)).optional(),
+    }).strict().optional(),
     executor: z.union([
+      z.object({ backend: z.literal("codex"), model: z.string().min(1).optional(), command: z.string().min(1).optional(),
+        effort: z.enum(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]).optional(),
+        max_tool_calls: z.number().int().positive().optional() }).strict(),
       z
         .object({
           provider: z.enum(["anthropic", "openai"]),
@@ -88,7 +120,7 @@ const SCHEMA = z
         .strict(),
       z.object({ module: z.string() }).strict(),
     ]),
-    inception: z.object({ inceptor: z.string().optional(), rounds: z.number().int().positive().optional() }).strict().optional(),
+    inception: z.object({ inceptor: z.string().optional(), rounds: z.number().int().positive().optional(), mode: z.enum(["auto", "manual"]).optional() }).strict().optional(),
   })
   .strict();
 
@@ -106,27 +138,37 @@ export async function loadGrant(paths: Paths): Promise<Grant> {
     throw new Error(`${paths.grant}: ${parsed.error.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`).join("; ")}`);
   }
   const config = parsed.data;
-  const batteries: Battery[] = [];
+  const hostNames = config.host_actions ?? [];
+  if (new Set(hostNames).size !== hostNames.length) throw new Error(`${paths.grant}: a host action is listed twice`);
+  const batteries: string[] = [];
   for (const name of config.batteries ?? []) {
-    const make = BUILTIN_BATTERIES[name];
-    if (!make) throw new Error(`${paths.grant}: unknown battery "${name}"; available: ${Object.keys(BUILTIN_BATTERIES).join(", ")}`);
-    if (batteries.some((b) => b.name === name)) throw new Error(`${paths.grant}: battery "${name}" listed twice`);
-    batteries.push(make());
+    if (!(BATTERY_NAMES as readonly string[]).includes(name)) throw new Error(`${paths.grant}: unknown battery "${name}"; available: ${BATTERY_NAMES.join(", ")}`);
+    if (batteries.includes(name)) throw new Error(`${paths.grant}: battery "${name}" listed twice`);
+    batteries.push(name);
   }
-  const executor = "module" in config.executor ? await executorModule(paths, config.executor.module) : aisdk({
+  const executor: ExecutorConfig = "module" in config.executor ? { module: config.executor.module } : "backend" in config.executor ? {
+    backend: "codex", model: config.executor.model, command: config.executor.command, effort: config.executor.effort, maxToolCalls: config.executor.max_tool_calls,
+  } : {
     provider: config.executor.provider,
     model: config.executor.model,
     maxOutputTokens: config.executor.max_output_tokens,
     temperature: config.executor.temperature,
-  });
+  };
   return {
     name: config.name,
     manifest: manifestOf(paths, config.manifest),
     executor,
     cwd: config.cwd ?? ".",
     batteries,
-    states: batteries.flatMap((b) => b.states ?? []),
-    inception: { inceptor: config.inception?.inceptor, rounds: config.inception?.rounds ?? 5 },
+    hostActions: hostNames,
+    hostModules: config.host_modules ?? [],
+    sandbox: config.sandbox ? {
+      network: config.sandbox.network ?? "offline",
+      read: config.sandbox.read ?? [],
+      write: config.sandbox.write ?? [],
+      env: config.sandbox.env ?? [],
+    } : undefined,
+    inception: { inceptor: config.inception?.inceptor, rounds: config.inception?.rounds ?? 5, mode: config.inception?.mode ?? "auto" },
   };
 }
 
@@ -139,14 +181,4 @@ function manifestOf(paths: Paths, manifest: string | { text: string } | undefine
     throw new Error(manifest ? `${paths.grant}: manifest ${manifest} not found at ${path}` : `no manifest: write ${path}, or put it inline in ${paths.grant} as [manifest] text = """..."""`);
   }
   return { text: readFileSync(path, "utf8"), path };
-}
-
-/** The escape hatch: a TS module (relative to the agent directory) whose default export is an ExecutorSpec. */
-async function executorModule(paths: Paths, module: string): Promise<ExecutorSpec> {
-  const file = resolve(paths.agentDir, module);
-  if (!existsSync(file)) throw new Error(`${paths.grant}: executor.module ${module} not found at ${file}`);
-  const mod = (await import(`${pathToFileURL(file).href}?t=${statSync(file).mtimeMs}`)) as { default?: unknown };
-  const spec = mod.default as ExecutorSpec | undefined;
-  if (!spec || typeof spec.create !== "function") throw new Error(`${paths.grant}: executor.module ${module} must export default { create(): ProjectorExecutor }`);
-  return { ...spec, description: spec.description ?? `module ${module}` };
 }

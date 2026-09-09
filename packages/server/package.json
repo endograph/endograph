@@ -1,0 +1,20 @@
+{
+  "name": "@endograph/server",
+  "version": "0.0.1",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anteprojector/endograph.git",
+    "directory": "packages/server"
+  },
+  "homepage": "https://github.com/anteprojector/endograph/tree/main/packages/server#readme",
+  "bugs": {
+    "url": "https://github.com/anteprojector/endograph/issues"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "endograph": "0.0.1"
+  }
+}

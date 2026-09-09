@@ -69,6 +69,7 @@ button { color: inherit; }
 .agent-state { color: var(--faint); }
 .status-dot { width: 0.5rem; height: 0.5rem; border-radius: 50%; background: var(--faint); box-shadow: 0 0 0 3px color-mix(in srgb, var(--faint) 15%, transparent); }
 .status-dot[data-state="idle"] { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 15%, transparent); }
+.status-dot[data-state="starting"], .status-dot[data-state="incepting"] { background: var(--actor); }
 .status-dot[data-state="active"] { background: var(--actor); box-shadow: 0 0 0 3px color-mix(in srgb, var(--actor) 18%, transparent); animation: pulse 1.6s ease-in-out infinite; }
 .topbar time { justify-self: end; color: var(--faint); font-weight: 400; text-transform: lowercase; letter-spacing: 0; }
 
