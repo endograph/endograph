@@ -1,94 +1,107 @@
 # Persisting an agent
 
-The state directory is everything the agent is, and it is written so that
-any file mirror can carry it: a `cp -r`, an rsync, a synced git checkout.
-Endograph knows nothing about the mirror. It keeps three promises about
-`.endo/` and one protocol for moving it, and a mirror that delivers files
-into the working tree gets migration and backup out of them.
+The durable record is `.endo/frames/`: immutable, numbered JSON commit
+files containing full frames and, when written, an instance checkpoint.
+One file contains one transaction, so inception's frame and migrated
+instance become visible together. Files are flushed before publication;
+temporary files are ignored. Ordinary frame appends are published as they
+are produced. Runtime checkpoints are also saved after activations.
 
-## The promises
+SQLite is a local index and transactional inbox. Keep it during normal
+operation, but omit `agent.db`, its WAL/SHM companions, and the local lock
+from backups. If SQLite is missing, opening the agent rebuilds it from
+the archive: history, the latest checkpoint, delivered-message IDs, and
+canonical replies. The loader hydrates the checkpoint and folds later
+frames without executing historical actions. Each inception's snapshot
+also includes `snapshots/<n>/instance.json`.
 
-- **A copy taken at any instant is valid.** The frame log is SQLite in WAL
-  mode; the WAL is checkpointed into `agent.db` every time the machine
-  snapshot is written (after every activation, after every inception), so
-  between activations that one file is the whole log. A copy that lands
-  mid-checkpoint is healed by the next one.
-- **`.endo/.gitignore` says what a copy leaves behind.** `node_modules`
-  (one symlink to the endograph that runs the agent; relinked by every
-  `up`) and the WAL companions `agent.db-wal` and `agent.db-shm` (empty
-  after every quiescence; only this machine's SQLite reads them). Nothing
-  else is excluded: `env`, `lock`, `status.json`, `runs/`, the wire, the
-  snapshots and inception records all travel. `ensureStateDir` writes the
-  file once; it is the owner's after that.
-- **Nothing inside stores its own absolute path.** The registry entry and
-  the service unit are per machine and outside the directory; `up`
-  recreates both.
+Live frame writes and archive recovery share the same mailbox indexing code.
+Appending a request or call frame records delivery in that transaction;
+there is no independent delivery marker for callers to keep in sync.
 
-## Residence
+This release supports the archive format only. Older SQLite-only agents
+must be reset before starting; there is no automatic history import.
+Opening an old store reports the incompatibility without modifying its data.
 
-Exactly one machine runs a state directory. `status.json` carries the
-`host` that holds it, `running` (true while a harness holds it, false once
-it stopped cleanly with `endo down` or Ctrl-C), and `at`, the last write.
+## Taking a snapshot
 
-- `endo up` on a host that is not the holder refuses while `running` is
-  true, and says who holds it. `endo up --adopt` takes it: a `residence`
-  frame records the move (`adopted from fox`), and the status is restamped
-  with this host, released, so the service can start.
-- A running agent reads `status.json` on every poll. When it finds a
-  status newer than its own last write from another host, it records
-  `adopted by <host>; stopping here`, stops writing the directory, and
-  stops (a service also removes its unit). This is the fence: under a
-  last-writer-wins mirror, a double run resolves to whichever status was
-  written last, and the other side stops instead of appending to a log it
-  no longer owns.
-- `endo status` and `endo doctor` print the holder.
+Run `endo snapshot /path/to/new-directory` in the agent directory (or use
+`--agent`). The agent can keep running and appending frames. The command
+copies a fixed archive prefix and the agent's files into a temporary sibling
+directory, checks that the copied files stayed unchanged during capture,
+checks the program against its recorded inception, then publishes the
+completed directory. An existing destination is refused.
+If code or owner files change during the copy, retry after those writes
+settle. An unfinished inception promotion must complete or be recovered first.
 
-An orderly move is `endo down` on the old host, let the mirror carry the
-released status, then `endo up` on the new one, and no `--adopt` is
-needed. `--adopt` is for a host that is gone, asleep, or unreachable. A
-double run inside one mirror window is still possible (both hosts write
-before either sees the other); the fence closes it within a window, and
-the loser's frames stay in its own copy for hand recovery.
+The result contains the grant, manifest, program, evolved `src/`, inception
+snapshots and records, and other ordinary files in the agent directory.
+It excludes SQLite, inbox/outbox, running procedures' files, logs, local
+locks, temporary workspaces, and `.git` / `node_modules` directly under
+the agent root or `.endo/`. Nested project files and `.endo/home` are kept.
+Credentials in `.endo/env` are also excluded. Symlinks and special files
+are refused rather than silently copying external data. External cwd or
+grant paths are not bundled; they must exist on the destination host.
 
-## Recipe: a standalone sidecar
+To restore, provision credentials and any owner-project dependencies, then
+run `endo up` in the saved directory. Endograph recreates its own module
+link, SQLite and canonical replies. The saved residence claim is retained;
+moving to another host may require `endo up --adopt`. Keep one active
+writer for an identity. Snapshotting does not itself stop or move the source.
 
-[sidecar](https://github.com/anteprojector/sidecar) is a git-based sync
-engine whose standalone mode makes a directory its own auto-synced repo:
-every change is committed to a per-machine inbox branch, merged into
-`main` on the remote, and fast-forwarded back into every other checkout.
-Nothing about it is specific to endograph. Persisting an agent with it:
+## Copying while running
 
-```sh
-cd agents/endofrog/.endo
-sidecar init git@github.com:you/endofrog-state.git --path . --resolve lww --debounce 10m --interval 1h
-```
+The live-copy guarantee applies to the immutable archive: a complete prefix
+of its commits can be reconstructed while the source continues appending.
+An interior gap is an incomplete copy; recovery rejects it rather than
+silently skipping history.
 
-`--path .` makes the directory its own repository and sidecar (a private
-remote; the frame log is binary and passes redaction untouched).
-`--resolve lww` keeps the newer write when two machines ever overlap,
-which the residence fence turns into a handoff. `--debounce 10m
---interval 1h` is the cadence for a directory a daemon writes: one round
-trip an hour says what a commit a minute would. All three land in the
-committed `.sidecar`, so every machine agrees. `init` ends with a first
-sync, so the whole state directory is on the remote at once. From then on
-the daemon syncs it; `sidecar status` says when. Three notes belong to
-this recipe and not to the promises above:
+A complete agent copy also needs the owner inputs, `program/`, `src/`, and
+`snapshots/` that match the latest inception in that archive prefix. Include
+the promotion journal and rollback directory if a promotion is in progress.
+Copying an older archive with newer code can pair an instance with an
+incompatible program. Mutable `src/` files can also change during a copy.
+Coordinate those files with the matching generation, or use a filesystem
+snapshot or a brief pause; independent file copying is not an atomic
+snapshot of the entire agent.
+Keep mirrored files byte-for-byte; redacting or merging individual JSON
+fields changes the recorded state.
 
-- **`env` and redaction.** Sidecar redacts credential-shaped text on
-  push and, since redaction is one-way, a clone on another machine would
-  receive placeholders in `env`. Put `# sidecar:no-redact` as the first
-  line of `env` (the loader skips comment lines), or use `git-crypt` on
-  that one path, or init with `--redaction none`.
-- **Moving.** After `endo down`, run `sidecar sync` so the released
-  status reaches the remote now rather than at the daemon's next pass.
-  On the new machine: `git clone <remote> .endo` into the agent
-  directory, `sidecar init` there (the committed `.sidecar` answers every
-  question), `endo up`. `endo up --adopt` when the old machine cannot
-  release.
-- **Reset.** `endo reset` deletes `.endo/`, and with it the `.sidecar`
-  config inside; the daemon prunes the registration and does not
-  re-clone. The remote keeps the history.
+An archive-only restore can lose pending messages accepted only into the
+runtime inbox, and anything after the last copied commit. A process restart
+on the original machine retains that inbox. Unfinished recorded work uses
+the harness's normal redrive/failure rules. Neither frame replay nor an
+instance checkpoint proves that an external side effect happened exactly
+once.
 
-Under one writer, every sidecar merge is a fast-forward. Its conflict
-strategy only matters when the residence rule is broken, and that is what
-the fence is for.
+If a delivery transaction rolls back after changing the in-memory machine,
+the worker stops. The next startup recovers the accepted message from SQLite
+and the machine from the committed archive. Internal consistency failures
+use this same startup path, rather than rebuilding a live machine in place.
+
+Terminal replies are explicit harness frames, committed before outbox
+publication. They survive rebuilding SQLite and prevent a different
+terminal answer from replacing the original. They establish that the
+sender committed its answer, not that a recipient received it. Recipient
+acknowledgements would require a separate receipt protocol.
+
+The generated `.endo/.gitignore` excludes the database, lock, and installed
+module link. It is written only once; existing owner-maintained ignore
+files need the database exclusions added when adopting this layout.
+Provision `.endo/env` separately according to the destination's needs.
+Registry entries and service units are per-machine and recreated by `up`.
+Owner-authored files and procedure arguments may still contain absolute
+paths; those need to make sense on the destination.
+
+## Moving between hosts
+
+Use one writer. Stop the old agent, copy its released status and durable
+files, then start the destination. `endo up --adopt` permits recovery when
+the old host cannot release its residence.
+
+`status.json` records the holder and allows a running agent to notice a
+newer foreign residence record. This is cooperative conflict detection,
+not a distributed lease or a fence against a disconnected writer. A file
+mirror cannot safely merge two independently appended archives. Prevent
+overlapping writers outside Endograph; preserve conflicting copies for
+inspection rather than resolving their frame files with last-writer-wins.

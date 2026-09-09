@@ -16,6 +16,13 @@ time). From
 the second inception on it also holds `BASELINE/`, `DIFF.md`,
 `ERRORS.md`, and `instance.json` (§9).
 
+You work in a staged agent directory under `.endo/candidate/`, with its
+own `.endo/program`, `.endo/src`, and `.endo/workspace`. Its `src` starts
+from the live agent's current work. Edits remain candidates until
+validation and promotion succeed. The grant's runtime `cwd` and executor
+module still resolve against the original agent directory; the staging
+directory is only the inceptor's working area.
+
 ## 1. What you are writing
 
 An agent is three files' worth of intent and one directory of self:
@@ -205,6 +212,12 @@ frames. This is how a noisy job's output is elided from the parent's
 view, or how old tool results are trimmed. Register it and reference it
 from a layout's `historyProjection`.
 
+With the Codex executor, projection is an IR lowered into a persistent native
+conversation. Updated state and instructions are appended; history trimming
+and `compact` do not make Codex forget previously supplied content. Keep
+durable memory in states/files and use separate generators for separate
+contexts. See [Codex context policy](../packages/codex-executor/README.md).
+
 **executorConfig.** Per-node, namespaced by executor: `{ aisdk: {
 maxOutputTokens, temperature } }`. A cheap node can run a cheap model.
 
@@ -218,7 +231,7 @@ fixed header, then the text:
 Deploy 09171ae to stout when you get a chance.
 ```
 
-`from` is the sender as the transport verified it: `local:<user>` (a
+`from` is the sender asserted by the trusted inbox writer, or derived by the file binding when omitted: `local:<user>` (a
 person on this machine), `timer:<procedure>` (the scheduler battery),
 `agent:<name>` or `agent:<name>/<procedure>` (this or another agent, or
 one of its procedures), `inceptor:<n>` (the briefing after inception n). A user
@@ -387,11 +400,31 @@ hand. A node built at runtime can only reference registered actions.
 
 ### 6.7 Senders and trust
 
-The harness verifies who sent a message and nothing more. If the
-manifest distinguishes an owner from everyone else, hold that in the
-instructions (which principals may ask for what) and, when it matters,
-in a state the agent consults. `origin` is what the sender claims about
-itself and is not verified.
+Inbox write permission includes authority to assert any valid `from` identity.
+When omitted, the file binding derives authorship from a procedure run or the
+file's OS owner. `origin` is unverified client context. Remote bindings must
+authenticate clients and construct `from` themselves. Replies carry `from`
+(the answering agent) and `to` (the accepted caller); procedures cannot redirect
+their completion replies.
+
+Every exposed procedure is callable by an admitted peer. Rare caller-specific
+restrictions belong inside the procedure: `caller()` from `endograph/procedure`
+returns `{ from, id }` separately from its arguments. This restricts that entry
+point, not other ways the agent can perform the same operation. Behavioral
+preferences can also live in instructions and state; they are not enforced access checks.
+
+`emitMessage({ text, to?, ref? })` accepts the same identities as `from`.
+Omitting `to` addresses this agent; a bare name means `agent:<name>`. Registered
+local agents receive requests. Other destinations, including currently
+unregistered agents, produce durable notifications for a binding to collect.
+They carry `from=agent:<name>/<procedure>` and `cause=<current run id>`; causal
+attribution does not delegate the caller's authority. A notification receipt has
+`notification: true`; `waitForCompletion` rejects it because it has no reply
+lifecycle. Messages remain available until a binding handles them; collection
+is non-destructive and does not claim delivery. No automatic rerouting occurs
+when an absent agent later registers.
+
+See [server and identity architecture](server.md) for remote admission and reads.
 
 ### 6.8 Noise
 

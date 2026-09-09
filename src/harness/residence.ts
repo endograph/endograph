@@ -20,13 +20,30 @@ export interface Residence {
   at: number;
 }
 
-export function readResidence(paths: Paths): Residence | null {
+export interface Status extends Residence {
+  name: string;
+  open: string[];
+  runs: { id: string; procedure: string; from: string; startedAt: number }[];
+  active: boolean;
+  /** An inception requested from the outer host (auto mode): its number. */
+  incepting?: number;
+  /** The exposed procedures: what `endo commands` prints. */
+  commands: { name: string; description: string; args: Record<string, unknown>; required: string[] }[];
+  failure?: LoadFailure;
+}
+
+/** Read the status record once; failed startup may have written only residence and failure fields. */
+export function readStatus(paths: Paths): Partial<Status> | null {
   try {
-    const s = JSON.parse(readFileSync(paths.status, "utf8")) as Partial<Residence>;
-    return typeof s.host === "string" && typeof s.at === "number" ? { host: s.host, running: s.running === true, at: s.at } : null;
-  } catch {
-    return null;
-  }
+    const value = JSON.parse(readFileSync(paths.status, "utf8"));
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  } catch { return null; }
+}
+
+export function readResidence(paths: Paths): Residence | null {
+  const s = readStatus(paths);
+  return s && typeof s.host === "string" && typeof s.at === "number"
+    ? { host: s.host, running: s.running === true, at: s.at } : null;
 }
 
 /** Another host holds it and has not released. */
@@ -48,3 +65,27 @@ export function adopt(paths: Paths): Residence | null {
 }
 
 export const since = (at: number) => new Date(at).toISOString();
+
+/**
+ * The last time this program was tried and did not load. Kept in
+ * `status.json` beside the residence fields so `endo status`, the bare
+ * listing, and the wire commands can say why the agent is down without
+ * opening the store. Keyed to the program's hash: once the program changes
+ * (an inception wrote a new one) the record no longer applies and reads as
+ * absent. A load that succeeds rewrites the whole file without it.
+ */
+export interface LoadFailure {
+  stage: string;
+  error: string;
+  /** Hash of the program that failed (`hashOf(paths.program)`). */
+  program: string;
+  at: number;
+}
+
+export function writeLoadFailure(paths: Paths, failure: LoadFailure): void {
+  let status: Record<string, unknown> = {};
+  try {
+    status = JSON.parse(readFileSync(paths.status, "utf8")) as Record<string, unknown>;
+  } catch {}
+  writeFileSync(paths.status, JSON.stringify({ ...status, host: HOST, running: false, at: failure.at, failure }));
+}

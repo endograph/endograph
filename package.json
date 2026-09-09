@@ -1,30 +1,49 @@
 {
   "name": "endograph",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "Embedded agents on projector: a grant, a manifest, a program written at inception, a message protocol, a frame log.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anteprojector/endograph.git"
+  },
+  "homepage": "https://github.com/anteprojector/endograph#readme",
+  "bugs": {
+    "url": "https://github.com/anteprojector/endograph/issues"
+  },
   "bin": {
     "endo": "./src/cli/index.ts"
   },
   "exports": {
     ".": "./src/index.ts",
-    "./procedure": "./src/procedures/lib.ts"
+    "./procedure": "./src/procedures/lib.ts",
+    "./protocol": "./src/protocol/wire.ts"
   },
   "scripts": {
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "release": "bun scripts/release.ts",
+    "release:check": "bun scripts/release.ts --dry-run"
   },
   "dependencies": {
+    "@endograph/codex-executor": "workspace:*",
     "@ai-sdk/anthropic": "3.0.96",
     "@ai-sdk/openai": "3.0.83",
-    "@projectors/aisdk-executor": "link:@projectors/aisdk-executor",
-    "@projectors/core": "link:@projectors/core",
+    "@anthropic-ai/sandbox-runtime": "0.0.75",
+    "@projectors/aisdk-executor": "latest",
+    "@projectors/core": "latest",
+    "@types/bun": "latest",
     "ai": "6.0.222",
     "zod": "^4.5.4"
   },
   "devDependencies": {
-    "@types/bun": "latest",
     "typescript": "^5.7.0"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "overrides": {
+    "endograph": "file:."
   }
 }

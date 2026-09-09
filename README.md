@@ -12,10 +12,12 @@ reads), and `docs/v3-future.md` (designs deliberately held back).
 
 ```
 project/agents/endofrog/
-  endograph.toml      # the grant: name, executor, batteries by name, inception options
+  endograph.toml      # owner grant, executor, batteries, host actions, sandbox policy
   manifest.md         # the owner's intent, in prose (or inline in the grant under [manifest])
+  host/               # optional owner-managed host action modules
   .endo/              # gitignored; everything the agent is
-    agent.db          #   the frame log and machine snapshot
+    frames/           #   immutable frame commits and instance checkpoints
+    agent.db          #   rebuildable indexes and transactional runtime inbox
     program/agent.ts  #   the program, written at inception
     src/              #   what the agent writes: procedures, notes
     inbox/  outbox/   #   the wire: one JSON file per message and reply
@@ -26,6 +28,16 @@ a launchd or systemd unit, and starts it. With no program it runs
 inception first: a coding agent (Claude Code or Codex) writes
 `program/agent.ts` from the manifest. Credentials go in `.endo/env`. Endograph is the harness, the protocol, the program contract,
 procedures, and batteries. What an agent does is decided at inception.
+
+Runtime inference can use the AI SDK executor or persistent Codex app-server
+threads. Set `[executor] backend = "codex"` to select the latter; see
+[`@endograph/codex-executor`](packages/codex-executor/README.md) for setup,
+session recovery, and its policy for retaining context across requests.
+
+`endo snapshot <directory>` saves a restorable copy while the agent runs.
+See [persistence](docs/persistence.md) for its contents and SQLite
+rebuilding, and [sandboxing](docs/sandbox.md) for process policy and the
+`hostAction` API.
 
 `endo observatory` opens a live, read-only view on localhost. It puts the
 projector frame log beside the current machine state and the full inception
@@ -39,9 +51,19 @@ application.
 
 ## Develop
 
+Start with the [runtime architecture](docs/architecture.md) for component
+ownership, message delivery, inception, and recovery.
+
 ```sh
-bun install         # @projectors/core and the AI SDK executor are bun links to ~/dev/projector
+bun install --frozen-lockfile
 bun test            # includes the end-to-end path: empty state dir → inception → a served request
 bunx tsc --noEmit
 bun link            # `endo` on PATH
 ```
+
+See [verification](docs/testing.md) for Linux sandbox CI and keeping the
+Projector dependencies current.
+
+`@endograph/server` supplies a per-machine HTTP Fetch handler with authenticated
+admission and recipient-scoped reads. See [server architecture](docs/server.md)
+for identity, procedure caller checks, addressed notifications, and setup.

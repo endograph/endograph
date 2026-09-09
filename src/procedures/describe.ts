@@ -1,7 +1,6 @@
 import { spawn } from "node:child_process";
-import { readdirSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { actionResult, createAction, normalizeSchema, schemaFromJsonSchema, type AnyAction } from "@projectors/core";
 import type { Battery } from "../grant/grant.ts";
@@ -46,7 +45,7 @@ export async function describeProcedures(dir: string, batteries: Battery[] = [])
     else failures.push({ name, file: join(dir, f), error: `procedure file names are [a-z][a-z0-9_-]*: ${f}` });
   }
   if (files.length === 0) return { procedures, failures };
-  const results = await describeInProcess(files);
+  const results = await describeInProcess(files, resolve(dir, "../../tmp"));
   for (const file of files) {
     const name = basename(file, ".ts");
     const r = results.get(file);
@@ -86,8 +85,9 @@ const DESCRIBER = fileURLToPath(new URL("./describer.ts", import.meta.url));
 const DESCRIBE_TIMEOUT_MS = 30_000;
 
 /** One child process imports every file fresh; the harness process never runs a procedure's top-level code. */
-async function describeInProcess(files: string[]): Promise<Map<string, { meta?: ProcedureMeta; error?: string }>> {
-  const out = join(tmpdir(), `endo-describe-${process.pid}-${Date.now()}.jsonl`);
+async function describeInProcess(files: string[], temp: string): Promise<Map<string, { meta?: ProcedureMeta; error?: string }>> {
+  mkdirSync(temp, { recursive: true });
+  const out = join(temp, `endo-describe-${crypto.randomUUID()}.jsonl`);
   const child = spawn(process.execPath, ["run", DESCRIBER, out, ...files], { stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, FORCE_COLOR: "0" } });
   let stderr = "";
   child.stderr?.on("data", (d: Buffer) => (stderr += d.toString()));

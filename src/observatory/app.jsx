@@ -76,14 +76,14 @@ function App() {
 }
 
 function Topbar({ snapshot, error }) {
-  const mode = error ? "down" : snapshot?.agent.running ? (snapshot.agent.active ? "active" : "idle") : "down";
+  const mode = error ? "down" : (snapshot?.agent.phase ?? "down");
   return (
     <header className="topbar">
       <div className="brand"><span className="brand-mark">endo</span><span className="slash">/</span><span>observatory</span></div>
       <div className="agent-context">
         <span className="status-dot" data-state={mode} />
         <strong>{snapshot?.agent.name ?? "agent"}</strong>
-        <span className="agent-state">{error ? "disconnected" : mode === "active" ? "working" : mode}</span>
+        <span className="agent-state" title={snapshot?.agent.reason ?? undefined}>{error ? "disconnected" : mode === "active" ? "working" : mode}</span>
       </div>
       <time>{error ?? (snapshot ? `updated ${time(snapshot.generatedAt)}` : "connecting…")}</time>
     </header>
@@ -279,8 +279,8 @@ function InceptionPane({ inception }) {
     artifacts: {},
   }));
   const entries = [...inception.history, ...unrecorded].sort((a, b) => b.n - a.n);
-  const healthy = !inception.changed.length && !inception.programEdited && !inception.loadError;
-  const drift = [inception.changed.length ? `changed: ${inception.changed.join(", ")}` : "", inception.programEdited ? "program edited by hand" : "", inception.loadError || ""].filter(Boolean).join(" · ");
+  const healthy = !inception.changed.length && !inception.programEdited && !inception.loadError && !inception.inputError;
+  const drift = [inception.changed.length ? `changed: ${inception.changed.join(", ")}` : "", inception.programEdited ? "program edited by hand" : "", inception.loadError || inception.inputError || ""].filter(Boolean).join(" · ");
   return (
     <>
       <div className="drift">

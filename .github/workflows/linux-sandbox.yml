@@ -1,0 +1,40 @@
+name: Linux sandbox
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sandbox:
+    # Use a VM with unprivileged user namespaces. Ubuntu 24.04's default
+    # AppArmor policy needs additional configuration; do not weaken it here.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: endograph
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: endograph
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.10
+      - name: Install OS sandbox prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap socat ripgrep
+          bwrap --unshare-user --unshare-pid --unshare-net --ro-bind / / /bin/true
+      - name: Install Endograph
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Typecheck
+        run: bun run typecheck
+      - name: Exercise real Linux filesystem, network, descendants, and inherited IPC
+        run: bun test test/sandbox.test.ts
+      - name: Exercise sandboxed CLI with parent host action
+        run: bun test test/host_cli.test.ts

@@ -28,8 +28,8 @@ asks for it.
 In order of how much of it is ours:
 
 1. **A messaging protocol.** Request, call, and reply between an agent
-   and every non-model actor, with authorship stamped outside the payload
-   by the binding (§11). Formal transport, prose content. The only part
+   and every non-model actor, with authorship asserted in the envelope
+   by trusted inbox writers (§10). Formal transport, prose content. The only part
    that is not projector; specified so a peer in any language can
    implement it against a directory.
 2. **A program contract.** What inception must produce and how the
@@ -59,9 +59,9 @@ what the model should think about.
 | Word | Meaning |
 |---|---|
 | **agent directory** | The directory `endo up` runs in. Holds the owner's two files and the state directory. Its path is the agent's identity. |
-| **grant** | `endograph.toml`: name, manifest path, executor, batteries by name, inception options. Data, owner-written, validated at load, never reachable from the program. |
+| **grant** | `endograph.toml`: name, manifest path, executor, batteries, host actions, sandbox and inception options. Owner-written data, validated at load; its selected provisions are passed to the program. |
 | **manifest** | The owner's intent, in prose: `manifest.md` beside the grant, or inline in it. Input to every inception. Never handed to the running agent. |
-| **state directory** | `.endo/`: everything the agent is. The frame log, the program, `src`, the wire, snapshots. Gitignored. `rm -rf .endo` is a factory reset; the next `up` incepts a fresh agent from the owner's two files. Copy-safe, and may be mirrored to another machine; one host runs it (§12, `docs/persistence.md`). |
+| **state directory** | `.endo/`: the immutable frame archive, local SQLite index/inbox, program, `src`, wire and snapshots. Its `.gitignore` excludes local runtime files. `rm -rf .endo` is a factory reset; the next `up` incepts a fresh agent. Copy the durable archive with a matching code generation; one host writes it (§12, `docs/persistence.md`). |
 | **program** | `.endo/program/agent.ts`: what inception wrote. Nodes, instructions, projections. Written only by inception; the running agent and the owner never edit it. |
 | **src** | `.endo/src/`: what the agent writes. Procedures, notes, whatever it keeps as files. Seeded by inception, owned by the agent. |
 | **provisions** | What the program function receives: the grant's actions and states, the compiled procedures, name, cwd, executor config. The narrowed view; `endo` in the examples. |
@@ -69,7 +69,7 @@ what the model should think about.
 | **procedure** | A TypeScript script under `src/procedures/` whose first statement is `procedure({...})`. A tool to the model, a command to peers, a peer of the agent while it runs. |
 | **inception** | A coding agent writing the program from the owner's inputs. The first one starts from nothing; every later one starts from the previous snapshot and the agent's current state. Numbered. |
 | **inceptor** | The coding agent that runs an inception. |
-| **snapshot** | A copy of the owner's inputs, the program, and `src` as they stood after an inception. The baseline the next inception diffs against. |
+| **snapshot** | A copy of the owner's inputs, program, `src`, and serialized instance after an inception. The baseline the next inception diffs against. |
 
 Retired words: mandate, home, declaration, playbook, drift, sensor, judge,
 session, settle, evolvable, world (as a special state), migration (an
@@ -82,12 +82,14 @@ project-repo/agents/endofrog/     # AGENT DIRECTORY (two files; usually committe
   endograph.toml                  #   the GRANT
   manifest.md                     #   the MANIFEST
   .endo/                          #   STATE DIRECTORY (gitignored; everything the agent is)
-    .gitignore                    #     what a copy of the directory leaves behind (node_modules, the WAL); written once
+    .gitignore                    #     local DB, lock, node_modules exclusions; written once
     env                           #     KEY=VALUE credentials (mode 600), loaded at start
     endo.log                      #     the service's stdout/stderr
-    lock                          #     flock held while running
+    lock                          #     held while the agent runs, and by inception while it writes the program
     status.json                   #     what `endo status` reads; the host that holds the directory (residence, §12)
-    agent.db                      #     frame log + machine snapshot (SQLite)
+    frames/<commit>.json          #     immutable frame transactions + instance checkpoints
+    agent.db                      #     rebuildable indexes + transactional runtime inbox (SQLite)
+    host-actions.json             #     cached schemas, never host implementations or authority
     program/agent.ts              #     the PROGRAM: defineProgram((endo) => ...), inception-owned
     src/                          #     agent-owned: procedures/*.ts (§7), notes, anything
     inbox/  outbox/               #     the wire (§11)
@@ -109,9 +111,10 @@ project-repo/agents/endofrog/     # AGENT DIRECTORY (two files; usually committe
 - No `.endo/program/agent.ts` → inception 1 (§9). Otherwise the load
   pipeline (§5), then run.
 - Nothing inside the agent directory stores its own absolute path.
-- The write rule: the agent writes the state directory and nothing else
-  beyond `cwd` paths its procedures need. Convention until the sandbox
-  lands (future); `program/` inside it is inception's alone (§9).
+- The write rule: the agent writes the state directory and any extra
+  paths explicitly allowed by `[sandbox].write`. The sandbox protects
+  owner inputs, host code and `program/`; without a declared sandbox,
+  this ownership rule remains a convention (§9, `docs/sandbox.md`).
 - Three owners, three places: the owner writes the two files, inception
   writes `program/`, the agent writes `src/`. Review of the program is
   reading it or `endo replay`, never editing it.
@@ -134,10 +137,11 @@ model = "gpt-5.6-luna"
 [inception]
 # inceptor = "claude -p --dangerously-skip-permissions"   # default: the first of claude, codex on PATH
 rounds = 5                        # validation rounds before an inception gives up
+# mode = "auto"                   # auto: the running agent incepts by itself, once idle, when manifest/grant/endograph changed; manual: only `endo incept`
 ```
 
-- The grant is data. Everything in it is a name or a number (or the
-  manifest's prose, inline), so nothing in the agent directory is code: an owner edits it by hand, a peer in
+- The grant is data: names, numbers, lists and optional inline manifest
+  prose. Owner host modules are separate trusted code. An owner edits the grant by hand, a peer in
   any language can write one, `endo up --template` copies it, and
   `DIFF.md` diffs a config. (For v3's first two days it was
   `endograph.ts` with `defineAgent`, which bought a type-level name check
@@ -146,9 +150,10 @@ rounds = 5                        # validation rounds before an inception gives 
 - Validated at load: a bad name, an unknown key, an unknown or repeated
   battery, a missing executor all fail `endo up` with the file and the
   reason.
-- The grant is the whole universe: every action the model can ever call
-  (core actions, battery actions). Procedures compose these and cannot
-  widen them (§7). Custom batteries beyond the built-in three, and
+- The grant defines the supported action vocabulary: core, battery and
+  selected host actions. Procedures execute arbitrary code within the
+  sandbox's resource limits (§7); grant and charter are assembly constraints,
+  not security boundaries. Custom batteries beyond the built-in three, and
   pass-through projector states and actions: future, as packages named
   in the grant.
 - Battery actions are offered, not placed. `evolve` puts transition,
@@ -167,9 +172,10 @@ rounds = 5                        # validation rounds before an inception gives 
   and writes `.endo/tsconfig.json`; the program and procedures resolve
   upward to the link, and an editor or `bunx tsc` in `.endo/` typechecks
   them.
-- `endograph.toml` changes are owner inputs: they need `endo up` again
-  and `endo incept` when the program should follow (§9). Nothing in the
-  grant reloads live.
+- `endograph.toml` changes are owner inputs. In auto mode, changed inputs
+  trigger inception when the worker is idle; promotion starts a new worker
+  with the new grant and sandbox policy. In manual mode, run `endo incept`
+  and restart (§9). The broker checks host-action authorization on every call.
 
 ## 5. The program contract
 
@@ -230,9 +236,16 @@ procedures change; it must be pure.
 
 A failure at stages 1 and 3–6 carries the stage name and the error text.
 It means the owner's inputs or endograph moved under the program, or the
-persisted instance no longer fits it: `endo up` prints it and exits 1
-with the hint to run `endo incept`; `endo up --service` logs it and
-exits 0 so the supervisor does not crash-loop; `endo doctor` reports it.
+persisted instance no longer fits it. Before anything exits, the
+failure is recorded where every reader looks: an `error` frame in the
+log and a `failure` field in `status.json` (stage, error, the hash of
+the program that failed), so `endo status`, the bare `endo` listing,
+and a wire command queuing into an unread inbox all say "program does
+not load at <stage>: <error>". The record is keyed to the program's
+hash: a new program from inception makes it moot, and a load that
+succeeds rewrites the status without it. Then: `endo up --foreground`
+exits 1 with the hint; `endo up --service` exits 0, which the
+supervisors leave alone (§13); `endo doctor` reports it.
 
 Stage 2 runs in a child process (`procedures/describer.ts`), one per
 load: bun never re-evaluates a cached module, so an in-process re-import
@@ -259,13 +272,15 @@ it gets more review than any module.
 
 ## 6. The harness
 
-The agent is one process: `endo up --service` (what the unit runs) or
-`endo up --foreground`. It runs the load pipeline, then serves; `endo
-up` runs inception first when there is no program (§13). (The sandbox,
-when it comes, wraps this in an outer shim; future.)
+`endo up --service` and `endo up --foreground` run a trusted outer process
+and an agent worker. The outer process holds credentials, host actions,
+model-provider access, and inception. The worker loads the program and
+serves messages. When `[sandbox]` is present, its policy covers the worker
+and descendants; generated programs and procedure descriptions are also
+validated in workers. See `docs/sandbox.md` for policy and host actions.
 
 **One wake reason: a message.** The process sleeps until an inbox file
-lands (a poll every second, plus `fs.watch` on the inbox). The router:
+lands (a poll every second). The router:
 
 - `call` → start the named exposed procedure (§7) as its own process;
   the call's id is the run's id; the first reply the run produces (the
@@ -318,9 +333,12 @@ The harness never compacts on its own.
 **Compaction is the program's call.** `compact` is a core action; the
 horizon is projector's message; history renders from the latest horizon.
 
-**Live reload.** A change under `src/procedures/` (`fs.watch`, debounced)
+**Live reload.** A change under `src/procedures/` (content hashes checked by the ordinary poll)
 reruns the pipeline between activations and swaps the charter, rebuilding
-the machine from the store; running procedures finish on the code they
+the machine from the store. Reload and restart retain conversation frames,
+including the compaction horizon; only compaction reduces visible history.
+Snapshot history is restored without reapplying its state changes or actions.
+Running procedures finish on the code they
 started with. A procedure that fails to describe is dropped from the
 charter and fed back to the agent as an inert frame the next activation
 sees (once per distinct error, across restarts). A pipeline failure on
@@ -385,13 +403,14 @@ activation, and its exit is its completion.
 **The API**, `endograph/procedure`, a thin client over the wire (§11)
 on the procedure's own agent, stamped `agent:<name>/<procedure>`:
 
-- `emitMessage({ text, ref?, to? })` → a receipt. A request to the agent
-  (or to another agent registered on this machine, by name: this is how
-  agents talk to each other; the receiver stamps `from` as this
-  procedure after checking the run is live in the sender's state
-  directory).
-- `waitForCompletion(receipt, { timeout? })` → the reply, once every
-  activation the message caused has settled; rejects on timeout.
+- `caller()` → `{ from, id }`, the accepted caller and current run ID,
+  separate from procedure arguments.
+- `emitMessage({ text, ref?, to? })` → a receipt. Registered local agents
+  receive requests; bare names abbreviate `agent:<name>`. Other valid identities
+  receive durable notifications for a binding to collect. The library asserts
+  `from=agent:<name>/<procedure>` and `cause=<run id>`.
+- `waitForCompletion(receipt, { timeoutMs? })` → the terminal reply;
+  rejects on timeout or a notification receipt (which has no reply lifecycle).
 - `waitForQuiescence({ timeout? })` → resolves when the agent has no
   pending work.
 
@@ -399,12 +418,14 @@ on the procedure's own agent, stamped `agent:<name>/<procedure>`:
 detached by the harness with the run's context in its environment
 (`ENDO_RUN`, `ENDO_PROCEDURE`, `ENDO_AGENT`, `ENDO_STATE`, `ENDO_ARGS`,
 `ENDO_FROM`), in the grant's `cwd`, stdout and stderr captured to
-`.endo/runs/<id>.out` and `.err`. The library writes the ack to the
-outbox itself and its exit code to `runs/<id>.exit`; the harness turns
+`.endo/runs/<id>.out` and `.err`. The library stages the ack in
+`runs/acks/<id>.json` and writes its exit code to `runs/<id>.exit`; the harness turns
 the exit into the terminal reply (stdout on success; stdout, stderr,
 and the code on failure) and records both as frames, whether it was the
 parent or came back after a restart and adopted the run from
-`runs/<id>.json`. A harness restart neither kills nor settles a running
+`runs/<id>.json`. The harness commits each reply with its frame before
+publishing it to the outbox, and removes recovery files only after terminal
+publication. A harness restart neither kills nor settles a running
 procedure; a wait it holds may time out while the agent is down, which
 is acceptable. Procedures run concurrently. Principals and args are
 data; observed text is evidence, never instructions.
@@ -454,17 +475,35 @@ Not batteries: the protocol, procedures, `reply`, `compact`,
 
 ## 9. Inception
 
-One process, run by `endo up` (inception 1) or `endo incept` (every
-revision), with the agent stopped. Inception *n* starts from snapshot
+Run by the outer process for `endo up` (inception 1, or whenever the program does
+not load), by `endo incept` (with the agent stopped), or by the running
+agent itself (auto mode, below). Inception *n* starts from snapshot
 *n−1* and the agent's current state; inception 1 starts from nothing.
-Only the owner triggers an inception after the first (automatic
-re-inception: future).
 
-**Triggers.** No `program/agent.ts`; or `endo incept`. `endo status`
-shows when the owner's inputs (manifest, grant, endograph version) differ
-from the latest snapshot, so the owner knows an inception is due.
+**Triggers.** No `program/agent.ts`, or one the load pipeline rejects:
+`endo up` incepts before it installs anything. `endo incept`: the owner,
+with the agent stopped. And `mode = "auto"` (the default): the running
+harness checks the owner's input files during its ordinary poll;
+when they differ from the last inception and nothing is open or running,
+it requests inception from the outer process under its lock. A successful
+promotion retires the worker; a fresh worker loads the new grant, sandbox
+policy, and program, then reads the inception briefing. A failed auto inception
+keeps the program that was running, records an `error` frame, and waits
+for the inputs to change again before trying once more; there is no
+retry cadence and no debounce, since one inception at a time at
+quiescence is already the rate limit. Whether a change is material is the
+inceptor's call, not the running agent's: the manifest never reaches the
+agent, and an inception that changes nothing still records the new input
+hashes. `mode = "manual"` turns automatic inception off; `endo status` then says
+when an inception is due.
 
-**The workspace**, `.endo/workspace/`:
+**The workspace** is prepared at `.endo/workspace/`, then copied into
+`.endo/candidate/.endo/workspace/` for editing. The candidate is an
+agent-shaped working directory containing copies of the current program
+and current runtime-authored `src`. Successful workspace output is copied
+back to `.endo/workspace/`; failed candidates remain inspectable.
+
+Workspace contents:
 
 - `MANIFEST.md`: a copy of the manifest
 - `GRANT.md`: the provisions as text: every action with its JSON schema
@@ -496,7 +535,7 @@ otherwise; `TASK.md` says so. Everything else is the inceptor's
 judgment: topology, instructions, what to remember, which procedures to
 seed, where the evolve actions sit.
 
-**Running the inceptor.** Headless, with the agent directory as cwd and
+**Running the inceptor.** Headless, with `.endo/candidate/` as cwd and
 the prompt "Read .endo/workspace/TASK.md and do exactly what it says" as
 the command's last argument: `claude -p --dangerously-skip-permissions`
 or `codex exec --dangerously-bypass-approvals-and-sandbox` (first found
@@ -504,9 +543,23 @@ on PATH, or the grant's `inception.inceptor`, or `--inceptor <command>`;
 `-p` mode cannot approve anything, and the inceptor must write files and
 run bun). Both run on an API key, so a service host without a login
 works. No built-in inceptor. `endo incept --manual` renders the
-workspace and stops, so the owner can run a coding agent in it
-interactively and then `endo incept --accept`; inception 1 of endofrog
+candidate workspace and stops. Run the coding agent in the candidate
+directory printed by the CLI, then run `endo incept --accept` from the
+original agent directory; inception 1 of endofrog
 happened this way, inceptions 2 and 3 headless.
+
+**Promotion.** Candidate code is validated against the original agent's
+runtime cwd, grant, and persisted state, in an isolated worker. Rollback
+copies and a promotion journal are flushed before
+live files change. The promoted files and inception snapshot directory
+are flushed before the inception frame and instance snapshot commit in
+one immutable archive commit, indexed by a SQLite transaction. On startup, under the agent lock, an unfinished
+promotion is rolled back unless its commit token is in the frame log.
+The old worker retires after that commit. Its replacement constructs the
+executor, actions, batteries, migrated machine and process sandbox from
+the new grant. Embeddings use `createAgentHost` for this same lifecycle;
+the lower-level `openAgent` runs a fixed generation and does not perform
+inception itself. Procedure reloads stay within the worker and preserve history.
 
 **Validation.** After each inceptor run: the header check, the load
 pipeline without an executor against the edited program, `src`, and
@@ -519,8 +572,9 @@ stays in place and the agent can be started again as it was.
 **Record.** A success writes an `inception` frame (n, manifest hash,
 grant hash, program hash, endograph version, inceptor command, rounds
 used, elapsed ms), a fresh machine snapshot so a failing frame is never
-replayed again, and `snapshots/<n>/` holding the inputs, the program,
-and a copy of `src`. Every attempt, success or not, also leaves
+reapplied to state, and `snapshots/<n>/` holding the inputs, program,
+`instance.json`, and a copy of `src`. Earlier conversation history remains
+visible subject to explicit compaction. Every attempt, success or not, also leaves
 `inceptions/<n>/`: `inception.json` (command, prompt, timing, outcome),
 `workspace/` as the inceptor read it, and `rounds/<k>/` with the
 inceptor's stdout and stderr, the program and `src` as that round left
@@ -538,51 +592,64 @@ inception's truth; the agent never edits it either.
 
 ## 10. Authorship
 
-`from` is the one field the transport owns (§11). It is stamped by the
-binding as `scheme:id`, never trusted from the payload; what the client
-asserts about itself (a worktree path) is `origin`. Schemes: `local:<user>`
-(the inbox file's owner, kernel-verified; overridden to `local:uid:<n>`
-when the file's uid is not ours), `timer:<name>`, `agent:<name>`,
-`inceptor:<n>` (the harness's own briefing after an inception). The
-file binding tells the agent's own processes apart from the user they
-run as by what the harness handed them: a procedure's library writes the
-run id the harness minted into the message (`run`), and the harness
-resolves a live run to `agent:<name>/<procedure>`; a battery inside the
-harness process names its scheme directly. Same-user processes are
-trusted either way: the uid says which user, the run id which procedure.
-More schemes arrive with their bindings (future). Endo validates nothing
-about the author; it guarantees the field is outside the payload and set
-by the transport. Whether the agent does permissions with it is the
-agent's business, and `docs/program.md` says so.
+Inbox write permission includes the authority to assert any syntactically valid
+`from` identity (`scheme:id`). Core trusts explicit authorship. When absent,
+the file binding derives it from a live procedure run or the inbox file's OS
+owner (`local:<user>`, or `local:uid:<n>` for another uid). `origin` remains
+unverified client context. Authentication of remote clients belongs to their
+binding, not the model or the inbox parser.
+
+Replies carry `from=agent:<name>` and `to` derived from the originally accepted
+caller, including acknowledgements, failures, rejections and recovered replies.
+A duplicate ID never changes that caller. Procedures can inspect `{ from, id }`
+through `caller()`; rare procedure-specific restrictions are ordinary code.
+
+`from` and `to` share an identity grammar. A procedure's `emitMessage` accepts
+bare local agent names as shorthand for `agent:<name>`. Registered local agents
+receive requests; other destinations receive durable notifications in the
+sending agent's `outbox/messages/`, archived before publication and repaired on
+restart. Notifications name the procedure as author and their causing run in
+`cause`. They have no completion reply and are not marked delivered by collection.
+See [server architecture](server.md) for the binding contract and initial relay.
 
 ## 11. Messaging protocol
 
-Every message is one JSON file with a `v` field, written to a temp name
-and renamed atomically into `inbox/`. Replies go to
-`outbox/<id>.json` as well as the frame log, so readers need no
-SQLite.
+Every message is one JSON file with a `v` field, written and flushed to a
+unique temp name, renamed atomically into `inbox/`, then followed by a
+directory flush. The harness durably accepts the stamped message in SQLite
+before removing its inbox file. Dispatch and the delivery marker commit
+together, so accepted but undelivered messages survive a restart.
+
+Replies commit with their frame in one immutable archive transaction, indexed
+in SQLite, before publication
+to `outbox/<id>.json`, so readers need no SQLite. A committed terminal reply
+cannot be replaced. Startup repairs missing or stale outbox files from the
+reply ledger. This guarantees a single durable terminal outcome, not exactly
+once execution of external effects: an interrupted model activation may be
+re-driven, and a call interrupted before its process identity was saved is
+failed rather than launched again.
 
 - **request**: `id`, `from`, optional `origin`, optional `ref`,
   `text`, `at`. Answered by the model.
 - **call**: same envelope + `procedure` + `args` (validated against the
   procedure's schema). Answered by the procedure's replies: an optional
   `working` ack, then one terminal reply.
-- **reply**: `id`, `ok`, `state`, `text`, `at`. Exactly one
+- **notification**: `id`, `from`, `to`, optional `cause` and `ref`, `text`, `at`; addressed output without a reply lifecycle.
+- **reply**: `id`, `from`, `to`, `ok`, `state`, `text`, `at`. Exactly one
   terminal reply per request or call. `state` borrows A2A's vocabulary:
   submitted, working (a procedure's ack), input-required (a question
   back to the sender), completed, failed, rejected, canceled.
 
 The request id is minted by the client (`endo send --id <id>` to supply
-one; otherwise random). The inbox drops a second message with an id it
-has already seen, so a retried CI job cannot create two requests. `ref`
+one; otherwise a UUID). The durable inbox ledger deduplicates messages by id,
+so a retried CI job cannot create two requests, including after restart. `ref`
 is the thread key: `docs/program.md` shows one child generator per `ref`
 so follow-ups share a history.
 
-**Binding.** File, the base and for now the only one: deliver = write
+**Binding.** File, the base: deliver = write
 into `inbox/`, receive = read `outbox/`; directory permissions are the
-boundary. The seams other bindings will use are the outbox files and
-`from` stamped by the binding; the bindings themselves (SSH, MCP, the
-HTTP relay, A2A) are future.
+boundary. The HTTP relay now uses these files through `@endograph/server` (see
+`docs/server.md`); SSH, MCP and A2A bindings remain future work.
 
 Removed from v2: the word incident (a request has an `id`), the
 `session` field (sessions are gone), the `world` message (a procedure
@@ -610,19 +677,20 @@ whenever `up` runs. Data, not code: any endo binary reads and writes it.
   Ctrl-C). `up` elsewhere refuses while it is held; `up --adopt` takes
   it and records a `residence` frame. A running agent whose
   `status.json` is replaced by a newer one from another host records the
-  move and stops: under a last-writer-wins mirror a double run becomes a
-  handoff.
+  move and stops when it observes it. This is cooperative detection, not
+  a distributed lease; prevent overlapping writers externally. Do not
+  merge conflicting immutable archives with last-writer-wins.
 
 ## 13. Running
 
 ```
-endo up                      # in the agent directory: register, install the unit, start; incepts first (foreground) when there is no program
+endo up                      # in the agent directory: register, install the unit, start; incepts first (foreground) when there is no program (soon: or when it does not load, or the inputs changed)
 endo up --foreground         # run in this terminal instead (debugging, tests); refuses while the service is loaded
 endo up --template <dir>     # seed endograph.toml + manifest.md from <dir>, then as above; with neither and no template, endo asks
 endo up --adopt              # run a state directory another host still holds (a copy, a synced mirror); the move is a frame
 endo down                    # stop the service and remove the unit
 endo logs [-f]               # the service log
-endo incept                  # re-incept now, with the agent stopped; --manual / --accept
+endo incept                  # the manual form of one step of `up`: write a new program and record it; never starts or stops the service. `endo up` after it. --manual / --accept
 ```
 
 An agent is a daemon, so `up` means "running and kept running".
@@ -632,8 +700,10 @@ Supervisors: launchd user agent on macOS (RunAtLoad, KeepAlive with
 failure and leave a clean exit alone, which is what lets a service exit 0
 instead of crash-looping (§5, §9). Units run `endo up --service` in the
 agent directory. Credentials live in `.endo/env` (KEY=VALUE, mode 600),
-loaded into the process environment at start, foreground or service, so
-a unit never holds a secret. No library postinstall: bun skips lifecycle
+loaded by the outer process at start, foreground or service, so
+a unit never holds a secret. Sandboxed workers receive only the environment
+variables selected by policy; model-provider credentials stay outside.
+No library postinstall: bun skips lifecycle
 scripts unless trusted, and an install is the wrong trigger. System units
 and containers: future.
 

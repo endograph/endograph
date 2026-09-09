@@ -1,0 +1,17 @@
+{
+  "name": "@endograph/codex-executor",
+  "version": "0.0.1",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anteprojector/endograph.git",
+    "directory": "packages/codex-executor"
+  },
+  "homepage": "https://github.com/anteprojector/endograph/tree/main/packages/codex-executor#readme",
+  "bugs": {
+    "url": "https://github.com/anteprojector/endograph/issues"
+  },
+  "exports": { ".": "./src/index.ts", "./host": "./src/host.ts" },
+  "dependencies": { "@projectors/core": "latest", "zod": "^4.5.4" }
+}

@@ -61,11 +61,10 @@ export const ENDOGRAPH_ROOT = resolve(import.meta.dir, "../..");
  * linked here by `endo up`, so they resolve upward to it; a tsconfig
  * beside the link lets an editor and `bunx tsc` do the same.
  *
- * The state directory is written so that a copy of it, taken at any
- * instant, is a valid state directory (the log is checkpointed at every
- * quiescence). Its `.gitignore` names what a copy should leave behind:
- * relinked on the next `up`, or meaningless off this machine. Written
- * once; the owner's from then on.
+ * Immutable frame commits under frames/ include instance checkpoints;
+ * SQLite can rebuild from those files. Copy the archive along with program,
+ * src, snapshots and owner inputs. The runtime database and lock are local.
+ * `.gitignore` is written once and belongs to the owner afterward.
  */
 export function ensureStateDir(paths: Paths): void {
   for (const dir of [paths.procedures, paths.inbox, paths.outbox, paths.runs, paths.snapshots, paths.modules]) mkdirSync(dir, { recursive: true });
@@ -88,9 +87,13 @@ export function ensureStateDir(paths: Paths): void {
 /** `.endo/tsconfig.json`: the program and src typecheck against the linked endograph. Tooling, rewritten at every start. */
 const GITIGNORE = `# relinked by every \`endo up\`
 node_modules
-# empty after every quiescence; only this machine's SQLite reads them
+# rebuilt from immutable frames/ on this machine
+agent.db
 agent.db-wal
 agent.db-shm
+# process ownership is local to this machine
+lock
+lock-journal
 `;
 
 const TSCONFIG = {
@@ -102,7 +105,8 @@ const TSCONFIG = {
     skipLibCheck: true,
     allowImportingTsExtensions: true,
     noEmit: true,
-    types: ["./node_modules/endograph/node_modules/bun-types"],
+    // Resolve from Endograph so hoisted and isolated installs both work.
+    types: [Bun.resolveSync("@types/bun/index.d.ts", ENDOGRAPH_ROOT)],
   },
   include: ["program", "src"],
 };
