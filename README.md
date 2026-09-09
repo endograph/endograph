@@ -1,6 +1,6 @@
 # endograph
 
-Embedded agents on [projector](https://github.com/anteprojector/projector).
+Embedded agents on [projector](https://github.com/endograph/projector).
 An agent ships inside the system it tends, answers its peers, and is written
 by a coding agent from its owner's manifest.
 

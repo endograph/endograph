@@ -1,7 +1,7 @@
 # Endograph v3 — rewrite plan
 
-Status: agreed 2026-09-03 after two days of v2 (last v2 commit `34600c7`,
-archaeology only; v1 is `4455c59`); built 2026-09-03 and 2026-09-04
+Status: agreed 2026-09-03 after two days of v2 (last v2 commit `cd97342`,
+archaeology only; v1 is `ca776eb`); built 2026-09-03 and 2026-09-04
 through every step of §16, and endofrog runs on it under launchd. The
 decisions made while building are folded into the sections below (the
 commit log has the order); what the dogfood is still watching is at the

@@ -5,7 +5,7 @@ Embedded agents on `@projectors/core`. CLI is `endo`. **v3** (agreed
 `docs/rewrite-plan.md` first (its status paragraph says what is built
 and what the dogfood is watching), then `docs/program.md` (the contract
 and idioms an inceptor reads) and `docs/v3-future.md` (designs
-deliberately held back; check it before re-proposing anything). v2 is at commit `34600c7` and v1 at `4455c59`,
+deliberately held back; check it before re-proposing anything). v2 is at commit `cd97342` and v1 at `ca776eb`,
 archaeology only. Do not resurrect v1 or v2 structure: no loop, drift,
 judge, sessions, evolvable, home/declaration split, playbook, or
 frontmatter.
