@@ -6,11 +6,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/anteprojector/endograph.git"
+    "url": "git+https://github.com/endograph/endograph.git"
   },
-  "homepage": "https://github.com/anteprojector/endograph#readme",
+  "homepage": "https://github.com/endograph/endograph#readme",
   "bugs": {
-    "url": "https://github.com/anteprojector/endograph/issues"
+    "url": "https://github.com/endograph/endograph/issues"
   },
   "bin": {
     "endo": "./src/cli/index.ts"

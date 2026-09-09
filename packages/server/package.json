@@ -4,12 +4,12 @@
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/anteprojector/endograph.git",
+    "url": "git+https://github.com/endograph/endograph.git",
     "directory": "packages/server"
   },
-  "homepage": "https://github.com/anteprojector/endograph/tree/main/packages/server#readme",
+  "homepage": "https://github.com/endograph/endograph/tree/main/packages/server#readme",
   "bugs": {
-    "url": "https://github.com/anteprojector/endograph/issues"
+    "url": "https://github.com/endograph/endograph/issues"
   },
   "exports": {
     ".": "./src/index.ts"
