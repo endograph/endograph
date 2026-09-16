@@ -71,7 +71,9 @@ export async function sandboxCommand(paths: Paths, grant: Grant, argv: string[])
       denyRead: ["/", paths.env, join(paths.state, "codex"), ...hostDirectories],
       allowRead: ["/bin", "/sbin", "/usr", "/lib", "/lib64", "/System", "/Library", "/dev", "/private/etc", "/etc", "/private/var/select",
         paths.agentDir, resolve(paths.agentDir, grant.cwd), ...runtime,
-        ...policy.read.map((p) => resolve(paths.agentDir, p))].map(canonical).concat([...ancestors]),
+        // Keep both spellings on usr-merged Linux: masking /bin must restore
+        // /bin itself as well as its /usr/bin target for shells and ELF loaders.
+        ...policy.read.map((p) => resolve(paths.agentDir, p))].flatMap((p) => process.platform === "linux" ? [p, canonical(p)] : [canonical(p)]).concat([...ancestors]),
       allowWrite: [paths.state, ...policy.write.map((p) => resolve(paths.agentDir, p))].map(canonical),
       denyWrite: [...ownerFiles, paths.env, join(paths.state, "codex"), join(paths.state, "program"), paths.modules,
         // SRT otherwise adds writable host temp/log directories implicitly.
