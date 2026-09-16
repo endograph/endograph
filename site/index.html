@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Agents in your infrastructure. Give them a manifest and sandbox. Let them find their methods.">
+  <meta name="theme-color" content="#faf8f4">
+  <title>endograph — Agents in your infrastructure.</title>
+  <script>
+    // Apply the preference before styles load to avoid a light flash in dark mode.
+    (() => {
+      let saved;
+      try { saved = localStorage.getItem('endograph-theme'); } catch {}
+      const mode = ['system', 'light', 'dark', 'ink'].includes(saved) ? saved : 'ink';
+      const theme = mode === 'system' ? (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') : mode;
+      document.documentElement.dataset.theme = theme;
+      if (theme === 'ink') document.documentElement.style.setProperty('--ink-hue', Math.floor(Math.random() * 360));
+      document.querySelector('meta[name="theme-color"]').content = theme === 'ink' ? `hsl(${document.documentElement.style.getPropertyValue('--ink-hue')} 72% 85%)` : theme === 'dark' ? '#000000' : '#faf8f4';
+    })();
+  </script>
+  <link rel="stylesheet" href="./style.css">
+  <script src="./site.js" defer></script>
+</head>
+<body>
+  <div class="page">
+    <header>
+      <a class="wordmark" href="./" aria-label="Endograph home">endograph</a>
+      <nav aria-label="Main navigation">
+        <button type="button" data-panel="install" aria-controls="details" aria-expanded="false">Install</button>
+        <a href="https://github.com/endograph/endograph" target="_blank" rel="noopener noreferrer" data-panel="github" aria-controls="details" aria-expanded="false">GitHub <span aria-hidden="true">↗</span></a>
+        <button id="theme-toggle" class="theme" type="button" data-mode="ink" aria-label="Theme: ink">
+        <svg class="i-system" viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="9" rx="1"/><path d="M5.5 14h5"/></svg>
+        <svg class="i-light" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="3.1"/><path d="M8 .9v1.8M8 13.3v1.8M15.1 8h-1.8M2.7 8H.9M13 3l-1.3 1.3M4.3 11.7 3 13M13 13l-1.3-1.3M4.3 4.3 3 3"/></svg>
+        <svg class="i-dark" viewBox="0 0 16 16" aria-hidden="true"><path d="M13.5 9.6A6 6 0 1 1 6.4 2.5a4.8 4.8 0 0 0 7.1 7.1Z"/></svg>
+        <svg class="i-ink" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.6c2.7 3 4.4 5.2 4.4 7.1a4.4 4.4 0 0 1-8.8 0c0-1.9 1.7-4.1 4.4-7.1Z"/></svg>
+        <svg class="i-drop" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.6c2.7 3 4.4 5.2 4.4 7.1a4.4 4.4 0 0 1-8.8 0c0-1.9 1.7-4.1 4.4-7.1Z"/></svg>
+      </button>
+      </nav>
+    </header>
+    <main>
+      <h1>Agents in your<br>infrastructure.</h1>
+      <div class="stages" aria-label="How Endograph works">
+        <button id="manifest-trigger" type="button" data-panel="manifest" aria-controls="details" aria-expanded="false">manifest</button>
+        <span aria-hidden="true">→</span>
+        <button id="incept-trigger" type="button" data-panel="incept" aria-controls="details" aria-expanded="false">incept</button>
+        <span aria-hidden="true">→</span>
+        <button id="evolve-trigger" type="button" data-panel="evolve" aria-controls="details" aria-expanded="false">evolve</button>
+      </div>
+      <noscript><p>Give an agent a manifest and sandbox. Inception writes its program; the agent develops its own methods. <a href="https://github.com/endograph/endograph#develop">Install from GitHub.</a></p></noscript>
+    </main>
+  </div>
+
+  <section id="details" class="panel" aria-hidden="true" inert aria-label="Endograph details">
+    <div class="panel-inner">
+      <div class="panel-bar"><span id="panel-label"></span><button class="close" type="button" aria-label="Close details">×</button></div>
+
+      <div data-content="manifest" hidden>
+        <div class="intro step-intro"><p>Choose its sandbox, and give it a manifest.</p></div>
+        <div class="columns">
+          <section class="example"><div class="file-label">endograph.toml <span>sandbox example</span></div>
+            <div class="choices" role="group" aria-label="Example network policy">
+              <button type="button" data-network="offline" aria-pressed="true">Offline</button>
+              <button type="button" data-network="loopback" aria-pressed="false">Localhost</button>
+              <button type="button" data-network="hosts" aria-pressed="false">Selected hosts</button>
+              <button type="button" data-network="full" aria-pressed="false">Any host</button>
+            </div>
+            <pre><code>[sandbox]
+network = <span id="network-value">"offline"</span>
+read = ["../deployments"]
+write = []
+env = []</code></pre>
+            <p class="note" id="network-note">The agent's code cannot access the network. The host still handles model requests.</p>
+            <p class="note">The agent can write to its own state directory. Add other writable paths here if it needs them.</p>
+          </section>
+          <section class="example"><div class="file-label">manifest.md <span>example</span></div>
+            <pre class="prose"><code># Release watcher
+
+Find out why our deployments fail.
+
+When you receive a deployment event,
+read the logs in ../deployments and
+explain the failure. Tell us if you've
+seen it before.
+
+Keep notes and write tools you find
+useful. Don't change the deployments.</code></pre>
+          </section>
+        </div>
+      </div>
+
+      <div data-content="incept" hidden>
+        <div class="intro step-intro"><p>During inception, endograph uses your coding agent to turn the manifest into a program.</p></div>
+        <section class="report example"><div class="file-label">inception / 001 <span>example report</span></div>
+          <div class="report-row"><span>Inputs</span><p>Read the manifest and checked the available tools and sandbox settings.</p></div>
+          <div class="report-row"><span>Program</span><p><code>.endo/program/agent.ts</code><br>Wrote an agent that investigates deployment failures and saves notes for later requests.</p></div>
+          <div class="report-row"><span>Procedure</span><p><code>.endo/src/procedures/read-deployment.ts</code><br>Added a tool that reads logs from the allowed directory.</p></div>
+          <div class="report-row"><span>Checks</span><p>Loaded the program and its initial state in the sandbox.</p></div>
+          <div class="report-row"><span>Status</span><p>Ready to receive a deployment event.</p></div>
+        </section>
+      </div>
+
+      <div data-content="evolve" hidden>
+        <div class="intro step-intro"><p>As the endograph agent runs, it will evolve its own prompts and procedures to become more effective and efficient.</p></div>
+        <section class="example evolution"><div class="file-label">release watcher / notes <span>example</span></div>
+          <div class="event"><span class="event-label">Problem</span><p>Three deployments failed on the same migration lock. The agent found it by reading each log separately.</p></div>
+          <div class="event"><span class="event-label">New tool</span><div><p>It writes a procedure that checks a deployment log for that lock error.</p><code class="added">+ .endo/src/procedures/detect-migration-lock.ts</code></div></div>
+          <div class="event"><span class="event-label">Next failure</span><p>The agent runs the procedure and reports the matching log lines, along with its notes from the earlier failures.</p></div>
+          <p class="note">Endograph reloads procedures between turns. The new code runs with the permissions you already granted.</p>
+        </section>
+      </div>
+
+      <div data-content="install" hidden>
+        <p class="install-lead">Tell your agent to try it out</p>
+        <section class="prompt-block" aria-label="Install prompt">
+          <div class="prompt-toolbar">
+            <span id="copy-status" role="status" aria-live="polite"></span>
+            <button id="copy-prompt" type="button" aria-label="Copy prompt" title="Copy prompt">
+              <svg class="copy-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg>
+              <svg class="copied-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>
+            </button>
+          </div>
+          <pre class="install-code"><code id="install-prompt">Please help me explore endograph: <a href="https://github.com/endograph/endograph" target="_blank" rel="noopener noreferrer">https://github.com/endograph/endograph</a>
+
+What infrastructure agents might be useful in our workflows?</code></pre>
+        </section>
+      </div>
+
+      <div data-content="github" class="readme" hidden>
+        <!-- readme:start -->
+<h1>endograph</h1>
+<p><a href="https://endograph.github.io/endograph/" target="_blank" rel="noopener noreferrer">Website</a></p>
+<p>Endograph runs agents in your infrastructure, using
+<a href="https://github.com/endograph/projector" target="_blank" rel="noopener noreferrer">projector</a>. You give an agent a
+manifest describing its job and permissions for what it can access. A coding
+agent writes its program. Once running, it receives messages and develops
+its own tools and notes.</p>
+<p>The v3 rewrite is in progress. <code>docs/rewrite-plan.md</code> describes the scope
+and implementation order. <code>docs/program.md</code> defines the program contract
+used during inception. Deferred ideas are in <code>docs/v3-future.md</code>.</p>
+<h2>Agent files</h2>
+<pre><code>project/agents/endofrog/
+  endograph.toml      # owner grant, executor, batteries, host actions, sandbox policy
+  manifest.md         # the owner's intent, in prose (or inline in the grant under [manifest])
+  .env                # owner credentials, gitignored; loaded by the host
+  host/               # optional owner-managed host action modules
+  .endo/              # agent-managed state and local runtime files
+    frames/           #   immutable frame commits and instance checkpoints
+    agent.db          #   rebuildable indexes and transactional runtime inbox
+    program/agent.ts  #   the program, written at inception
+    src/              #   what the agent writes: procedures, notes
+    inbox/  outbox/   #   the wire: one JSON file per message and reply
+</code></pre>
+<p>Run <code>endo up</code> in the agent directory. It registers the agent, installs
+a launchd or systemd service, and starts it. If the agent has no program,
+Endograph runs inception first: a coding agent (Claude Code or Codex)
+writes <code>program/agent.ts</code> from your manifest.</p>
+<p>Put credentials in <code>.env</code> beside <code>endograph.toml</code> and add it to your
+project's <code>.gitignore</code>. Existing process environment variables take
+precedence over <code>.env</code>. If you're upgrading from the old layout, move
+<code>.endo/env</code> to <code>.env</code>; Endograph no longer loads the old path.</p>
+<p>Configure the agent through these owner files. You don't need to edit
+anything inside <code>.endo/</code>. Endograph handles running the program and
+delivering messages, and provides the program contract, procedures, and
+optional capabilities called batteries. Inception determines how the agent
+does its job.</p>
+<h2>Model access</h2>
+<p>The agent can use the AI SDK executor or persistent Codex app-server
+threads. To use Codex, set <code>[executor] backend = &quot;codex&quot;</code>. The
+<a href="https://github.com/endograph/endograph/blob/main/packages/codex-executor/README.md" target="_blank" rel="noopener noreferrer"><code>@endograph/codex-executor</code></a> README
+explains setup, session recovery, and how context carries across requests.</p>
+<h2>Snapshots and inspection</h2>
+<p>Run <code>endo snapshot &lt;directory&gt;</code> to save a restorable copy while the agent
+runs. The <a href="https://github.com/endograph/endograph/blob/main/docs/persistence.md" target="_blank" rel="noopener noreferrer">persistence docs</a> explain what the snapshot
+contains and how Endograph rebuilds SQLite. The
+<a href="https://github.com/endograph/endograph/blob/main/docs/sandbox.md" target="_blank" rel="noopener noreferrer">sandboxing docs</a> cover process permissions and the
+<code>hostAction</code> API for actions that run on the host.</p>
+<p><code>endo observatory</code> opens a live, read-only view on localhost. You can inspect
+the Projector frame log, current machine state, and inception history. Each
+inception record includes the changed inputs, the resulting program
+structure, the coding agent's brief, and copies of the program and owner
+files.</p>
+<p>Use <code>--agent &lt;name|dir&gt;</code> to inspect an agent from another directory,
+<code>--port &lt;n&gt;</code> to choose a port, or <code>--no-open</code> to leave the browser closed.
+Bun bundles the React interface when the command starts. The first launch
+installs a pinned React runtime under <code>~/.endograph/observatory/</code>, outside
+the agent and its application.</p>
+<h2>Develop</h2>
+<p>Read the <a href="https://github.com/endograph/endograph/blob/main/docs/architecture.md" target="_blank" rel="noopener noreferrer">runtime architecture</a> before changing the
+code. It explains which components own each part of the runtime and how
+message delivery, inception, and recovery work.</p>
+<pre><code class="language-sh">bun install --frozen-lockfile
+bun test            # includes the end-to-end path: empty state dir → inception → a served request
+bunx tsc --noEmit
+bun link            # `endo` on PATH
+</code></pre>
+<p>The <a href="https://github.com/endograph/endograph/blob/main/docs/testing.md" target="_blank" rel="noopener noreferrer">testing docs</a> cover Linux sandbox CI and updating
+the Projector dependencies.</p>
+<p><code>@endograph/server</code> provides an HTTP Fetch handler for each machine. It
+authenticates callers and restricts reads to the intended recipient.
+The <a href="https://github.com/endograph/endograph/blob/main/docs/server.md" target="_blank" rel="noopener noreferrer">server docs</a> explain setup, caller identity checks,
+and notifications sent to specific recipients.</p>
+
+        <!-- readme:end -->
+      </div>
+    </div>
+  </section>
+</body>
+</html>

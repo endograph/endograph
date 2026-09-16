@@ -1,14 +1,18 @@
 # endograph
 
-Embedded agents on [projector](https://github.com/endograph/projector).
-An agent ships inside the system it tends, answers its peers, and is written
-by a coding agent from its owner's manifest.
+[Website](https://endograph.github.io/endograph/)
 
-**v3 rewrite in progress.** Read `docs/rewrite-plan.md` (what endograph is
-and the order it lands in), `docs/program.md` (the contract an inceptor
-reads), and `docs/v3-future.md` (designs deliberately held back).
+Endograph runs agents in your infrastructure, using
+[projector](https://github.com/endograph/projector). You give an agent a
+manifest describing its job and permissions for what it can access. A coding
+agent writes its program. Once running, it receives messages and develops
+its own tools and notes.
 
-## An agent is two files and a state directory
+The v3 rewrite is in progress. `docs/rewrite-plan.md` describes the scope
+and implementation order. `docs/program.md` defines the program contract
+used during inception. Deferred ideas are in `docs/v3-future.md`.
+
+## Agent files
 
 ```
 project/agents/endofrog/
@@ -24,42 +28,54 @@ project/agents/endofrog/
     inbox/  outbox/   #   the wire: one JSON file per message and reply
 ```
 
-`endo up` runs in the agent directory: it registers the agent, installs
-a launchd or systemd unit, and starts it. With no program it runs
-inception first: a coding agent (Claude Code or Codex) writes
-`program/agent.ts` from the manifest. Credentials go in an owner-managed `.env`
-beside `endograph.toml`; add it to your project’s `.gitignore`. Humans configure the agent through these owner
-files; they do not need to edit anything inside `.endo/`. Existing process
-environment variables take precedence over `.env`. If upgrading from the old
-layout, move `.endo/env` to `.env`; the old path is no longer loaded.
+Run `endo up` in the agent directory. It registers the agent, installs
+a launchd or systemd service, and starts it. If the agent has no program,
+Endograph runs inception first: a coding agent (Claude Code or Codex)
+writes `program/agent.ts` from your manifest.
 
-Endograph is the harness, the protocol, the program contract,
-procedures, and batteries. What an agent does is decided at inception.
+Put credentials in `.env` beside `endograph.toml` and add it to your
+project's `.gitignore`. Existing process environment variables take
+precedence over `.env`. If you're upgrading from the old layout, move
+`.endo/env` to `.env`; Endograph no longer loads the old path.
 
-Runtime inference can use the AI SDK executor or persistent Codex app-server
-threads. Set `[executor] backend = "codex"` to select the latter; see
-[`@endograph/codex-executor`](packages/codex-executor/README.md) for setup,
-session recovery, and its policy for retaining context across requests.
+Configure the agent through these owner files. You don't need to edit
+anything inside `.endo/`. Endograph handles running the program and
+delivering messages, and provides the program contract, procedures, and
+optional capabilities called batteries. Inception determines how the agent
+does its job.
 
-`endo snapshot <directory>` saves a restorable copy while the agent runs.
-See [persistence](docs/persistence.md) for its contents and SQLite
-rebuilding, and [sandboxing](docs/sandbox.md) for process policy and the
-`hostAction` API.
+## Model access
 
-`endo observatory` opens a live, read-only view on localhost. It puts the
-projector frame log beside the current machine state and the full inception
-history—what inputs changed, what shape was produced, the inceptor's brief,
-and the captured program and owner files. Pass `--agent <name|dir>` from
-elsewhere, `--port <n>` to choose the port, or `--no-open` to serve without
-opening a browser. The interface is React, bundled by Bun when the command
-starts. Its pinned React runtime installs lazily under
-`~/.endograph/observatory/` on the first launch, not into the agent or its
-application.
+The agent can use the AI SDK executor or persistent Codex app-server
+threads. To use Codex, set `[executor] backend = "codex"`. The
+[`@endograph/codex-executor`](packages/codex-executor/README.md) README
+explains setup, session recovery, and how context carries across requests.
+
+## Snapshots and inspection
+
+Run `endo snapshot <directory>` to save a restorable copy while the agent
+runs. The [persistence docs](docs/persistence.md) explain what the snapshot
+contains and how Endograph rebuilds SQLite. The
+[sandboxing docs](docs/sandbox.md) cover process permissions and the
+`hostAction` API for actions that run on the host.
+
+`endo observatory` opens a live, read-only view on localhost. You can inspect
+the Projector frame log, current machine state, and inception history. Each
+inception record includes the changed inputs, the resulting program
+structure, the coding agent's brief, and copies of the program and owner
+files.
+
+Use `--agent <name|dir>` to inspect an agent from another directory,
+`--port <n>` to choose a port, or `--no-open` to leave the browser closed.
+Bun bundles the React interface when the command starts. The first launch
+installs a pinned React runtime under `~/.endograph/observatory/`, outside
+the agent and its application.
 
 ## Develop
 
-Start with the [runtime architecture](docs/architecture.md) for component
-ownership, message delivery, inception, and recovery.
+Read the [runtime architecture](docs/architecture.md) before changing the
+code. It explains which components own each part of the runtime and how
+message delivery, inception, and recovery work.
 
 ```sh
 bun install --frozen-lockfile
@@ -68,9 +84,10 @@ bunx tsc --noEmit
 bun link            # `endo` on PATH
 ```
 
-See [verification](docs/testing.md) for Linux sandbox CI and keeping the
-Projector dependencies current.
+The [testing docs](docs/testing.md) cover Linux sandbox CI and updating
+the Projector dependencies.
 
-`@endograph/server` supplies a per-machine HTTP Fetch handler with authenticated
-admission and recipient-scoped reads. See [server architecture](docs/server.md)
-for identity, procedure caller checks, addressed notifications, and setup.
+`@endograph/server` provides an HTTP Fetch handler for each machine. It
+authenticates callers and restricts reads to the intended recipient.
+The [server docs](docs/server.md) explain setup, caller identity checks,
+and notifications sent to specific recipients.
