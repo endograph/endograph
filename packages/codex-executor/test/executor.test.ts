@@ -7,6 +7,7 @@ import { z } from "zod";
 import { CodexExecutor } from "../src/index.ts";
 import { CodexHost, type AppServer, type ServerMessage } from "../src/host.ts";
 import { type Json, type Projection } from "../src/protocol.ts";
+import { contextUpdate } from "../src/context.ts";
 
 class FakeServer implements AppServer {
   listeners = new Set<(m: ServerMessage) => void>();
@@ -102,6 +103,36 @@ test("successive activations reuse a thread, append state changes, and tolerate 
   const config = server.requests.find((r) => r.method === "thread/start")!.params.config;
   expect(config["mcp_servers.personal.enabled"]).toBe(false);
   expect(config["features.shell_tool"]).toBe(false);
+});
+
+test("oversized turn history keeps current context and newest messages under Codex's combined input limit", async () => {
+  const { executor, server } = setup();
+  const input = request("large-history", [
+    { type: "user", text: "old history " + "x".repeat(1 << 20) },
+    { type: "user", text: "recent observation" },
+    { type: "user", text: "check stout now" },
+  ]);
+  input.inference.recency = [{ type: "text", text: "Current state: no open deployment", slot: "state", volatile: true }];
+  await executor.run(input);
+  const text = server.requests.find(r => r.method === "turn/start")!.params.input.map((item: any) => item.text).join("");
+  expect(text.length).toBeLessThanOrEqual(1 << 20);
+  expect(text).toContain("Tend this system.");
+  expect(text).toContain("Current state: no open deployment");
+  expect(text).toContain("recent observation");
+  expect(text).toContain("check stout now");
+  expect(text).not.toContain("old history");
+  expect(JSON.parse(text.slice(text.indexOf("\n") + 1)).historyWindow.omittedMessages).toBe(1);
+  expect(input.inference.history).toHaveLength(3);
+});
+
+test("history window preserves a contiguous suffix and never truncates mandatory context or the newest message", () => {
+  const projection: Projection = { preamble: "[]", recency: "[]", tools: [],
+    history: [JSON.stringify({text:"old"}), JSON.stringify({text:"x".repeat(2000)}), JSON.stringify({text:"new"})] };
+  const update = JSON.parse(contextUpdate(projection, undefined, 800));
+  expect(update.history).toEqual([{text:"new"}]);
+  expect(update.historyWindow.omittedMessages).toBe(2);
+  expect(() => contextUpdate({...projection, preamble: JSON.stringify(["x".repeat(2000)])}, undefined, 800)).toThrow("standing context");
+  expect(() => contextUpdate({...projection, history: [JSON.stringify({text:"x".repeat(2000)})]}, undefined, 800)).toThrow("newest history message");
 });
 
 test("clean host restart resumes the thread; a different generator gets its own thread", async () => {

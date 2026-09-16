@@ -34,6 +34,12 @@ Each Projector generator gets one Codex thread, reused across activations.
 Projection is an intermediate representation, not a required exact transcript:
 
 - First use sends the standing context, visible history and action catalog.
+- Turn input respects Codex's combined one-million-character limit. If needed,
+  it keeps a contiguous suffix of recent history and explicitly reports the
+  omitted message count. Instructions, current state and action schemas are
+  preserved in full; oversized mandatory context or the newest message fails
+  explicitly. Omitted history remains in Endograph's durable log and is not
+  automatically resent on later turns.
 - Later turns append changed context and new history occurrences. State updates
   supersede older snapshots without rewriting the native conversation.
 - Two fixed dynamic tools list and invoke current actions. Adding/removing a

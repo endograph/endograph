@@ -147,8 +147,9 @@ export class CodexHost {
     const resultTask = completion.promise;
     void resultTask.catch(() => {});
     return this.step(active, signal, resultTask, async () => {
+      const prefix = `Endograph activation ${input.activationId}\n`;
       const result = await this.server.request("turn/start", { threadId: session.threadId,
-        input: [{ type: "text", text: `Endograph activation ${input.activationId}\n${contextUpdate(input.projection, session.cursor)}` }],
+        input: [{ type: "text", text: prefix + contextUpdate(input.projection, session.cursor, (1 << 20) - prefix.length) }],
         ...(this.options.effort ? { effort: this.options.effort } : {}), ...(input.outputSchema ? { outputSchema: input.outputSchema } : {}) });
       active.turnId ??= result.turn?.id;
     });
