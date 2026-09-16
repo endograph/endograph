@@ -56,6 +56,39 @@ test("failed inceptors preserve active files; manual editing happens in the cand
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("inceptor output streams before exit and remains intact in the round record", async () => {
+  const dir = scaffold();
+  const paths = pathsOf(dir);
+  const release = join(dir, "release");
+  const script = join(dir, "stream.ts");
+  const lines: string[] = [];
+  writeFileSync(script, `
+    import { existsSync } from "node:fs";
+    process.stdout.write("ready\\ncaf");
+    process.stderr.write("waiting\\n");
+    const deadline = Date.now() + 2000;
+    while (!existsSync(${JSON.stringify(release)})) {
+      if (Date.now() > deadline) process.exit(4);
+      await Bun.sleep(10);
+    }
+    const tail = Buffer.from("é tail");
+    process.stdout.write(tail.subarray(0, 1));
+    await Bun.sleep(10);
+    process.stdout.write(tail.subarray(1));
+    process.exit(3);
+  `);
+  try {
+    await expect(incept({ agentDir: dir, inceptor: `${process.execPath} ${script}`, log: line => {
+      lines.push(line);
+      if (line === "  | ready") writeFileSync(release, "continue");
+    } })).rejects.toThrow("exited 3");
+    expect(lines).toContain("  | café tail");
+    expect(lines).toContain("  | waiting");
+    expect(readFileSync(join(paths.inceptions, "1/rounds/1/stdout.txt"), "utf8")).toBe("ready\ncafé tail");
+    expect(readFileSync(join(paths.inceptions, "1/rounds/1/stderr.txt"), "utf8")).toBe("waiting\n");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("auto inception starts a fresh worker with revoked bash, new executor, cwd and inception mode", async () => {
   const dir = scaffold();
   const paths = pathsOf(dir);

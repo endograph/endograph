@@ -267,8 +267,26 @@ const dryStart = () => {
 async function runInceptor(command: string, prompt: string, cwd: string, log: (line: string) => void) {
   const started = Date.now();
   const child = Bun.spawn(["sh", "-c", `${command} "$0"`, prompt], { cwd, stdout: "pipe", stderr: "pipe", env: { ...process.env, FORCE_COLOR: "0" } });
-  const [exitCode, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
-  for (const line of `${stdout}\n${stderr}`.split("\n")) if (line.trim()) log(`  | ${line}`);
+  const capture = async (stream: ReadableStream<Uint8Array>) => {
+    const decoder = new TextDecoder();
+    let output = "";
+    let pending = "";
+    const append = (text: string) => {
+      output += text;
+      pending += text;
+      let end: number;
+      while ((end = pending.indexOf("\n")) !== -1) {
+        const line = pending.slice(0, end);
+        pending = pending.slice(end + 1);
+        if (line.trim()) log(`  | ${line}`);
+      }
+    };
+    for await (const chunk of stream) append(decoder.decode(chunk, { stream: true }));
+    append(decoder.decode());
+    if (pending.trim()) log(`  | ${pending}`);
+    return output;
+  };
+  const [exitCode, stdout, stderr] = await Promise.all([child.exited, capture(child.stdout), capture(child.stderr)]);
   return { stdout, stderr, exitCode, inceptorMs: Date.now() - started };
 }
 
