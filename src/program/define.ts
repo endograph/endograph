@@ -26,6 +26,7 @@ export interface GrantedActions {
   reply: AnyAction;
   compact: AnyAction;
   update_state: AnyAction;
+  threads: AnyAction;
 }
 
 /** What the program receives: the grant, narrowed. */

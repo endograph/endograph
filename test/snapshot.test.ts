@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, watch, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, watch, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { serializeInstance } from "@projectors/core";
@@ -10,7 +10,7 @@ import { incept, inceptionStatus } from "../src/inception/incept.ts";
 import { newId, readReply, writeMessage } from "../src/protocol/wire.ts";
 import { archivePath, commitNumbers } from "../src/store/archive.ts";
 import { snapshotAgent } from "../src/store/snapshot.ts";
-import { openSqliteStore } from "../src/store/sqlite.ts";
+import { checkpointCursor, checkpointPath, openSqliteStore, type AgentStore } from "../src/store/sqlite.ts";
 import { allFrames } from "../src/store/types.ts";
 import { answer, scripted } from "./fixtures/agent/scripted.ts";
 
@@ -45,9 +45,12 @@ test("CLI snapshots a live agent and restores code, evolved state, history and r
     writeFileSync(join(paths.src, "agent-note.md"), "A file written after inception.");
     mkdirSync(join(paths.state, "home"));
     writeFileSync(join(paths.state, "home", "memory"), "Persistent HOME data.");
-    writeFileSync(paths.env, "SNAPSHOT_SECRET=do-not-copy\n");
+    writeFileSync(join(source, ".env"), "SNAPSHOT_SECRET=do-not-copy\n");
+    writeFileSync(join(paths.state, "env"), "LEGACY_SECRET=do-not-copy\n");
     const instance = serializeInstance(agent.loaded.machine.instance, agent.loaded.charter);
     const replies = ids.map((id) => readReply(paths.outbox, id));
+    // A program-owned table travels with the database checkpoint, not the archive.
+    (agent.store as AgentStore).database.exec("CREATE TABLE app_notes (k TEXT PRIMARY KEY, v TEXT); INSERT INTO app_notes VALUES ('kept', 'program data');");
     ticker = setInterval(() => agent!.store.append({ type: "test", at: Date.now(), summary: "source still running" }), 5);
     const child = Bun.spawn([process.execPath, "run", join(ROOT, "src/cli/index.ts"), "snapshot", destination], { cwd: source, stdout: "pipe", stderr: "pipe" });
     const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
@@ -56,19 +59,25 @@ test("CLI snapshots a live agent and restores code, evolved state, history and r
     expect(stdout).toContain("snapshot through archive commit");
     expect(isLocked(paths.lock)).toBe(true);
     const saved = pathsOf(destination);
-    for (const file of [saved.db, `${saved.db}-wal`, saved.lock, saved.env, saved.modules, saved.outbox]) expect(existsSync(file)).toBe(false);
+    for (const file of [saved.db, `${saved.db}-wal`, saved.lock, join(destination, ".env"), join(saved.state, "env"), saved.modules, saved.outbox]) expect(existsSync(file)).toBe(false);
     expect(readFileSync(saved.program, "utf8")).toBe(readFileSync(paths.program, "utf8"));
     expect(readFileSync(join(saved.src, "agent-note.md"), "utf8")).toBe("A file written after inception.");
     expect(readFileSync(join(saved.state, "home", "memory"), "utf8")).toBe("Persistent HOME data.");
+    // The copied archive ends exactly where the captured database stands; the
+    // source keeps its own checkpoint for portable copies of the directory.
     const cutoff = commitNumbers(archivePath(saved.db)).at(-1)!;
+    expect(stdout).toContain(`snapshot through archive commit ${cutoff}`);
+    expect(checkpointCursor(checkpointPath(saved.db)).commit).toBe(cutoff);
+    expect(readFileSync(checkpointPath(saved.db))).toEqual(readFileSync(checkpointPath(paths.db)));
     agent.store.append({ type: "test", at: Date.now(), summary: "after snapshot" });
     expect(commitNumbers(archivePath(paths.db)).at(-1)!).toBeGreaterThan(cutoff);
     await agent.stop(); agent = undefined;
 
-    // Opening the saved directory recreates SQLite and the outbox, using only
-    // copied files. The normal loader must not need another inception.
+    // Opening the saved directory starts SQLite from the checkpoint and recreates
+    // the outbox, using only copied files. The normal loader must not need another inception.
     expect((await inceptionStatus(saved)).n).toBe(1);
     agent = await openAgent({ agentDir: destination, executor: scripted(answer) });
+    expect((agent.store as AgentStore).database.query("SELECT v FROM app_notes").all()).toEqual([{ v: "program data" }]);
     expect(serializeInstance(agent.loaded.machine.instance, agent.loaded.charter)).toEqual(instance);
     expect(ids.map((id) => readReply(saved.outbox, id))).toEqual(replies);
     const frames = [...allFrames(agent.store)];
@@ -129,12 +138,14 @@ test("snapshot discards its temporary copy when source files change during captu
   try {
     await incept({ agentDir: source, inceptor: "true" });
     writeFileSync(note, "before");
-    // Archive copying gives the parent time to change a file after the child's
-    // initial hash and before its final check. No sleeps or production hooks.
+    // Checkpointing and copying a multi-segment archive gives the parent time to
+    // change a file after the child's initial hash and before its final check.
+    // No sleeps or production hooks.
     const store = openSqliteStore(paths.db);
     try {
-      for (let i = 0; i < 100; i++) store.append({ type: "test", at: Date.now(), summary: String(i) });
+      for (let i = 0; i < 120; i++) store.append({ type: "test", at: Date.now(), summary: String(i), payload: { bulk: "x".repeat(150 * 1024) } });
     } finally { store.close(); }
+    expect(readdirSync(archivePath(paths.db)).filter((name) => name.endsWith(".jsonl")).length).toBeGreaterThan(1);
     let edited = false;
     watcher = watch(root, (_event, name) => {
       if (!edited && name?.toString().startsWith(".saved-")) {

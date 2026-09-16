@@ -216,3 +216,25 @@ test("a program that does not load is recorded as a frame and in status.json; th
   expect(loadFailure(paths2)).toBeNull();
   await agent.stop();
 });
+
+test("a thread request queued by a client is served once and stays in that discussion after restart", async () => {
+  const { agentQuery } = await import("../src/client.ts");
+  const dir = scaffold({ procedures: false });
+  let agent: Agent | undefined;
+  try {
+    await agentQuery(dir, { op: "threads.create", id: "discussion", title: "Arithmetic" });
+    const request = { op: "messages.send", id: newId(), threadId: "discussion", text: "2+2?" };
+    await agentQuery(dir, request);
+    agent = await openAgent({ agentDir: dir, executor: scripted(answer) });
+    await agent.poll();
+    expect(readReply(agent.paths.outbox, request.id)).toMatchObject({ ok: true, text: "4" });
+    await agent.stop(); agent = undefined;
+    await agentQuery(dir, request);
+    agent = await openAgent({ agentDir: dir, executor: scripted(answer) });
+    await agent.poll();
+    const page = await agentQuery(dir, { op: "messages.list", threadId: "discussion" }) as any;
+    expect(page.messages.map((m: any) => m.kind)).toEqual(["request", "reply"]);
+    expect(page.messages[1]).toMatchObject({ threadId: "discussion", text: "4" });
+    expect(JSON.stringify([...allFrames(agent.store)])).toContain("thread=discussion");
+  } finally { await agent?.stop(); rmSync(dir, { recursive: true, force: true }); }
+});

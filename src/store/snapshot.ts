@@ -1,14 +1,19 @@
 import { createHash } from "node:crypto";
-import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, copyFileSync, existsSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { pathsOf } from "../harness/paths.ts";
-import { archivePath, commitNumbers, publishCommit, readCommit } from "./archive.ts";
+import { archivePath, checkpointPath, copyArchive, readAfter, START } from "./archive.ts";
+import { checkpointCursor, checkpointStore } from "./sqlite.ts";
 
-// Runtime files are either rebuilt, in flight, machine-local, or credentials.
-const LOCAL = new Set(["frames", "agent.db", "agent.db-wal", "agent.db-shm", "lock", "lock-journal", "env", "endo.log", "status.json", "inbox", "outbox", "runs", "tmp", "candidate", "workspace", "node_modules", ".git", "codex"]);
+// Runtime files are either rebuilt, in flight, machine-local, credentials, or produced by the capture itself.
+const LOCAL = new Set(["frames", "agent.db", "agent.db-wal", "agent.db-shm", "checkpoint.db", "lock", "lock-journal", "env", "endo.log", "status.json", "inbox", "outbox", "runs", "tmp", "candidate", "workspace", "node_modules", ".git", "codex"]);
 const changed = () => new Error("agent files changed while copying; retry snapshot when code and owner files are stable");
 
-/** Copy a fixed archive prefix and stable agent files. Never opens the live database. */
+/**
+ * Capture a consistent agent: a database checkpoint, the archive through the
+ * commit that checkpoint stands at, and the stable agent files. The live
+ * database is read only to write the checkpoint; the copy never opens it.
+ */
 export function snapshotAgent(agentDir: string, destination: string): { directory: string; commit: number } {
   const source = realpathSync(agentDir);
   const paths = pathsOf(source);
@@ -21,26 +26,30 @@ export function snapshotAgent(agentDir: string, destination: string): { director
   if (!existsSync(paths.program)) throw new Error("no agent program to snapshot; run endo up first");
   const promotion = join(paths.state, "promotion.json");
   if (existsSync(promotion)) throw new Error("inception promotion is unfinished; complete or recover it before taking a snapshot");
+  if (!existsSync(archivePath(paths.db))) throw new Error("no frame archive to snapshot; run endo up first");
 
   const before = files(source);
-  const archive = archivePath(paths.db);
-  const commits = commitNumbers(archive);
-  if (!commits.length) throw new Error("no frame archive to snapshot; run endo up first");
   const residence = existsSync(paths.status) ? readFileSync(paths.status) : undefined;
   const temporary = mkdtempSync(join(dirname(directory), `.${basename(directory)}-`));
   try {
+    // The checkpoint is taken after the index catches up with the archive, so
+    // the archive prefix copied below is exactly what the checkpoint indexes.
+    checkpointStore(paths.db);
     // Copy using the same walk as the stability check: additions, removals and
     // edits all invalidate the result, while frame appends may continue freely.
     if (files(source, temporary) !== before) throw changed();
     const target = pathsOf(temporary);
-    const targetArchive = archivePath(target.db);
-    mkdirSync(targetArchive, { recursive: true });
+    copyFileSync(checkpointPath(paths.db), checkpointPath(target.db));
+    // Another snapshot may replace the source checkpoint. Use the position in
+    // our own immutable copy, never a position read before copying it.
+    const cursor = checkpointCursor(checkpointPath(target.db));
+    if (!cursor.commit) throw new Error("no frame archive to snapshot; run endo up first");
+    copyArchive(archivePath(paths.db), archivePath(target.db), cursor);
     let programHash: string | undefined;
-    for (const commit of commits) {
-      const record = readCommit(archive, commit);
+    const copied = readAfter(archivePath(target.db), START, (record) => {
       for (const frame of record.frames) if (frame.type === "inception") programHash = (frame.payload as { program: string }).program;
-      publishCommit(targetArchive, record);
-    }
+    });
+    if (copied.torn || copied.cursor.commit !== cursor.commit) throw new Error(`copied frame archive ends at commit ${copied.cursor.commit}, not the checkpoint's ${cursor.commit}`);
     if (programHash && createHash("sha256").update(readFileSync(target.program)).digest("hex").slice(0, 16) !== programHash)
       throw new Error("program differs from the captured inception; restore the recorded program or run endo incept before snapshotting");
     if (files(source) !== before || existsSync(promotion)) throw changed();
@@ -50,7 +59,7 @@ export function snapshotAgent(agentDir: string, destination: string): { director
     if (lstatSync(directory, { throwIfNoEntry: false })) throw new Error(`snapshot destination already exists: ${directory}`);
     renameSync(temporary, directory);
     sync(dirname(directory));
-    return { directory, commit: commits.at(-1)! };
+    return { directory, commit: cursor.commit };
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }
@@ -61,7 +70,7 @@ function files(root: string, destination?: string): string {
   const hash = createHash("sha256");
   function walk(path: string): void {
     const name = relative(root, path);
-    if (name === ".git" || name === "node_modules") return;
+    if (name === ".env" || name === ".git" || name === "node_modules") return;
     if (dirname(name) === ".endo" && LOCAL.has(basename(name))) return;
     const stat = lstatSync(path);
     if (stat.isSymbolicLink() || (!stat.isFile() && !stat.isDirectory())) throw new Error(`snapshot requires ordinary files and directories: ${name}`);

@@ -18,7 +18,9 @@
   "exports": {
     ".": "./src/index.ts",
     "./procedure": "./src/procedures/lib.ts",
-    "./protocol": "./src/protocol/wire.ts"
+    "./protocol": "./src/protocol/wire.ts",
+    "./client": "./src/client.ts",
+    "./store": "./src/store/sqlite.ts"
   },
   "scripts": {
     "test": "bun test",

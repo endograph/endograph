@@ -9,6 +9,7 @@ import { loadAgent, LoadError, type Loaded } from "../program/load.ts";
 import { createRuns, type Runs, type RunRequest } from "../procedures/runs.ts";
 import { atomicWrite, isMessage, isTerminal, newId, PROTOCOL_VERSION, writeReply, type CallMessage, type Delivered, type Message, type Reply, type ReplyState, type RequestMessage } from "../protocol/wire.ts";
 import { openSqliteStore, StoreRecoveryRequired } from "../store/sqlite.ts";
+import { threadStore } from "../store/threads.ts";
 import { allFrames, type FrameInput, type FrameStore } from "../store/types.ts";
 import { endoMeta, firstLine, frameInputOf } from "./frames.ts";
 import { acquireLock } from "./lock.ts";
@@ -78,7 +79,7 @@ export class NoProgram extends Error {}
 export class HeldElsewhere extends Error {}
 
 const REQUEST_HEADER = (m: Delivered<RequestMessage>) =>
-  `[request id=${m.id} from=${m.from}${m.ref ? ` ref=${m.ref}` : ""}${m.origin ? ` origin=${m.origin}` : ""}]`;
+  `[request id=${m.id} from=${m.from}${m.thread ? ` thread=${m.thread}` : ""}${m.ref ? ` ref=${m.ref}` : ""}${m.origin ? ` origin=${m.origin}` : ""}]`;
 
 export async function openAgent(opts: OpenOptions): Promise<Agent> {
   const paths = pathsOf(resolve(opts.agentDir));
@@ -101,6 +102,8 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
     let persistenceFailed = (error: StoreRecoveryRequired) => { persistenceFailure = error; };
     const store = openSqliteStore(paths.db, { onRecoveryRequired: (error) => persistenceFailed(error) });
     closeStore = () => store.close();
+    const threads = threadStore(store);
+    threads.list(); // Rebuild recorded thread indexes and queued requests when restoring.
     const executor = opts.executor ?? bindings.executor.create();
     const activationTimeoutMs = opts.activationTimeoutMs ?? 2 * 60 * 60 * 1000;
 
@@ -223,6 +226,7 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
       { name, cwd, charter: () => loaded.charter },
       {
         reply,
+        threads,
         stateSchema: (key) => {
           const descriptor = loaded.charter.states[key];
           return descriptor ? normalizeSchema(descriptor.schema).jsonSchema() : undefined;

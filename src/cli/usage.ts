@@ -11,7 +11,7 @@ Any process that can write a file is a client; \`endo\` is the convenience.
 \`~/.endograph/agents/\`, or a directory holding \`endograph.toml\`); without
 it, the current directory must be the agent directory.
 
-    endo --agent <name> send [--id <id>] [--ref <r>] [--wait] <text>
+    endo --agent <name> send [--id <id>] [--ref <r>] [--thread <id>] [--wait] <text>
     endo --agent <name> call [--wait] <procedure> KEY=VAL ...
     endo --agent <name> wait <id>
     endo --agent <name> commands
@@ -23,6 +23,7 @@ it, the current directory must be the agent directory.
   overrides; nothing when not in a git repository). \`--wait\` blocks for
   the terminal reply instead and prints its text. \`--id\` supplies the id
   (a retried job with the same id is delivered once).
+- \`--thread\` attaches a request to a persistent discussion independently of its topic ref.
 - \`call\` runs an exposed procedure without waking the model and prints
   its first reply (the ack, or the result); \`--wait\` waits for the
   terminal reply. Unknown or unexposed names are rejected with the list of
@@ -56,12 +57,13 @@ owner:
   endo observatory [--port <n>] [--no-open]   open a live, read-only localhost view of projector and inception
   endo charter                                the provisions as the inceptor sees them
   endo replay [<id>] | endo why <id>          the frame log, or the frames about one request or call
-  endo snapshot <directory>                  copy durable agent files and a fixed archive prefix while running
+  endo snapshot <directory>                  save a checkpoint database, durable files, and matching archive prefix
+  endo api                                   read a JSON operation from stdin; threads, messages, frames, and status
   endo reset [--force]                        remove .endo: the next up incepts a fresh agent
   endo                                        list registered agents
 
 consumer (see CLI.md in an inception workspace):
-  endo [--agent <name|dir>] send [--id <id>] [--ref <r>] [--wait] <text>
+  endo [--agent <name|dir>] send [--id <id>] [--ref <r>] [--thread <id>] [--wait] <text>
   endo [--agent <name|dir>] call [--wait] <procedure> KEY=VAL ...
   endo [--agent <name|dir>] wait <id>
   endo [--agent <name|dir>] commands

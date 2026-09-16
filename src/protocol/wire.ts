@@ -36,8 +36,10 @@ interface Envelope {
   agent?: string;
   /** Client-asserted context (a worktree path). Unverified. */
   origin?: string;
-  /** The thread key: what the message is about (a sha, a path, an issue). Follow-ups repeat it. */
+  /** Subject context: what the message is about (a sha, a path, an issue). Follow-ups repeat it. */
   ref?: string;
+  /** Persistent discussion identity; independent of sender identity and topic ref. */
+  thread?: string;
   at: number;
 }
 
@@ -99,9 +101,10 @@ export function isMessage(value: unknown): value is Message {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const m = value as Record<string, unknown>;
   if (m.v !== PROTOCOL_VERSION || typeof m.id !== "string" || !ID.test(m.id) || typeof m.at !== "number" || !Number.isFinite(m.at)) return false;
-  for (const key of ["origin", "ref", "run", "agent"]) if (m[key] !== undefined && typeof m[key] !== "string") return false;
+  for (const key of ["origin", "ref", "run", "agent", "thread"]) if (m[key] !== undefined && typeof m[key] !== "string") return false;
   for (const key of ["from", "to"]) if (m[key] !== undefined && !isIdentity(m[key])) return false;
   if (m.cause !== undefined && (typeof m.cause !== "string" || !ID.test(m.cause))) return false;
+  if (m.thread !== undefined && (typeof m.thread !== "string" || !ID.test(m.thread))) return false;
   if (m.kind === "notification") return isIdentity(m.to) && typeof m.text === "string";
   if (m.run !== undefined && !ID.test(m.run as string)) return false;
   if (m.agent !== undefined && !/^[a-z][a-z0-9]*(-[a-z0-9]+)*$/.test(m.agent as string)) return false;

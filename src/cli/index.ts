@@ -34,6 +34,7 @@ interface Flags {
   template?: string;
   id?: string;
   ref?: string;
+  thread?: string;
   rest: string[];
 }
 
@@ -57,6 +58,8 @@ function parse(argv: string[]): { command: string; flags: Flags } {
     else if (a === "--template") flags.template = argv[++i];
     else if (a === "--id") flags.id = argv[++i];
     else if (a === "--ref") flags.ref = argv[++i];
+    else if (a === "--thread") flags.thread = argv[++i];
+    else if (a === "--") { flags.rest.push(...argv.slice(i + 1)); break; }
     else if (!command) command = a;
     else flags.rest.push(a);
   }
@@ -268,7 +271,7 @@ async function send(flags: Flags): Promise<number> {
   if (!paths) return 1;
   const id = flags.id ?? newId();
   const caller = callerContext();
-  writeMessage(paths.inbox, { v: PROTOCOL_VERSION, kind: "request", id, text, origin: caller.origin, ref: flags.ref ?? caller.ref, at: Date.now() });
+  writeMessage(paths.inbox, { v: PROTOCOL_VERSION, kind: "request", id, text, origin: caller.origin, ref: flags.ref ?? caller.ref, thread: flags.thread, at: Date.now() });
   await noteIfDown(paths);
   if (!flags.wait) {
     say(id);
@@ -449,7 +452,7 @@ async function doctor(flags: Flags): Promise<number> {
     if (existsSync(join(paths.state, ".git"))) note(true, "state directory is a git checkout");
     const { loadEnv } = await import("../harness/env.ts");
     const keys = loadEnv(paths);
-    note(true, keys.length ? `env: ${keys.join(", ")}` : "env: no .endo/env (credentials must come from the environment)");
+    note(true, keys.length ? `env: ${keys.join(", ")}` : "env: no .env (credentials must come from the environment)");
     if (existsSync(paths.program)) {
       const status = await inceptionStatus(paths);
       const validation = await validateProgram({ paths, grant: await host.grant(), loadRuntime: host.loadRuntime });
@@ -496,13 +499,23 @@ function openBrowser(url: string): void {
   } catch {}
 }
 
+async function apiCommand(flags: Flags): Promise<number> {
+  const paths = target(flags);
+  if (!paths) return 1;
+  const text = await Bun.stdin.text();
+  if (text.length > 65536) throw new Error("API input is too large");
+  const { agentQuery } = await import("../client.ts");
+  console.log(JSON.stringify(await agentQuery(paths.agentDir, JSON.parse(text))));
+  return 0;
+}
+
 function usage(): number {
   console.error(USAGE);
   return 2;
 }
 
 const { command, flags } = parse(process.argv.slice(2));
-const handlers: Record<string, (f: Flags) => Promise<number>> = { up, down, logs, incept: inceptCommand, send, call, wait, commands, status, charter, replay, why, snapshot, reset, doctor, observatory };
+const handlers: Record<string, (f: Flags) => Promise<number>> = { api: apiCommand, up, down, logs, incept: inceptCommand, send, call, wait, commands, status, charter, replay, why, snapshot, reset, doctor, observatory };
 const run = command ? handlers[command] : listAgents;
 if (!run) process.exit(usage());
 run(flags).then(

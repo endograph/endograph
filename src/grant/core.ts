@@ -1,5 +1,6 @@
 import { actionResult, createAction, type AnyAction, type StateUpdate } from "@projectors/core";
 import { z } from "zod";
+import type { threadStore } from "../store/threads.ts";
 import type { ReplyState } from "../protocol/wire.ts";
 import type { BatteryContext } from "./grant.ts";
 import type { RuntimeBindings } from "./bind.ts";
@@ -17,6 +18,7 @@ export interface CoreRuntime {
   reply(id: string, reply: { ok: boolean; state: ReplyState; text: string }): string | null;
   /** The JSON Schema of a declared state, so a rejected write can say what would have been accepted. */
   stateSchema?(key: string): Record<string, unknown> | undefined;
+  threads?: ReturnType<typeof threadStore>;
 }
 
 const REPLY_STATES = ["completed", "failed", "rejected", "input-required", "working"] as const satisfies readonly ReplyState[];
@@ -46,11 +48,9 @@ export function coreActions(runtime: CoreRuntime): AnyAction[] {
     state: null,
     name: "compact",
     description:
-      "Bound your history: everything before this call leaves your view and the " +
-      "summary you give takes its place. Older frames stay in the log. Write what " +
-      "a successor needs and cannot get elsewhere: open requests by id and what is " +
-      "owed, what was learned and is not yet in a state or a file. Do not restate " +
-      "what a state already holds.",
+      "Record a horizon and summary for your projected history. Older frames remain " +
+      "in the log and state values are unchanged. This does not reset a persistent " +
+      "executor conversation.",
     inputSchema: z.object({ summary: z.string().min(1) }),
     run: ({ summary }) =>
       actionResult({
@@ -101,7 +101,24 @@ export function coreActions(runtime: CoreRuntime): AnyAction[] {
     },
   });
 
-  return [reply, compact, updateState];
+  const threads = createAction({
+    state: null,
+    name: "threads",
+    description: "Create, read, or update persistent discussion threads. Thread identity groups messages; it does not isolate memory or decide access. Metadata is yours to organize.",
+    inputSchema: z.object({ op: z.enum(["list", "get", "create", "update", "messages"]), id: z.string().optional(), title: z.string().optional(), archived: z.boolean().optional(), metadata: z.record(z.string(), z.unknown()).optional(), before: z.number().optional(), limit: z.number().optional() }),
+    run: ({ op, id, title, archived, metadata, before, limit }) => {
+      if (!runtime.threads) return actionResult({ success: false, error: "Threads are unavailable during program validation" });
+      try {
+        if (op === "list") return runtime.threads.list();
+        if (op === "create") return runtime.threads.create({ id, title, metadata });
+        if (!id) throw new Error("Thread ID is required");
+        if (op === "get") return runtime.threads.get(id);
+        if (op === "messages") return runtime.threads.messages({ threadId: id, before, limit });
+        return runtime.threads.update(id, { title, archived, metadata });
+      } catch (error) { return actionResult({ success: false, error: error instanceof Error ? error.message : String(error) }); }
+    },
+  });
+  return [reply, compact, updateState, threads];
 }
 
 /** Everything the grant puts in the charter: core, then each battery's. Names must not collide. */
