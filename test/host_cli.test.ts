@@ -20,7 +20,7 @@ test("CLI sandbox denies direct HTTP while its selected host action reaches the 
   const endpoint = `http://127.0.0.1:${service.port}`;
   const unsafeImport = join(dir, "generated-code-imported-in-parent");
   const env = { ...process.env, ENDOGRAPH_HOME: join(dir, "registry") };
-  writeFileSync(paths.env, "ENDO_SERVICE_SECRET=parent-only-token\n");
+  writeFileSync(join(dir, ".env"), "ENDO_SERVICE_SECRET=parent-only-token\n");
   writeFileSync(paths.grant, `name="host-cli"
 batteries=[]
 host_actions=["sentryApi"]

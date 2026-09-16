@@ -69,7 +69,7 @@ test("OS sandbox confines agent and descendants while preserving private IPC and
     const denyOpenWrite = (path) => denied(() => { const fd = openSync(path, "r+"); closeSync(fd); });
     writeFileSync(${JSON.stringify(join(paths.src, "allowed.txt"))}, "allowed");
     writeFileSync(process.env.TMPDIR + "/private-temp.txt", "temp");
-    const child = spawnSync(process.execPath, ["--eval", ${JSON.stringify(`${directNetwork}
+    const child = spawnSync(process.execPath, ["--no-env-file", "--eval", ${JSON.stringify(`${directNetwork}
       import { readFileSync } from "node:fs";
       let denied = false; try { denied = !readFileSync(${JSON.stringify(paths.env)}, "utf8").includes("PRIVATE_KEY=secret"); } catch { denied = true; }
       console.log(JSON.stringify({ networkDenied, secretDenied: denied, credentialPresent: !!process.env.ENDO_TEST_SECRET }));`)}], { encoding: "utf8", timeout: 5000 });
@@ -80,6 +80,8 @@ test("OS sandbox confines agent and descendants while preserving private IPC and
       credentialPresent: !!process.env.ENDO_TEST_SECRET, allowedEnv: process.env.ENDO_TEST_ALLOWED,
       javaSecretPresent: (process.env.JAVA_TOOL_OPTIONS ?? "").includes("outer-only-token"), privateTemp: process.env.TMPDIR,
       envDenied: unavailable(${JSON.stringify(paths.env)}, "PRIVATE_KEY=secret"),
+      codexDenied: unavailable(${JSON.stringify(join(paths.state, "codex/session.json"))}, "private-session"),
+      codexWriteDenied: denied(() => writeFileSync(${JSON.stringify(join(paths.state, "codex/injected.json"))}, "bad")),
       hostDenied: denied(() => readFileSync(${JSON.stringify(join(dir, "host/action.ts"))})),
       hostHelperWriteDenied: denyOpenWrite(${JSON.stringify(join(dir, "host/helper.ts"))}),
       outsideDenied: denied(() => readFileSync(${JSON.stringify(join(directory, "outside.txt"))})),
@@ -97,6 +99,7 @@ test("OS sandbox confines agent and descendants while preserving private IPC and
       await expect(sandboxCommand(paths, { ...grant, hostModules: [module] }, [process.execPath, "run", probe])).rejects.toThrow("dedicated owner directory");
     }
     const wrapped = await sandboxCommand(paths, grant, [process.execPath, "run", probe]);
+    writeFileSync(join(paths.state, "codex/session.json"), "private-session");
     expect(wrapped.env.ENDO_TEST_SECRET).toBeUndefined();
     expect(wrapped.env.ENDO_TEST_ALLOWED).toBe("explicitly-permitted");
     child = spawn(wrapped.argv[0]!, wrapped.argv.slice(1), { cwd: dir, env: wrapped.env, stdio: ["ignore", "pipe", "pipe", "pipe", "pipe"] });
@@ -115,7 +118,7 @@ test("OS sandbox confines agent and descendants while preserving private IPC and
     expect(result).toMatchObject({
       runtimeImported: true, networkDenied: true, unixDenied: true, httpDenied: true, credentialPresent: false, allowedEnv: "explicitly-permitted",
       javaSecretPresent: false, privateTemp: join(paths.state, "tmp"),
-      envDenied: true, hostDenied: true, hostHelperWriteDenied: true, outsideDenied: true, outsideWriteDenied: true,
+      envDenied: true, codexDenied: true, codexWriteDenied: true, hostDenied: true, hostHelperWriteDenied: true, outsideDenied: true, outsideWriteDenied: true,
       grantWriteDenied: true, programWriteDenied: true, runtimeWriteDenied: true, allowedWrite: "allowed", childExit: 0,
     });
     expect(JSON.parse(result.child)).toEqual({ networkDenied: true, secretDenied: true, credentialPresent: false });

@@ -46,9 +46,11 @@ uses the restrictive defaults shown above.
 | `write` | Extra writable paths. The state directory is writable by default; owner inputs, program, host implementations, and runtime code remain protected. |
 | `env` | Extra environment variables forwarded from the outer process. A small runtime baseline is supplied, with private HOME and TMPDIR under the state directory. |
 
-The worker cannot read `.endo/env`. The outer process loads that file;
-provider keys and host-action credentials stay there unless the owner
-explicitly forwards a variable. Model traffic uses IPC even with
+The worker cannot read or write the owner’s `.env` beside `endograph.toml`.
+The outer process loads that file, and provider keys and host-action
+credentials stay in that process unless the owner explicitly forwards a
+variable. Bun workers and procedure subprocesses disable automatic `.env`
+loading. Model traffic uses IPC even with
 `network = "offline"`; granting it does not grant arbitrary HTTP access.
 Custom executor modules execute inside the worker and must fit its network
 and environment policy.

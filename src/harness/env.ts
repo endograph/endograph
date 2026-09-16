@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import type { Paths } from "./paths.ts";
 
 /**
- * `.endo/env`: KEY=VALUE lines, one per credential the agent's executor
+ * Owner-managed `.env` beside endograph.toml: KEY=VALUE lines, one per credential the agent's executor
  * and procedures need (OPENAI_API_KEY, deploy keys). Loaded into the
  * process environment when the agent starts, foreground or service, so a
  * unit never holds a secret. Existing environment wins over the file.

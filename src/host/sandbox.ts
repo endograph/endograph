@@ -10,6 +10,9 @@ const canonical = (path: string) => existsSync(path) ? realpathSync(path) : path
 
 /** One policy per outer process. Every program import and descendant runs under it. */
 export async function sandboxCommand(paths: Paths, grant: Grant, argv: string[]): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }> {
+  // Credentials are loaded explicitly by the host. Bun must not reload the
+  // owner .env inside workers, where the file is intentionally unreadable.
+  if (argv[0] === process.execPath) argv = [argv[0], "--no-env-file", ...argv.slice(1)];
   if (!grant.sandbox) return { argv, env: { ...process.env } };
   const policy = grant.sandbox;
   const forwarded = new Set(["PATH", "USER", "LANG", "TERM", ...policy.env]);
@@ -28,6 +31,8 @@ export async function sandboxCommand(paths: Paths, grant: Grant, argv: string[])
   const temp = join(paths.state, "tmp");
   mkdirSync(home, { recursive: true });
   mkdirSync(temp, { recursive: true });
+  // Linux needs an existing directory to mask before mounting the read-only tree.
+  mkdirSync(join(paths.state, "codex"), { recursive: true, mode: 0o700 });
   const runtime = [ENDOGRAPH_ROOT, dirname(canonical(process.execPath)),
     dirname(fileURLToPath(import.meta.resolve("@endograph/codex-executor"))),
     dirname(fileURLToPath(import.meta.resolve("@projectors/core"))),

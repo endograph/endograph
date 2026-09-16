@@ -149,7 +149,7 @@ export function createRuns(opts: {
       let child: ReturnType<typeof spawn>;
       try {
         stderr = openSync(file(id, "err"), "w");
-        child = spawn(process.execPath, ["run", spec.file], {
+        child = spawn(process.execPath, ["--no-env-file", "run", spec.file], {
           cwd,
           detached: true,
           stdio: ["ignore", stdout, stderr],

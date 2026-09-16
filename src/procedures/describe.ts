@@ -88,7 +88,7 @@ const DESCRIBE_TIMEOUT_MS = 30_000;
 async function describeInProcess(files: string[], temp: string): Promise<Map<string, { meta?: ProcedureMeta; error?: string }>> {
   mkdirSync(temp, { recursive: true });
   const out = join(temp, `endo-describe-${crypto.randomUUID()}.jsonl`);
-  const child = spawn(process.execPath, ["run", DESCRIBER, out, ...files], { stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, FORCE_COLOR: "0" } });
+  const child = spawn(process.execPath, ["--no-env-file", "run", DESCRIBER, out, ...files], { stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, FORCE_COLOR: "0" } });
   let stderr = "";
   child.stderr?.on("data", (d: Buffer) => (stderr += d.toString()));
   const timer = setTimeout(() => child.kill("SIGKILL"), DESCRIBE_TIMEOUT_MS);

@@ -11,7 +11,7 @@ export interface Paths {
   modules: string;
   lock: string;
   db: string;
-  /** KEY=VALUE credentials, mode 600; loaded at start. */
+  /** Owner-managed `.env` beside endograph.toml; KEY=VALUE credentials loaded at start. */
   env: string;
   log: string;
   program: string;
@@ -37,7 +37,7 @@ export function pathsOf(agentDir: string): Paths {
     modules: join(state, "node_modules"),
     lock: join(state, "lock"),
     db: join(state, "agent.db"),
-    env: join(state, "env"),
+    env: join(agentDir, ".env"),
     log: join(state, "endo.log"),
     program: join(state, "program", "agent.ts"),
     src: join(state, "src"),
@@ -56,7 +56,7 @@ export function pathsOf(agentDir: string): Paths {
 export const ENDOGRAPH_ROOT = resolve(import.meta.dir, "../..");
 
 /**
- * The agent directory holds the owner's two files and nothing else. The
+ * The agent directory holds the owner's configuration, manifest, and credentials. The
  * one dependency the program and the procedures need is the package
  * linked here by `endo up`, so they resolve upward to it; a tsconfig
  * beside the link lets an editor and `bunx tsc` do the same.

@@ -14,8 +14,9 @@ reads), and `docs/v3-future.md` (designs deliberately held back).
 project/agents/endofrog/
   endograph.toml      # owner grant, executor, batteries, host actions, sandbox policy
   manifest.md         # the owner's intent, in prose (or inline in the grant under [manifest])
+  .env                # owner credentials, gitignored; loaded by the host
   host/               # optional owner-managed host action modules
-  .endo/              # gitignored; everything the agent is
+  .endo/              # agent-managed state and local runtime files
     frames/           #   immutable frame commits and instance checkpoints
     agent.db          #   rebuildable indexes and transactional runtime inbox
     program/agent.ts  #   the program, written at inception
@@ -26,7 +27,13 @@ project/agents/endofrog/
 `endo up` runs in the agent directory: it registers the agent, installs
 a launchd or systemd unit, and starts it. With no program it runs
 inception first: a coding agent (Claude Code or Codex) writes
-`program/agent.ts` from the manifest. Credentials go in `.endo/env`. Endograph is the harness, the protocol, the program contract,
+`program/agent.ts` from the manifest. Credentials go in an owner-managed `.env`
+beside `endograph.toml`; add it to your project’s `.gitignore`. Humans configure the agent through these owner
+files; they do not need to edit anything inside `.endo/`. Existing process
+environment variables take precedence over `.env`. If upgrading from the old
+layout, move `.endo/env` to `.env`; the old path is no longer loaded.
+
+Endograph is the harness, the protocol, the program contract,
 procedures, and batteries. What an agent does is decided at inception.
 
 Runtime inference can use the AI SDK executor or persistent Codex app-server

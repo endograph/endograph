@@ -1,3 +1,4 @@
 node_modules/
 .endo/
 *.log
+.env
