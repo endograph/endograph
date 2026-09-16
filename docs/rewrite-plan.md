@@ -78,12 +78,12 @@ inception with a baseline), rule, match, policy (future).
 ## 3. Layout
 
 ```
-project-repo/agents/endofrog/     # AGENT DIRECTORY (two files; usually committed; git never required)
+project-repo/agents/endofrog/     # AGENT DIRECTORY (owner inputs; git never required)
   endograph.toml                  #   the GRANT
   manifest.md                     #   the MANIFEST
-  .endo/                          #   STATE DIRECTORY (gitignored; everything the agent is)
+  .env                            #   owner credentials (mode 600), gitignored, loaded at start
+  .endo/                          #   STATE DIRECTORY (durable agent state plus local runtime files)
     .gitignore                    #     local DB, lock, node_modules exclusions; written once
-    env                           #     KEY=VALUE credentials (mode 600), loaded at start
     endo.log                      #     the service's stdout/stderr
     lock                          #     held while the agent runs, and by inception while it writes the program
     status.json                   #     what `endo status` reads; the host that holds the directory (residence, §12)
@@ -128,7 +128,7 @@ cwd = "."                         # where procedures and bash run; default
 batteries = ["bash", "evolve"]    # by name: bash, evolve, scheduler
 
 [executor]
-provider = "openai"               # anthropic | openai, through the AI SDK; credentials from .endo/env
+provider = "openai"               # anthropic | openai, through the AI SDK; credentials from .env
 model = "gpt-5.6-luna"
 # max_output_tokens = 16000
 # temperature = 0.2
@@ -327,8 +327,7 @@ duplicate-id drop.
 **Context overflow.** The executor reporting an overflowed context
 settles the request `failed` with a frame naming the cause; the next
 activation starts with that frame in view so the program can compact.
-`docs/program.md` requires every program to carry a compaction routine.
-The harness never compacts on its own.
+The agent chooses its history strategy; the harness never compacts on its own.
 
 **Compaction is the program's call.** `compact` is a core action; the
 horizon is projector's message; history renders from the latest horizon.
@@ -699,7 +698,7 @@ Supervisors: launchd user agent on macOS (RunAtLoad, KeepAlive with
 (`Restart=on-failure`; enable lingering or refuse loudly). Both restart a
 failure and leave a clean exit alone, which is what lets a service exit 0
 instead of crash-looping (§5, §9). Units run `endo up --service` in the
-agent directory. Credentials live in `.endo/env` (KEY=VALUE, mode 600),
+agent directory. Credentials live in `.env` (KEY=VALUE, mode 600),
 loaded by the outer process at start, foreground or service, so
 a unit never holds a secret. Sandboxed workers receive only the environment
 variables selected by policy; model-provider credentials stay outside.

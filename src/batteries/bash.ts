@@ -96,17 +96,7 @@ with the agent's own environment. Output is the exit code and the last 80
 lines of stdout and stderr; a timeout (default 120 s, at most an hour)
 kills the whole process tree.
 
-Idioms:
-
-- It is how the agent reads and writes files under \`src\` (notes, its
-  README, a procedure it is drafting) and how it looks at the systems it
-  tends. Nothing else in the grant reads files.
-- Anything the agent runs twice belongs in a procedure, not in a bash
-  call it repeats from memory: a procedure has a schema, a name peers
-  can call, and its output stays out of the model's history.
-- Long or noisy jobs (builds, deploys, test runs) belong in procedures
-  for the same reason. A bash call's output is paid for on every
-  activation until the next compaction.
-- Instructions should say what bash is for in this agent, not that it
-  exists; the model sees the tool.
+Commands can read and write files and invoke installed tools within the
+process sandbox. Procedures are also available for named, callable work
+(PROGRAM.md §6.5).
 `;

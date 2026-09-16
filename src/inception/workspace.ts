@@ -169,10 +169,9 @@ inception.
 You are writing ${first ? "the first program" : `program ${n}`} for the agent in this directory. Work here, in the
 agent directory; the files you read and write are under \`.endo/\`.
 ${revising}
-Read, in this order: \`PROGRAM.md\` (the contract and the idioms; all of
-it), \`MANIFEST.md\` (what this agent is for), \`GRANT.md\` (what it may
-do), \`CLI.md\` (how peers reach it: the only source of truth for what
-the agent may tell peers to type), and every guide under \`batteries/\`.
+Read \`MANIFEST.md\` for the mandate, \`GRANT.md\` for capabilities,
+\`PROGRAM.md\` for the program contract, \`CLI.md\` for peer commands,
+and the guides under \`batteries/\` for their APIs.
 
 Then write:
 
@@ -184,18 +183,15 @@ Then write:
    // change manifest.md or endograph.toml and run \`endo incept\`.
    \`\`\`
 
-2. \`${rel(paths, paths.src)}/\` — seed it: procedures under \`procedures/\` for what the
-   manifest makes obviously repeatable (PROGRAM.md §6.5, one file each,
-   \`await procedure({...})\` first, imported from \`endograph/procedure\`),
-   a \`README.md\` for the agent, notes the manifest implies (§7).
+2. \`${rel(paths, paths.src)}/\` — seed what the mandate needs (PROGRAM.md §7).
+   Procedures, if any, go under \`procedures/\` (§6.5).
 
-Rules to keep, all from PROGRAM.md: the contract (§2), reply exactly once
-(§5.1), a compaction routine (§5.2), evidence versus instructions (§5.3),
-the write rule (§5.4), the header (§5.5), purity (§5.6), no tool list in
-prose (§5.7), no secrets (§5.8). Go through §8 before you finish.
+Preserve the contract (§2) and protocol and boundaries (§5).
+Memory, history management, procedures, and evolution are the agent's
+design choices. Check §8 before finishing.
 
 Validation runs after you stop: the load pipeline (import, describe every
-procedure, invoke, charter, hydrate, replay) and \`endo commands\`. A
+procedure, invoke, charter, hydrate, replay). A
 procedure that fails to describe fails validation here. If validation
 fails you get \`ERRORS.md\` in this workspace with the stage and the error,
 and another round.

@@ -77,14 +77,7 @@ suffix, lists). While the agent runs, a due procedure is started as
 other. Nothing runs while the agent is down, and a missed minute is not
 made up.
 
-Idioms:
-
-- A standing self-initiated activation is a scheduled procedure that
-  calls \`actionResult()\` and then \`emitMessage()\` to its own agent: a
-  nightly digest, a self-review, a retry loop for a host that was asleep.
-  The message's text is the brief; the agent answers it like any request.
-- A scheduled procedure that does its work without the model (a health
-  check that only emits when something is wrong) costs nothing while all
-  is well.
-- Keep schedules coarse. Every emitted message is an activation.
+A scheduled procedure can call \`actionResult()\` then \`emitMessage()\`
+to request work from its own agent. A procedure that does not emit a
+request can run without activating the model. The agent owns its cadence.
 `;

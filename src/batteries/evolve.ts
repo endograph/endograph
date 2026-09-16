@@ -53,7 +53,6 @@ export function evolve(): Battery {
         name: "transition",
         description:
           "Replace the node you run in with a new shape: new instructions and tool set, same instance and states. " +
-          "Prefer spawn, a state update, or a procedure; a transition is merged by hand at the next inception. " +
           "Say why: the reason is recorded with the change.",
         inputSchema: z.object({ node: NODE, reason: z.string().min(1) }),
         run: ({ node, reason }, actionCtx) => {
@@ -110,18 +109,12 @@ projects into the parent's surface, no history of its own) or
 \`actor-frame\`). Every reshaping is a frame carrying the reason, so the
 next inception reads intent, not mechanics.
 
-Idioms (PROGRAM.md §6.6):
+\`spawn\` adds a child. \`transition\` replaces the current node's shape,
+including its instructions and tools, while preserving its instance and
+states. \`cede\` removes the named child, or the current node when no key
+is given; ceding the current node ends its activation.
 
-- You decide which node carries these actions and what its instructions
-  say about when to use them. A root that can transition itself can also
-  erase its own instructions; give it a rule.
-- Prefer, in order: a procedure (new behavior), a state update (new
-  memory), a spawn (new structure), and only then a transition. The first
-  three compose and survive a later inception on their own; a transition
-  replaces a node wholesale and is merged by hand next time.
-- A spawned generator is a private sub-machine: it sees broadcast
-  messages and the states it declares, not the parent's transcript. Put
-  what it needs in its instructions or in a state.
-- Cede what you spawned when its job is done; a ceded root ends the
-  activation.
+A private generator sees broadcast messages and its declared states,
+not the parent's transcript. The agent chooses whether and when to
+reshape its organization.
 `;
