@@ -1,6 +1,6 @@
 {
   "name": "@endograph/server",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "type": "module",
   "repository": {
     "type": "git",
@@ -15,6 +15,6 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
-    "endograph": "0.0.1"
+    "endograph": "0.0.2"
   }
 }

@@ -21,7 +21,7 @@
     },
     "packages/codex-executor": {
       "name": "@endograph/codex-executor",
-      "version": "0.0.1",
+      "version": "0.0.2",
       "dependencies": {
         "@projectors/core": "latest",
         "zod": "^4.5.4",
@@ -29,9 +29,9 @@
     },
     "packages/server": {
       "name": "@endograph/server",
-      "version": "0.0.1",
+      "version": "0.0.2",
       "dependencies": {
-        "endograph": "0.0.1",
+        "endograph": "0.0.2",
       },
     },
   },
