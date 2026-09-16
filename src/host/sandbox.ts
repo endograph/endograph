@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { getDefaultWritePaths, SandboxManager, type SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
+import { getDefaultWritePaths, SandboxManager, type SandboxRuntimeConfig } from "@endograph/sandbox-runtime";
 import type { Grant } from "../grant/grant.ts";
 import { ENDOGRAPH_ROOT, type Paths } from "../harness/paths.ts";
 

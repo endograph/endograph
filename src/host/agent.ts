@@ -208,7 +208,12 @@ export async function createAgentHost(opts: {
       return closeTask ??= (async () => {
         closing = true;
         const pending = [...children];
-        for (const [child] of pending) child.kill("SIGTERM");
+        // Signals can stop the Linux sandbox wrapper without reaching the
+        // worker. The inherited IPC channel addresses the worker directly.
+        for (const [child] of pending) {
+          if (child.connected) child.send(JSON.stringify({ v: 1, kind: "shutdown" }), (error) => { if (error) child.kill("SIGTERM"); });
+          else child.kill("SIGTERM");
+        }
         const timer = setTimeout(() => { for (const [child] of pending) if (children.has(child)) child.kill("SIGKILL"); }, 5000);
         try { await Promise.allSettled(pending.map(([, exited]) => exited)); }
         finally { clearTimeout(timer); await closeSandbox(); }

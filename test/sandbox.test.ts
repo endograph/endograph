@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createServer } from "node:net";
 import { join } from "node:path";
@@ -81,11 +81,18 @@ test("OS sandbox confines agent and descendants while preserving private IPC and
       javaSecretPresent: (process.env.JAVA_TOOL_OPTIONS ?? "").includes("outer-only-token"), privateTemp: process.env.TMPDIR,
       envDenied: unavailable(${JSON.stringify(paths.env)}, "PRIVATE_KEY=secret"),
       codexDenied: unavailable(${JSON.stringify(join(paths.state, "codex/session.json"))}, "private-session"),
-      codexWriteDenied: denied(() => writeFileSync(${JSON.stringify(join(paths.state, "codex/injected.json"))}, "bad")),
+      codexWriteDenied: denied(() => {
+        writeFileSync(${JSON.stringify(join(paths.state, "codex/injected.json"))}, "bad");
+        writeFileSync(${JSON.stringify(join(paths.state, "codex/session.json"))}, "bad");
+      }),
       hostDenied: denied(() => readFileSync(${JSON.stringify(join(dir, "host/action.ts"))})),
       hostHelperWriteDenied: denyOpenWrite(${JSON.stringify(join(dir, "host/helper.ts"))}),
       outsideDenied: denied(() => readFileSync(${JSON.stringify(join(directory, "outside.txt"))})),
-      outsideWriteDenied: denied(() => writeFileSync(${JSON.stringify(join(directory, "outside-write.txt"))}, "bad")),
+      outsideWriteDenied: denied(() => {
+        writeFileSync(${JSON.stringify(join(directory, "outside-write.txt"))}, "bad");
+        writeFileSync(${JSON.stringify(join(directory, "outside.txt"))}, "bad");
+      }),
+      agentRootWriteDenied: denied(() => writeFileSync(${JSON.stringify(join(dir, "ungranted.txt"))}, "bad")),
       grantWriteDenied: denyOpenWrite(${JSON.stringify(paths.grant)}),
       programWriteDenied: denyOpenWrite(${JSON.stringify(paths.program)}),
       runtimeWriteDenied: denyOpenWrite(${JSON.stringify(join(ENDOGRAPH_ROOT, "src/index.ts"))}),
@@ -118,9 +125,16 @@ test("OS sandbox confines agent and descendants while preserving private IPC and
     expect(result).toMatchObject({
       runtimeImported: true, networkDenied: true, unixDenied: true, httpDenied: true, credentialPresent: false, allowedEnv: "explicitly-permitted",
       javaSecretPresent: false, privateTemp: join(paths.state, "tmp"),
-      envDenied: true, codexDenied: true, codexWriteDenied: true, hostDenied: true, hostHelperWriteDenied: true, outsideDenied: true, outsideWriteDenied: true,
-      grantWriteDenied: true, programWriteDenied: true, runtimeWriteDenied: true, allowedWrite: "allowed", childExit: 0,
+      envDenied: true, codexDenied: true, hostDenied: true, hostHelperWriteDenied: true, outsideDenied: true,
+      agentRootWriteDenied: true, grantWriteDenied: true, programWriteDenied: true, runtimeWriteDenied: true, allowedWrite: "allowed", childExit: 0,
     });
+    // Linux hides read-denied directories behind private tmpfs mounts. Writes
+    // there may succeed, but must never create or overwrite files on the host.
+    if (process.platform !== "linux") expect(result).toMatchObject({ codexWriteDenied: true, outsideWriteDenied: true });
+    expect(existsSync(join(paths.state, "codex/injected.json"))).toBe(false);
+    expect(readFileSync(join(paths.state, "codex/session.json"), "utf8")).toBe("private-session");
+    expect(existsSync(join(directory, "outside-write.txt"))).toBe(false);
+    expect(readFileSync(join(directory, "outside.txt"), "utf8")).toBe("outside");
     expect(JSON.parse(result.child)).toEqual({ networkDenied: true, secretDenied: true, credentialPresent: false });
     expect(ipc).toBe("private-ipc:roundtrip");
     expect(hits).toBe(0);
@@ -134,7 +148,7 @@ test("OS sandbox confines agent and descendants while preserving private IPC and
       catch { helperProtected = true; }
       try { renameSync(${JSON.stringify(paths.state)}, ${JSON.stringify(join(dir, "moved-state"))}); }
       catch { stateRenameDenied = true; }
-      if (!stateRenameDenied) try { leaked = readFileSync(${JSON.stringify(join(dir, "moved-state/env"))}, "utf8").includes("secret"); } catch {}
+      if (!stateRenameDenied) try { leaked = readFileSync(${JSON.stringify(join(dir, "moved-state/codex/session.json"))}, "utf8").includes("private-session"); } catch {}
       try { renameSync(${JSON.stringify(join(dir, "host"))}, ${JSON.stringify(join(dir, "moved-host"))}); }
       catch { hostRenameDenied = true; }
       console.log(JSON.stringify({ helperProtected, stateRenameDenied, hostRenameDenied, leaked }));

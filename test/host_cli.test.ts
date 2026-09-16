@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { ensureStateDir, pathsOf } from "../src/harness/paths.ts";
+import { isLocked } from "../src/harness/lock.ts";
 import { newId, readReply, waitForReply, writeMessage } from "../src/protocol/wire.ts";
 
 const ROOT = resolve(import.meta.dir, "..");
@@ -122,8 +123,9 @@ console.log(${JSON.stringify(version)});
     }
     expect(readReply(paths.outbox, id)).toEqual(reply);
     spawned.kill("SIGTERM");
-    expect(await spawned.exited).toBe(0);
-    expect(await stderr).toBe("");
+    expect({ code: await spawned.exited, errors: await stderr }).toEqual({ code: 0, errors: "" });
+    expect(JSON.parse(readFileSync(paths.status, "utf8")).running).toBe(false);
+    expect(isLocked(paths.lock)).toBe(false);
     await stdout;
     child = undefined;
   } finally {

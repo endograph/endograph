@@ -6,9 +6,11 @@ import { atomicWrite } from "../protocol/wire.ts";
 import { createHostClient } from "./client.ts";
 import { ipcTransport } from "./transport.ts";
 
+let shutdown: () => void = () => process.exit(0);
 const client = createHostClient({
   transport: ipcTransport(process),
   timeoutMs: 2 * 60 * 60 * 1000, maxBytes: 8 * 1024 * 1024,
+  onShutdown: () => shutdown(),
 });
 const [mode, agentDir, inputFile] = process.argv.slice(2);
 
@@ -31,6 +33,7 @@ if (mode === "load" && inputFile) {
     client.close();
     process.exit(code);
   };
+  shutdown = () => { void stop(); };
   process.on("SIGINT", () => void stop());
   process.on("SIGTERM", () => void stop());
   // The parent may have died after promoting a generation. Do not let this

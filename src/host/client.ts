@@ -13,7 +13,7 @@ export interface HostClient {
   model(args: JsonValue, onChunk?: (chunk: JsonValue) => void, signal?: AbortSignal): Promise<JsonValue>;
   close(): void;
 }
-export function createHostClient(opts: { transport: HostTransport; timeoutMs?: number; modelTimeoutMs?: number; maxPending?: number; maxBytes?: number }): HostClient {
+export function createHostClient(opts: { transport: HostTransport; timeoutMs?: number; modelTimeoutMs?: number; maxPending?: number; maxBytes?: number; onShutdown?: () => void }): HostClient {
   const { transport } = opts;
   const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
   const pending = new Map<string, { resolve(value: JsonValue): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout>; onChunk?: (chunk: JsonValue) => void; cleanup(): void }>();
@@ -39,6 +39,10 @@ export function createHostClient(opts: { transport: HostTransport; timeoutMs?: n
     try {
       if (Buffer.byteLength(raw) > maxBytes) throw new Error("oversized response");
       const response: unknown = JSON.parse(raw);
+      if (object(response) && response.v === VERSION && response.kind === "shutdown" && opts.onShutdown) {
+        opts.onShutdown();
+        return;
+      }
       if (!object(response) || response.v !== VERSION || !validId(response.id) || typeof response.ok !== "boolean") throw new Error("invalid response");
       const call = pending.get(response.id);
       if (!call) return; // A response arriving after cancellation has no recipient.

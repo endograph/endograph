@@ -42,12 +42,20 @@ The lockfile records the tested versions: `latest` does not bypass it. Local
 development and CI install those versions with `bun install --frozen-lockfile`;
 no sibling Projector checkout or repository variable is required.
 
-The workflow's first successful Linux execution is still needed to establish
-Linux support. Running these tests on macOS proves its Seatbelt policy only.
+The runtime pins `@endograph/sandbox-runtime@0.0.75-endograph.1`, an Apache-2.0
+[fork of upstream 0.0.75](https://github.com/endograph/sandbox-runtime/blob/endograph/ENDOGRAPH_FORK.md)
+with the mount-order fix from [upstream PR #447](https://github.com/anthropics/sandbox-runtime/pull/447).
+It restores read-only ancestors before writable children; protected-path mounts
+and network policy are unchanged. Upstream native helpers are retained byte for
+byte after verifying the original package's pinned SHA-512 integrity. The fork
+ships compiled code and helpers, so consumer installs need no dependency patches
+or lifecycle scripts. Return to upstream after a published fix passes these tests.
 
 On Linux, a denied file may be masked by a read-only `/dev/null` mount. Tests
 assert that protected contents are unavailable, accepting either an access error
-or an empty masked file.
+or an empty masked file. Read-denied directories are hidden by private tmpfs
+mounts. Writes inside those masks may succeed, so the tests also check from the
+host that protected files are unchanged and no new host files were created.
 
 ## Codex backend
 

@@ -32,12 +32,12 @@
     "@endograph/codex-executor": "workspace:*",
     "@ai-sdk/anthropic": "3.0.96",
     "@ai-sdk/openai": "3.0.83",
-    "@anthropic-ai/sandbox-runtime": "0.0.75",
     "@projectors/aisdk-executor": "latest",
     "@projectors/core": "latest",
     "@types/bun": "latest",
     "ai": "6.0.222",
-    "zod": "^4.5.4"
+    "zod": "^4.5.4",
+    "@endograph/sandbox-runtime": "0.0.75-endograph.1"
   },
   "devDependencies": {
     "typescript": "^5.7.0"

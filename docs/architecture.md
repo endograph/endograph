@@ -35,6 +35,8 @@ replaying missed intervals. Explicit poll/reload/tick calls use the same serial
 queue. Shutdown fences that queue immediately, wakes an idle loop, lets the
 current turn finish, and releases the store and lock once. Persistence failures
 retain the fatal shutdown path described below.
+The parent requests graceful shutdown through private IPC so it reaches the
+worker through Linux sandbox wrappers, with a forced-stop timeout as fallback.
 
 Appending a request or call frame indexes its delivered messages using the same
 function as archive recovery. SQLite owns deduplication; the harness keeps no
