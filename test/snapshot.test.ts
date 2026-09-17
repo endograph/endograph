@@ -47,6 +47,9 @@ test("CLI snapshots a live agent and restores code, evolved state, history and r
     writeFileSync(join(paths.state, "home", "memory"), "Persistent HOME data.");
     writeFileSync(join(source, ".env"), "SNAPSHOT_SECRET=do-not-copy\n");
     writeFileSync(join(paths.state, "env"), "LEGACY_SECRET=do-not-copy\n");
+    mkdirSync(join(paths.local, "executors", "codex"), { recursive: true });
+    writeFileSync(join(paths.local, "executors", "codex", "session.json"), "host-local-session");
+    writeFileSync(join(paths.local, "other-runtime-state"), "also local");
     const instance = serializeInstance(agent.loaded.machine.instance, agent.loaded.charter);
     const replies = ids.map((id) => readReply(paths.outbox, id));
     // A program-owned table travels with the database checkpoint, not the archive.
@@ -59,7 +62,7 @@ test("CLI snapshots a live agent and restores code, evolved state, history and r
     expect(stdout).toContain("snapshot through archive commit");
     expect(isLocked(paths.lock)).toBe(true);
     const saved = pathsOf(destination);
-    for (const file of [saved.db, `${saved.db}-wal`, saved.lock, join(destination, ".env"), join(saved.state, "env"), saved.modules, saved.outbox]) expect(existsSync(file)).toBe(false);
+    for (const file of [saved.db, `${saved.db}-wal`, saved.lock, join(destination, ".env"), join(saved.state, "env"), saved.modules, saved.outbox, saved.local]) expect(existsSync(file)).toBe(false);
     expect(readFileSync(saved.program, "utf8")).toBe(readFileSync(paths.program, "utf8"));
     expect(readFileSync(join(saved.src, "agent-note.md"), "utf8")).toBe("A file written after inception.");
     expect(readFileSync(join(saved.state, "home", "memory"), "utf8")).toBe("Persistent HOME data.");

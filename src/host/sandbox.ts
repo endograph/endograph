@@ -32,7 +32,7 @@ export async function sandboxCommand(paths: Paths, grant: Grant, argv: string[])
   mkdirSync(home, { recursive: true });
   mkdirSync(temp, { recursive: true });
   // Linux needs an existing directory to mask before mounting the read-only tree.
-  mkdirSync(join(paths.state, "codex"), { recursive: true, mode: 0o700 });
+  mkdirSync(paths.local, { recursive: true, mode: 0o700 });
   const runtime = [ENDOGRAPH_ROOT, dirname(canonical(process.execPath)),
     dirname(fileURLToPath(import.meta.resolve("@endograph/codex-executor"))),
     dirname(fileURLToPath(import.meta.resolve("@projectors/core"))),
@@ -68,14 +68,14 @@ export async function sandboxCommand(paths: Paths, grant: Grant, argv: string[])
       allowLocalBinding: false,
     },
     filesystem: {
-      denyRead: ["/", paths.env, join(paths.state, "codex"), ...hostDirectories],
+      denyRead: ["/", paths.env, paths.local, ...hostDirectories],
       allowRead: ["/bin", "/sbin", "/usr", "/lib", "/lib64", "/System", "/Library", "/dev", "/private/etc", "/etc", "/private/var/select",
         paths.agentDir, resolve(paths.agentDir, grant.cwd), ...runtime,
         // Keep both spellings on usr-merged Linux: masking /bin must restore
         // /bin itself as well as its /usr/bin target for shells and ELF loaders.
         ...policy.read.map((p) => resolve(paths.agentDir, p))].flatMap((p) => process.platform === "linux" ? [p, canonical(p)] : [canonical(p)]).concat([...ancestors]),
       allowWrite: [paths.state, ...policy.write.map((p) => resolve(paths.agentDir, p))].map(canonical),
-      denyWrite: [...ownerFiles, paths.env, join(paths.state, "codex"), join(paths.state, "program"), paths.modules,
+      denyWrite: [...ownerFiles, paths.env, paths.local, join(paths.state, "program"), paths.modules,
         // SRT otherwise adds writable host temp/log directories implicitly.
         ...getDefaultWritePaths().filter((path) => !path.startsWith("/dev/")),
         join(ENDOGRAPH_ROOT, "src"), join(ENDOGRAPH_ROOT, "node_modules"), join(ENDOGRAPH_ROOT, "package.json"),

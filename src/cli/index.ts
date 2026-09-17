@@ -17,6 +17,7 @@ import { claim, list, lookup, NameConflict, release, resolveAgent } from "./regi
 import { installService, removeService, serviceInfo, serviceRunning } from "./service.ts";
 import { fromTemplate, interactiveSetup } from "./setup.ts";
 import { USAGE } from "./usage.ts";
+import { installDependencies } from "./dependencies.ts";
 
 interface Flags {
   agent?: string;
@@ -116,6 +117,7 @@ async function up(flags: Flags): Promise<number> {
   }
   const paths = target(flags);
   if (!paths) return 1;
+  await installDependencies(paths.agentDir);
   // Recover an interrupted filesystem promotion before preflight reads any candidate code.
   if (existsSync(join(paths.state, "promotion.json"))) {
     const lock = acquireLock(paths.lock);

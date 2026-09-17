@@ -57,8 +57,8 @@ and environment policy.
 
 The Codex backend's app-server process runs in the trusted parent environment
 with native effectful capabilities disabled; Projector actions still execute
-in the worker or through its granted host proxies. `.endo/codex` is protected
-from worker reads/writes, so generated code cannot replace a persisted thread
+in the worker or through its granted host proxies. `.endo/local/` (including
+`executors/codex/`) is protected from worker reads/writes, so generated code cannot replace a persisted thread
 association. Authentication remains in the service user's Codex home.
 
 Endograph uses the pinned `@endograph/sandbox-runtime` fork of upstream 0.0.75

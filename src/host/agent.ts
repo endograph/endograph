@@ -80,7 +80,7 @@ export async function createAgentHost(opts: {
       try { recoverPromotion(paths); } finally { lock.release(); }
     }
     const grant = await host.grant();
-    if ("backend" in grant.executor) mkdirSync(join(paths.state, "codex"), { recursive: true, mode: 0o700 });
+    if ("backend" in grant.executor) mkdirSync(join(paths.local, "executors", "codex"), { recursive: true, mode: 0o700 });
     const wrapped = await sandboxCommand(paths, grant, [process.execPath, WORKER, mode, paths.agentDir, ...(inputFile ? [inputFile] : [])]);
     if (closing) throw new Error("agent host is closing");
     const child = spawn(wrapped.argv[0]!, wrapped.argv.slice(1), {
@@ -142,7 +142,7 @@ export async function createAgentHost(opts: {
         if ("backend" in currentGrant.executor) {
           if (mode !== "run" || !("backend" in grant.executor) || JSON.stringify(currentGrant.executor) !== JSON.stringify(grant.executor))
             throw new HostActionError("Codex configuration changed; restart the worker");
-          codex ??= new CodexHost({ ...currentGrant.executor, stateDir: join(paths.state, "codex"),
+          codex ??= new CodexHost({ ...currentGrant.executor, stateDir: join(paths.local, "executors", "codex"),
             isActivationCommitted: (id) => hasCommittedActivation(paths.db, id) });
           try { return await codex.handle(input, context.signal, emit); }
           catch (error) {

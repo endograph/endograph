@@ -106,7 +106,7 @@ app-server. Validation loads do not start it.
 
 Context realization belongs to the executor: updated projections are appended
 to a native thread, and Projector compaction does not force a session reset.
-State/action semantics remain Projector's. Session metadata under `.endo/codex`
+State/action semantics remain Projector's. Session metadata under `.endo/local/executors/codex`
 is parent-only and not included in snapshots. Clean restarts resume; uncertain
 turns are replaced using Projector context. See the
 [package documentation](../packages/codex-executor/README.md) for details.

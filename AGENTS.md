@@ -23,6 +23,8 @@ optional discussion IDs, with no prescribed workflow, ownership, or isolation.
   `docs/v3-future.md` records deferred ideas; verify its status against the code.
 - Runtime is Bun and TypeScript. Run `bun run typecheck` and `bun test` for code
   changes. Test observable behavior, especially recovery and sandbox boundaries.
+- `endo up` installs owner-project dependencies before loading agent code. Honor
+  the committed lockfile; startup installs dependencies, never upgrades them.
 - Update `@projectors/core` and `@projectors/aisdk-executor` together; keep `latest`
   in the manifest and tested versions in `bun.lock`. Upstream AI SDK executor
   fixes belong in Projector; the Codex adapter lives in `packages/codex-executor`.

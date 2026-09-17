@@ -1,6 +1,6 @@
 {
   "name": "endograph",
-  "version": "0.0.2",
+  "version": "0.0.4",
   "description": "Embedded agents on projector: a grant, a manifest, a program written at inception, a message protocol, a frame log.",
   "type": "module",
   "license": "MIT",

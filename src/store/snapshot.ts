@@ -6,7 +6,7 @@ import { archivePath, checkpointPath, copyArchive, readAfter, START } from "./ar
 import { checkpointCursor, checkpointStore } from "./sqlite.ts";
 
 // Runtime files are either rebuilt, in flight, machine-local, credentials, or produced by the capture itself.
-const LOCAL = new Set(["frames", "agent.db", "agent.db-wal", "agent.db-shm", "checkpoint.db", "lock", "lock-journal", "env", "endo.log", "status.json", "inbox", "outbox", "runs", "tmp", "candidate", "workspace", "node_modules", ".git", "codex"]);
+const LOCAL = new Set(["frames", "agent.db", "agent.db-wal", "agent.db-shm", "checkpoint.db", "lock", "lock-journal", "env", "endo.log", "status.json", "inbox", "outbox", "runs", "tmp", "candidate", "workspace", "node_modules", ".git", "local"]);
 const changed = () => new Error("agent files changed while copying; retry snapshot when code and owner files are stable");
 
 /**

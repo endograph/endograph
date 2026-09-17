@@ -33,6 +33,13 @@ a launchd or systemd service, and starts it. If the agent has no program,
 Endograph runs inception first: a coding agent (Claude Code or Codex)
 writes `program/agent.ts` from your manifest.
 
+When the agent directory has a `package.json`, every `endo up` installs its
+dependencies before loading host modules or the agent program. Bun lockfiles use
+`bun install --frozen-lockfile`; npm lockfiles use `npm ci`. With no lockfile,
+`bun install` creates one. Commit the lockfile. Installation failure stops
+startup; dependencies are never upgraded on startup. Stop a running agent
+before reinstalling its dependencies.
+
 Put credentials in `.env` beside `endograph.toml` and add it to your
 project's `.gitignore`. Existing process environment variables take
 precedence over `.env`. If you're upgrading from the old layout, move

@@ -7,6 +7,8 @@ export interface Paths {
   /** `endograph.toml` */
   grant: string;
   state: string;
+  /** Host-owned machine-local state; excluded from Git and snapshots. */
+  local: string;
   /** `.endo/node_modules/endograph` links the endograph that runs the agent. */
   modules: string;
   lock: string;
@@ -34,6 +36,7 @@ export function pathsOf(agentDir: string): Paths {
     agentDir,
     grant: join(agentDir, "endograph.toml"),
     state,
+    local: join(state, "local"),
     modules: join(state, "node_modules"),
     lock: join(state, "lock"),
     db: join(state, "agent.db"),
@@ -85,7 +88,9 @@ export function ensureStateDir(paths: Paths): void {
 }
 
 /** `.endo/tsconfig.json`: the program and src typecheck against the linked endograph. Tooling, rewritten at every start. */
-const GITIGNORE = `# relinked by every \`endo up\`
+const GITIGNORE = `# host-owned machine-local state, including executor sessions
+/local/
+# relinked by every \`endo up\`
 node_modules
 # rebuilt from immutable frames/ on this machine
 agent.db

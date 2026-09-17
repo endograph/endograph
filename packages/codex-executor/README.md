@@ -64,7 +64,7 @@ procedures, reply semantics and structured final output use Projector's APIs.
 
 ## Lifecycle and recovery
 
-`.endo/codex/` holds atomic per-generator thread associations and context
+`.endo/local/executors/codex/` holds atomic per-generator thread associations and context
 cursors. Codex stores native rollouts in its own home. A clean host restart
 resumes those rollouts. Session metadata is protected from sandboxed workers
 and excluded from `endo snapshot`: a restored agent reconstructs context from

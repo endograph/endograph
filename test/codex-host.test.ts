@@ -28,8 +28,8 @@ test.each([false, true])("Codex backend serves through stdio + host IPC, reuses 
 import { readdirSync, writeFileSync } from "node:fs";
 if (${sandboxed}) {
   let readable = false, writable = false;
-  try { readdirSync(${JSON.stringify(join(paths.state, "codex"))}); readable = true; } catch {}
-  try { writeFileSync(${JSON.stringify(join(paths.state, "codex", "probe"))}, "bad"); writable = true; } catch {}
+  try { readdirSync(${JSON.stringify(join(paths.local, "executors", "codex"))}); readable = true; } catch {}
+  try { writeFileSync(${JSON.stringify(join(paths.local, "executors", "codex", "probe"))}, "bad"); writable = true; } catch {}
   if (readable || writable) throw new Error("Worker can access protected Codex session metadata");
 }
 export default defineProgram(endo => { const node = createNode({key:"test",instructions:"Reply to requests.",parts:Object.values(endo.actions).map(a=>tool(a)),runtime:{type:"generator",trigger:{type:"actor-frame"}}}); return {nodes:[node],instance:createSourceInstance({id:"agent",node})}; });`);

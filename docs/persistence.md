@@ -97,14 +97,16 @@ The result contains the grant, manifest, program, evolved `src/`, inception
 snapshots and records, the archive prefix, the checkpoint, and other ordinary
 files in the agent directory. It excludes the live SQLite database and its
 WAL/SHM, inbox/outbox, running procedures' files, logs, local locks,
-temporary workspaces, and `.git` / `node_modules` directly under the agent
+temporary workspaces, `.endo/local/`, and `.git` / `node_modules` directly under the agent
 root or `.endo/`. Nested project files and `.endo/home` are kept.
 Credentials in `.env` are also excluded. Symlinks and special files
 are refused rather than silently copying external data. External cwd or
 grant paths are not bundled; they must exist on the destination host.
 
-To restore, provision credentials and any owner-project dependencies, then
-run `endo up` in the saved directory. Endograph recreates its own module
+To restore, provision credentials and make the Endograph CLI available, then
+run `endo up` in the saved directory. It installs owner-project dependencies
+from the root package manifest and lockfile before loading agent code; keep
+both in the snapshot. Endograph recreates its own module
 link, starts SQLite from the checkpoint, and republishes canonical replies.
 The saved residence claim is retained; moving to another host may require
 `endo up --adopt`. Keep one active writer for an identity. Snapshotting does
@@ -150,8 +152,14 @@ sender committed its answer, not that a recipient received it. Recipient
 acknowledgements would require a separate receipt protocol.
 
 The generated `.endo/.gitignore` excludes the database, lock, and installed
-module link. It is written only once; existing owner-maintained ignore
-files need the database exclusions added when adopting this layout.
+module link, plus `/local/` for host-owned machine-local state. Executors keep
+their session metadata under `.endo/local/executors/<name>/`; it is protected
+from sandboxed workers and excluded from snapshots. This state is retained
+across restarts, but does not travel with the agent. It is not disposable while
+the host is running.
+
+The ignore file is written only once; existing owner-maintained ignore
+files need the corresponding exclusions added when adopting this layout.
 Provision `.env` separately according to the destination's needs.
 Registry entries and service units are per-machine and recreated by `up`.
 Owner-authored files and procedure arguments may still contain absolute

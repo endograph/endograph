@@ -80,10 +80,10 @@ test("OS sandbox confines agent and descendants while preserving private IPC and
       credentialPresent: !!process.env.ENDO_TEST_SECRET, allowedEnv: process.env.ENDO_TEST_ALLOWED,
       javaSecretPresent: (process.env.JAVA_TOOL_OPTIONS ?? "").includes("outer-only-token"), privateTemp: process.env.TMPDIR,
       envDenied: unavailable(${JSON.stringify(paths.env)}, "PRIVATE_KEY=secret"),
-      codexDenied: unavailable(${JSON.stringify(join(paths.state, "codex/session.json"))}, "private-session"),
+      codexDenied: unavailable(${JSON.stringify(join(paths.local, "executors/codex/session.json"))}, "private-session"),
       codexWriteDenied: denied(() => {
-        writeFileSync(${JSON.stringify(join(paths.state, "codex/injected.json"))}, "bad");
-        writeFileSync(${JSON.stringify(join(paths.state, "codex/session.json"))}, "bad");
+        writeFileSync(${JSON.stringify(join(paths.local, "executors/codex/injected.json"))}, "bad");
+        writeFileSync(${JSON.stringify(join(paths.local, "executors/codex/session.json"))}, "bad");
       }),
       hostDenied: denied(() => readFileSync(${JSON.stringify(join(dir, "host/action.ts"))})),
       hostHelperWriteDenied: denyOpenWrite(${JSON.stringify(join(dir, "host/helper.ts"))}),
@@ -106,7 +106,8 @@ test("OS sandbox confines agent and descendants while preserving private IPC and
       await expect(sandboxCommand(paths, { ...grant, hostModules: [module] }, [process.execPath, "run", probe])).rejects.toThrow("dedicated owner directory");
     }
     const wrapped = await sandboxCommand(paths, grant, [process.execPath, "run", probe]);
-    writeFileSync(join(paths.state, "codex/session.json"), "private-session");
+    mkdirSync(join(paths.local, "executors/codex"), { recursive: true });
+    writeFileSync(join(paths.local, "executors/codex/session.json"), "private-session");
     expect(wrapped.env.ENDO_TEST_SECRET).toBeUndefined();
     expect(wrapped.env.ENDO_TEST_ALLOWED).toBe("explicitly-permitted");
     child = spawn(wrapped.argv[0]!, wrapped.argv.slice(1), { cwd: dir, env: wrapped.env, stdio: ["ignore", "pipe", "pipe", "pipe", "pipe"] });
@@ -131,8 +132,8 @@ test("OS sandbox confines agent and descendants while preserving private IPC and
     // Linux hides read-denied directories behind private tmpfs mounts. Writes
     // there may succeed, but must never create or overwrite files on the host.
     if (process.platform !== "linux") expect(result).toMatchObject({ codexWriteDenied: true, outsideWriteDenied: true });
-    expect(existsSync(join(paths.state, "codex/injected.json"))).toBe(false);
-    expect(readFileSync(join(paths.state, "codex/session.json"), "utf8")).toBe("private-session");
+    expect(existsSync(join(paths.local, "executors/codex/injected.json"))).toBe(false);
+    expect(readFileSync(join(paths.local, "executors/codex/session.json"), "utf8")).toBe("private-session");
     expect(existsSync(join(directory, "outside-write.txt"))).toBe(false);
     expect(readFileSync(join(directory, "outside.txt"), "utf8")).toBe("outside");
     expect(JSON.parse(result.child)).toEqual({ networkDenied: true, secretDenied: true, credentialPresent: false });
@@ -143,15 +144,17 @@ test("OS sandbox confines agent and descendants while preserving private IPC and
     const broader = await sandboxCommand(paths, { ...grant, sandbox: { ...grant.sandbox!, write: ["."] } }, [process.execPath, "--eval", `
       import { openSync, closeSync, readFileSync, renameSync, writeFileSync } from "node:fs";
       writeFileSync(${JSON.stringify(join(dir, "explicitly-allowed.txt"))}, "allowed");
-      let helperProtected = false, stateRenameDenied = false, hostRenameDenied = false, leaked = false;
+      let helperProtected = false, stateRenameDenied = false, localRenameDenied = false, hostRenameDenied = false, leaked = false;
       try { const fd = openSync(${JSON.stringify(join(dir, "host/helper.ts"))}, "r+"); closeSync(fd); }
       catch { helperProtected = true; }
+      try { renameSync(${JSON.stringify(paths.local)}, ${JSON.stringify(join(paths.state, "moved-local"))}); }
+      catch { localRenameDenied = true; }
       try { renameSync(${JSON.stringify(paths.state)}, ${JSON.stringify(join(dir, "moved-state"))}); }
       catch { stateRenameDenied = true; }
-      if (!stateRenameDenied) try { leaked = readFileSync(${JSON.stringify(join(dir, "moved-state/codex/session.json"))}, "utf8").includes("private-session"); } catch {}
+      if (!stateRenameDenied) try { leaked = readFileSync(${JSON.stringify(join(dir, "moved-state/local/executors/codex/session.json"))}, "utf8").includes("private-session"); } catch {}
       try { renameSync(${JSON.stringify(join(dir, "host"))}, ${JSON.stringify(join(dir, "moved-host"))}); }
       catch { hostRenameDenied = true; }
-      console.log(JSON.stringify({ helperProtected, stateRenameDenied, hostRenameDenied, leaked }));
+      console.log(JSON.stringify({ helperProtected, stateRenameDenied, localRenameDenied, hostRenameDenied, leaked }));
     `]);
     const next = Bun.spawn(broader.argv, { cwd: dir, env: broader.env, stdout: "pipe", stderr: "pipe" });
     const [nextCode, nextOut, nextErr] = await Promise.all([next.exited, new Response(next.stdout).text(), new Response(next.stderr).text()]);
@@ -160,7 +163,7 @@ test("OS sandbox confines agent and descendants while preserving private IPC and
     for (const [from, to] of [[join(dir, "moved-state"), paths.state], [join(dir, "moved-host"), join(dir, "host")]]) {
       if (existsSync(from!)) renameSync(from!, to!);
     }
-    expect(JSON.parse(nextOut)).toEqual({ helperProtected: true, stateRenameDenied: true, hostRenameDenied: true, leaked: false });
+    expect(JSON.parse(nextOut)).toEqual({ helperProtected: true, stateRenameDenied: true, localRenameDenied: true, hostRenameDenied: true, leaked: false });
   } finally {
     child?.kill("SIGKILL");
     server.stop(true);
