@@ -63,7 +63,7 @@ association. Authentication remains in the service user's Codex home.
 
 Endograph uses the pinned `@endograph/sandbox-runtime` fork of upstream 0.0.75
 (Seatbelt on macOS, bubblewrap on Linux), with the Linux nested writable mount
-fix from upstream PR #447. See [verification](testing.md) for provenance. Requested enforcement has no
+fix from upstream PR #447 and canonical mount paths for usrmerge systems. See [verification](testing.md) for provenance. Requested enforcement has no
 unsandboxed fallback. Linux needs the sandbox runtime's system dependencies.
 The inceptor itself remains trusted and runs outside this policy.
 

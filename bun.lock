@@ -8,7 +8,7 @@
         "@ai-sdk/anthropic": "3.0.96",
         "@ai-sdk/openai": "3.0.83",
         "@endograph/codex-executor": "workspace:*",
-        "@endograph/sandbox-runtime": "0.0.75-endograph.1",
+        "@endograph/sandbox-runtime": "0.0.75-endograph.2",
         "@projectors/aisdk-executor": "latest",
         "@projectors/core": "latest",
         "@types/bun": "latest",
@@ -21,7 +21,7 @@
     },
     "packages/codex-executor": {
       "name": "@endograph/codex-executor",
-      "version": "0.0.4",
+      "version": "0.0.5",
       "dependencies": {
         "@projectors/core": "latest",
         "zod": "^4.5.4",
@@ -29,9 +29,9 @@
     },
     "packages/server": {
       "name": "@endograph/server",
-      "version": "0.0.4",
+      "version": "0.0.5",
       "dependencies": {
-        "endograph": "0.0.4",
+        "endograph": "0.0.5",
       },
     },
   },
@@ -53,7 +53,7 @@
 
     "@endograph/codex-executor": ["@endograph/codex-executor@workspace:packages/codex-executor"],
 
-    "@endograph/sandbox-runtime": ["@endograph/sandbox-runtime@0.0.75-endograph.1", "", { "dependencies": { "@pondwader/socks5-server": "^1.0.10", "commander": "^12.1.0", "node-forge": "^1.4.0", "zod": "^3.24.1" }, "bin": { "srt": "dist/cli.js" } }, "sha512-h9XnDYYlya+Z7FGWL1efQs4GgSaj4Km3j7fcn3p4z1sk9AW3ephXGEA4mw2bbMqDW6Fe7H8j9GN7LQDzFv0qBw=="],
+    "@endograph/sandbox-runtime": ["@endograph/sandbox-runtime@0.0.75-endograph.2", "", { "dependencies": { "@pondwader/socks5-server": "^1.0.10", "commander": "^12.1.0", "node-forge": "^1.4.0", "zod": "^3.24.1" }, "bin": { "srt": "dist/cli.js" } }, "sha512-QPAqvwd7JcPRJCWLH3eD+fdQgY5CR7UKWJ2NEPZKsaGQ9YN0SWhD+KvEgLMLOpB+cID5SLp19vZTg6i7+KicZw=="],
 
     "@endograph/server": ["@endograph/server@workspace:packages/server"],
 

@@ -42,11 +42,13 @@ The lockfile records the tested versions: `latest` does not bypass it. Local
 development and CI install those versions with `bun install --frozen-lockfile`;
 no sibling Projector checkout or repository variable is required.
 
-The runtime pins `@endograph/sandbox-runtime@0.0.75-endograph.1`, an Apache-2.0
+The runtime pins `@endograph/sandbox-runtime@0.0.75-endograph.2`, an Apache-2.0
 [fork of upstream 0.0.75](https://github.com/endograph/sandbox-runtime/blob/endograph/ENDOGRAPH_FORK.md)
 with the mount-order fix from [upstream PR #447](https://github.com/anthropics/sandbox-runtime/pull/447).
-It restores read-only ancestors before writable children; protected-path mounts
-and network policy are unchanged. Upstream native helpers are retained byte for
+It restores read-only ancestors before writable children. It also preserves
+usrmerge aliases such as `/bin -> usr/bin` and mounts canonical policy paths
+so security-patched bubblewrap never needs to mount on those symlinks. Read
+restrictions and network policy remain enforced. Upstream native helpers are retained byte for
 byte after verifying the original package's pinned SHA-512 integrity. The fork
 ships compiled code and helpers, so consumer installs need no dependency patches
 or lifecycle scripts. Return to upstream after a published fix passes these tests.

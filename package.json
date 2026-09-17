@@ -1,6 +1,6 @@
 {
   "name": "endograph",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "description": "Embedded agents on projector: a grant, a manifest, a program written at inception, a message protocol, a frame log.",
   "type": "module",
   "license": "MIT",
@@ -37,7 +37,7 @@
     "@types/bun": "latest",
     "ai": "6.0.222",
     "zod": "^4.5.4",
-    "@endograph/sandbox-runtime": "0.0.75-endograph.1"
+    "@endograph/sandbox-runtime": "0.0.75-endograph.2"
   },
   "devDependencies": {
     "typescript": "^5.7.0"
