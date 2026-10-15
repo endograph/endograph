@@ -8,13 +8,20 @@ import type { Paths } from "./paths.ts";
  * unit never holds a secret. Existing environment wins over the file.
  */
 export function loadEnv(paths: Paths): string[] {
+  const entries = readEnv(paths);
+  for (const [key, value] of entries) if (process.env[key] === undefined) process.env[key] = value;
+  return entries.map(([key]) => key);
+}
+
+/** The `.env` entries in file order, without touching the process environment. */
+export function readEnv(paths: Paths): [key: string, value: string][] {
   let text: string;
   try {
     text = readFileSync(paths.env, "utf8");
   } catch {
     return [];
   }
-  const keys: string[] = [];
+  const entries: [string, string][] = [];
   for (const raw of text.split("\n")) {
     const line = raw.trim();
     if (!line || line.startsWith("#")) continue;
@@ -23,8 +30,7 @@ export function loadEnv(paths: Paths): string[] {
     const key = line.slice(0, eq).trim();
     let value = line.slice(eq + 1).trim();
     if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
-    if (process.env[key] === undefined) process.env[key] = value;
-    keys.push(key);
+    entries.push([key, value]);
   }
-  return keys;
+  return entries;
 }

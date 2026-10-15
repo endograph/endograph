@@ -4,9 +4,10 @@ import { basename, join, resolve } from "node:path";
 import { createAgentHost } from "../host/agent.ts";
 import { acquireLock, isLocked } from "../harness/lock.ts";
 import { pathsOf } from "../harness/paths.ts";
+import { shellQuote } from "../harness/shell.ts";
 import { adopt, heldElsewhere, HOST, readResidence, readStatus, since } from "../harness/residence.ts";
 import { recoverPromotion } from "../inception/promotion.ts";
-import { incept, InceptionFailed, inceptionStatus, validateProgram } from "../inception/incept.ts";
+import { incept, InceptionFailed, inceptionStatus, hasInteractiveInception, validateProgram } from "../inception/incept.ts";
 import { newId, PROTOCOL_VERSION, waitForReply, writeMessage } from "../protocol/wire.ts";
 import { hasPersistedStore, openSqliteStore } from "../store/sqlite.ts";
 import { snapshotAgent } from "../store/snapshot.ts";
@@ -18,10 +19,17 @@ import { installService, removeService, serviceInfo, serviceRunning } from "./se
 import { fromTemplate, interactiveSetup } from "./setup.ts";
 import { USAGE } from "./usage.ts";
 import { installDependencies } from "./dependencies.ts";
+import { completedSetupSession, createFromPrefab, loadPrefab, resumeSetup } from "./create.ts";
+import { nativeHandshake, runNativeSession } from "./native-session.ts";
+import { chooseHarness, configuredHarness, HARNESS_NAMES, HARNESSES, harnessOrder, HEADLESS, isHarness, setConfiguredHarness, type Harness } from "../inception/harnesses.ts";
+import { PromptCancelled, repositoryPrompt, intentPrompt, askText, startPrompt, intro, outro, log, note } from "./prompts.ts";
+import { runLocal } from "./local.ts";
 
 interface Flags {
   agent?: string;
   inceptor?: string;
+  harness?: Harness;
+  interactive: boolean;
   manual: boolean;
   accept: boolean;
   wait: boolean;
@@ -40,12 +48,18 @@ interface Flags {
 }
 
 function parse(argv: string[]): { command: string; flags: Flags } {
-  const flags: Flags = { manual: false, accept: false, wait: false, follow: false, foreground: false, service: false, force: false, adopt: false, noOpen: false, rest: [] };
+  const flags: Flags = { interactive: false, manual: false, accept: false, wait: false, follow: false, foreground: false, service: false, force: false, adopt: false, noOpen: false, rest: [] };
   let command = "";
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "--agent") flags.agent = argv[++i];
     else if (a === "--inceptor") flags.inceptor = argv[++i];
+    else if (a === "--harness") {
+      const value = argv[++i];
+      if (!isHarness(value)) { console.error(`--harness must be one of: ${HARNESSES.join(", ")}`); process.exit(2); }
+      flags.harness = value;
+    }
+    else if (a === "--interactive") flags.interactive = true;
     else if (a === "--manual") flags.manual = true;
     else if (a === "--accept") flags.accept = true;
     else if (a === "--wait") flags.wait = true;
@@ -94,7 +108,70 @@ async function noteIfDown(paths: ReturnType<typeof pathsOf>): Promise<void> {
   } catch {}
 }
 
+async function create(flags: Flags): Promise<number> {
+  if (flags.rest.length !== 1 || flags.agent || flags.service) return usage();
+  const prefab = loadPrefab(flags.rest[0]!);
+  if (!process.stdin.isTTY) throw new Error("endo create requires an interactive terminal");
+  const harness = chooseHarness(flags.harness);
+  intro(`Create ${prefab.name}`);
+  log.message(prefab.description);
+  log.info("Enter accepts the current choice. Esc or Ctrl+C cancels.");
+  const repo = await repositoryPrompt(prefab.directory);
+  const intent = await intentPrompt();
+  outro(`Opening ${HARNESS_NAMES[harness]}. Discuss the draft, then ask it to finish when you’re happy with it.`);
+  const agentDir = await createFromPrefab({ prefab, repo, intent, harness });
+  intro(`${prefab.name} setup complete`);
+  log.success(`Saved owner files in ${agentDir} and updated AGENTS.md.`);
+  try { await installDependencies(agentDir); }
+  catch (error) {
+    throw new Error(`${error instanceof Error ? error.message : String(error)}. Owner files are preserved; retry with npx endograph@latest up --interactive --agent ${shellQuote(agentDir)}.`);
+  }
+  note(`Review manifest.md and endograph.toml in ${agentDir}.
+Commit the owner files and lockfile; local state and credentials are ignored.
+The agent runs on ${HARNESS_NAMES[harness]} without a sandbox.`, "Your agent");
+  if (await startPrompt()) {
+    outro("Opening interactive inception, then starting your agent.");
+    return up({ ...flags, agent: agentDir, harness, interactive: true });
+  }
+  outro(`When ready: endo up --interactive --agent ${shellQuote(agentDir)}`);
+  return 0;
+}
+
+async function setupCommand(flags: Flags): Promise<number> {
+  if (flags.rest.length === 1 && ["ready", "finish"].includes(flags.rest[0]!)) {
+    await nativeHandshake(flags.rest[0]!, "setup");
+    return 0;
+  }
+  if (!process.stdin.isTTY) throw new Error("endo setup requires an interactive terminal");
+  // An unfinished creation has no grant yet, so resolve directory paths directly.
+  const agentDir = flags.agent ? resolveAgent(flags.agent) ?? resolve(flags.agent) : process.cwd();
+  await resumeSetup({ agentDir, harness: flags.harness, ...(flags.rest.length ? { intent: flags.rest.join(" ") } : {}) });
+  say(`Updated owner files in ${agentDir}.`);
+  say(`Review the files, then run endo up --agent ${shellQuote(agentDir)} when ready.`);
+  say("If the agent is already running with automatic inception, it will observe the owner changes.");
+  return 0;
+}
+
+function interactiveInceptor(flags: Flags) {
+  if (!flags.interactive) return undefined;
+  if (flags.manual || flags.accept || flags.inceptor || flags.service)
+    throw new Error("--interactive cannot be combined with --manual, --accept, --inceptor, or --service");
+  if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("--interactive requires an interactive terminal");
+  chooseHarness(flags.harness);
+  return (session: import("../inception/incept.ts").InteractiveInceptionSession) =>
+    runNativeSession({ ...session, harness: chooseHarness(flags.harness, session.previous?.harness), purpose: "inception" });
+}
+
+/** A headless inceptor: an explicit command, else the requested harness, else the grant or default order decides. */
+function headlessInceptor(flags: Flags): string | undefined {
+  if (flags.inceptor && flags.harness) throw new Error("--harness cannot be combined with --inceptor");
+  if (flags.interactive || !flags.harness) return flags.inceptor;
+  return HEADLESS[chooseHarness(flags.harness)];
+}
+
 async function up(flags: Flags): Promise<number> {
+  const interactive = interactiveInceptor(flags);
+  const inceptor = headlessInceptor(flags);
   if (!flags.agent && !existsSync(resolve("endograph.toml"))) {
     if (flags.template) {
       const err = fromTemplate(process.cwd(), flags.template);
@@ -108,16 +185,18 @@ async function up(flags: Flags): Promise<number> {
       return 0;
     } else {
       say(`no endograph.toml in ${process.cwd()}: setting up a new agent here`);
-      await interactiveSetup(process.cwd(), async (q, fallback) => {
-        const answer = (prompt(`${q}${fallback ? ` [${fallback}]` : ""}:`) ?? "").trim();
-        return answer || fallback || "";
-      });
+      await interactiveSetup(process.cwd(), askText);
       say("wrote endograph.toml and manifest.md; edit manifest.md before inception if the stub is not enough");
     }
   }
   const paths = target(flags);
   if (!paths) return 1;
-  await installDependencies(paths.agentDir);
+  if (!isLocked(paths.lock)) await installDependencies(paths.agentDir);
+  const local = await runLocal(paths.agentDir, ["up", "--agent", paths.agentDir,
+    ...(flags.foreground ? ["--foreground"] : []), ...(flags.service ? ["--service"] : []),
+    ...(flags.interactive ? ["--interactive"] : []), ...(flags.harness ? ["--harness", flags.harness] : []),
+    ...(flags.adopt ? ["--adopt"] : []), ...(flags.inceptor ? ["--inceptor", flags.inceptor] : [])]);
+  if (local !== null) return local;
   // Recover an interrupted filesystem promotion before preflight reads any candidate code.
   if (existsSync(join(paths.state, "promotion.json"))) {
     const lock = acquireLock(paths.lock);
@@ -127,7 +206,7 @@ async function up(flags: Flags): Promise<number> {
     }
     try { recoverPromotion(paths); } finally { lock.release(); }
   }
-  const host = await createAgentHost({ agentDir: paths.agentDir, inceptor: flags.inceptor, log: say });
+  const host = await createAgentHost({ agentDir: paths.agentDir, inceptor, log: say });
   try {
     let name: string;
     try {
@@ -144,19 +223,25 @@ async function up(flags: Flags): Promise<number> {
     // No program, or one the load pipeline rejects (an endograph or grant change since it was written): incept before installing anything.
     const status = await inceptionStatus(paths);
     const validation = await validateProgram({ paths, grant: await host.grant(), loadRuntime: host.loadRuntime });
-    if (!validation.ok) {
-      const reason = `${validation.error}${status.changed.length ? ` (changed since inception ${status.n}: ${status.changed.join(", ")})` : ""}`;
+    if (!validation.ok || (interactive && (status.n === 0 || status.changed.length > 0 || status.programEdited || hasInteractiveInception(paths)))) {
+      const reason = `${validation.ok ? "interactive inception requested" : validation.error}${status.changed.length ? ` (changed since inception ${status.n}: ${status.changed.join(", ")})` : ""}`;
       if (flags.service) {
         console.error(`${reason}; run \`endo up\` in a terminal so inception can run`);
         return 0;
       }
       say(`${reason}: running inception ${status.n + 1}`);
       try {
-        await incept({ agentDir: paths.agentDir, inceptor: flags.inceptor, log: say, loadRuntime: host.loadRuntime });
+        await incept({ agentDir: paths.agentDir, inceptor, interactive, initialSession: interactive ? completedSetupSession(paths.agentDir) : undefined, log: say, loadRuntime: host.loadRuntime });
       } catch (err) {
         console.error(err instanceof InceptionFailed ? err.message : `inception failed: ${err instanceof Error ? err.message : String(err)}`);
         return 1;
       }
+    }
+    // Interactive inception may have changed the runtime identity.
+    const finalName = (await host.grant()).name;
+    if (finalName !== name) {
+      claim(finalName, paths.agentDir);
+      name = finalName;
     }
     // A state directory another host holds (a copy, a synced mirror) runs here only when adopted; the move is a frame.
     const held = heldElsewhere(paths);
@@ -240,11 +325,17 @@ async function listAgents(): Promise<number> {
 }
 
 async function inceptCommand(flags: Flags): Promise<number> {
+  if (flags.rest.length === 1 && ["ready", "finish"].includes(flags.rest[0]!)) {
+    await nativeHandshake(flags.rest[0]!, "inception");
+    return 0;
+  }
+  const interactive = interactiveInceptor(flags);
+  const inceptor = headlessInceptor(flags);
   const paths = target(flags);
   if (!paths) return 1;
-  const host = await createAgentHost({ agentDir: paths.agentDir, inceptor: flags.inceptor, log: say });
+  const host = await createAgentHost({ agentDir: paths.agentDir, inceptor, log: say });
   try {
-    const result = await incept({ agentDir: paths.agentDir, inceptor: flags.inceptor, manual: flags.manual, accept: flags.accept, log: say, loadRuntime: host.loadRuntime });
+    const result = await incept({ agentDir: paths.agentDir, inceptor, interactive, initialSession: interactive ? completedSetupSession(paths.agentDir) : undefined, manual: flags.manual, accept: flags.accept, log: say, loadRuntime: host.loadRuntime });
     if ("manual" in result) say(`run your coding agent in ${resolve(result.workspace, "../..")}, then run \`endo incept --accept\` from ${paths.agentDir}`);
     return 0;
   } catch (err) {
@@ -511,18 +602,47 @@ async function apiCommand(flags: Flags): Promise<number> {
   return 0;
 }
 
+/** The machine-wide default harness for owner conversations and inception. */
+async function harnessCommand(flags: Flags): Promise<number> {
+  if (flags.rest.length > 1 || flags.agent) return usage();
+  const [value] = flags.rest;
+  if (value !== undefined) {
+    if (!isHarness(value)) throw new Error(`expected one of: ${HARNESSES.join(", ")}`);
+    setConfiguredHarness(value);
+  }
+  const order = harnessOrder();
+  const installed = order.find((harness) => Bun.which(harness));
+  say(`default harness: ${order[0]}${configuredHarness() ? "" : " (built-in)"}`);
+  for (const harness of HARNESSES) say(`  ${harness.padEnd(7)} ${Bun.which(harness) ? "installed" : "not installed"}`);
+  say(installed ? `endo opens ${HARNESS_NAMES[installed]} unless --harness chooses another` : "install codex or claude to create or incept agents");
+  return 0;
+}
+
 function usage(): number {
   console.error(USAGE);
   return 2;
 }
 
 const { command, flags } = parse(process.argv.slice(2));
-const handlers: Record<string, (f: Flags) => Promise<number>> = { api: apiCommand, up, down, logs, incept: inceptCommand, send, call, wait, commands, status, charter, replay, why, snapshot, reset, doctor, observatory };
+const handlers: Record<string, (f: Flags) => Promise<number>> = { create, setup: setupCommand, api: apiCommand, up, down, logs, incept: inceptCommand, harness: harnessCommand, send, call, wait, commands, status, charter, replay, why, snapshot, reset, doctor, observatory };
+if (command === "--help" || command === "help" || command === "-h") { console.log(USAGE); process.exit(0); }
+// All agent-targeted commands use an existing local version. Startup hands off itself, after
+// installing the locked dependencies: an older local version must not install over itself.
+if (flags.interactive && !["up", "incept"].includes(command)) { console.error("--interactive is supported by endo up and endo incept"); process.exit(1); }
+if (flags.harness && !["create", "setup", "up", "incept"].includes(command)) { console.error("--harness is supported by endo create, setup, up, and incept"); process.exit(1); }
+if (command && !["create", "setup", "harness", "up"].includes(command) && !(command === "incept" && ["ready", "finish"].includes(flags.rest[0] ?? ""))) {
+  const dir = flags.agent ? resolveAgent(flags.agent) : existsSync(resolve("endograph.toml")) ? process.cwd() : null;
+  if (dir) {
+    const code = await runLocal(dir, process.argv.slice(2));
+    if (code !== null) process.exit(code);
+  }
+}
 const run = command ? handlers[command] : listAgents;
 if (!run) process.exit(usage());
 run(flags).then(
   (code) => process.exit(code),
   (err: unknown) => {
+    if (err instanceof PromptCancelled) process.exit(130);
     console.error(err instanceof Error ? err.message : String(err));
     process.exit(1);
   },

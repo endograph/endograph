@@ -1,0 +1,6 @@
+{
+  "name": "endodev",
+  "directory": ".endodev",
+  "description": "An autonomous helper that takes care of development processes in this checkout.",
+  "setup": "setup.md"
+}

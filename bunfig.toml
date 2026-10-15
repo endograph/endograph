@@ -1,3 +1,7 @@
 [install]
 # Agent tsconfigs resolve Bun types through the root package.
 linker = "hoisted"
+
+[test]
+# Many tests start real processes (CLI, workers, sandboxes); a constrained machine needs headroom.
+timeout = 30000

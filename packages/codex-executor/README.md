@@ -24,7 +24,7 @@ experimental, so validate upgrades against the installed binary. See the
 [official app-server protocol](https://developers.openai.com/codex/app-server/).
 
 To switch back, replace the entire executor table with the existing
-`provider = "openai"` / `provider = "anthropic"` and `model` configuration.
+`provider = "openai"` and `model` configuration.
 Restarting keeps Projector's durable program, state and frames. Native Codex
 sessions and cache entries do not transfer to the AI SDK executor.
 
@@ -47,6 +47,10 @@ Projection is an intermediate representation, not a required exact transcript:
   resolves and validates against the current Projector action registry.
 - Projector `compact` summaries are appended. They do **not** force native
   compaction or forgetting. Codex manages its own context-window compaction.
+- Codex compaction keeps only its summary and recent user messages. When a
+  `contextCompaction` item completes, the host steers the current preamble, state
+  and action catalog back into that turn (`turn/steer`); if the turn has already
+  ended, the next turn resends them. History is not resent.
 - Changes during an action are included in its tool response. A terminal
   Projector action interrupts the native turn and completes the activation.
 
@@ -87,7 +91,7 @@ are declined. Agent effects go through Endograph actions in the worker and its
 existing sandbox/host grants. Owner-selected executable/model configuration is
 never accepted from worker requests.
 
-`CodexExecutor.realizePrompt` returns the projection input, not an exact native
+`NativeExecutor.realizePrompt` returns the projection input, not an exact native
 prompt. Execution reports include thread/turn IDs, latency and token usage when
 Codex supplies it. A persistent process preserves conversation continuity; it
 does not guarantee prompt-cache retention across idle periods.

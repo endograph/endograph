@@ -10,7 +10,7 @@ import type { HostClient } from "../host/client.ts";
 import { createHostLanguageModel } from "../host/model.ts";
 import { loadHostActions } from "../host/provisions.ts";
 import { aisdk, type ExecutorSpec } from "./executor.ts";
-import { CodexExecutor } from "@endograph/codex-executor";
+import { NATIVE_LABELS, NativeExecutor, type Rpc } from "@endograph/codex-executor";
 import type { BATTERY_NAMES, Battery, Grant } from "./grant.ts";
 
 const BATTERIES: Record<(typeof BATTERY_NAMES)[number], () => Battery> = { bash, evolve, scheduler };
@@ -38,12 +38,14 @@ export async function bindRuntime(paths: Paths, grant: Grant, host?: HostClient)
     if (!spec || typeof spec.create !== "function") throw new Error(`${paths.grant}: executor.module ${config.module} must export default { create(): ProjectorExecutor }`);
     executor = { ...spec, description: spec.description ?? `module ${config.module}` };
   } else if ("backend" in config) {
+    const backend = config.backend;
+    const rpc: Rpc = async (input, emit, signal) => {
+      if (!host) throw new Error(`${NATIVE_LABELS[backend]} execution requires the trusted host; run endo up`);
+      return host.model(input, emit, signal);
+    };
     executor = {
-      description: `codex ${config.model ?? "default model"}`,
-      create: () => new CodexExecutor(async (input, emit, signal) => {
-        if (!host) throw new Error("Codex execution requires the trusted host; run endo up");
-        return host.model(input, emit, signal);
-      }),
+      description: `${backend} ${config.model ?? "default model"}`,
+      create: () => new NativeExecutor(rpc, backend),
     };
   } else {
     const model = host ? createHostLanguageModel(host, { provider: config.provider, modelId: config.model }) : undefined;

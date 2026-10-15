@@ -28,7 +28,7 @@ export function release(args: string[], root: string, run: Run = runBun): void {
     throw new Error(usage);
   }
   const dryRun = option === "--dry-run";
-  const packages = [join(root, "packages/codex-executor"), root, join(root, "packages/server")].map((cwd) => {
+  const packages = [join(root, "packages/codex-executor"), join(root, "packages/claude-executor"), join(root, "packages/endodev"), root, join(root, "packages/server")].map((cwd) => {
     const file = join(cwd, "package.json");
     return { cwd, file, manifest: JSON.parse(readFileSync(file, "utf8")) };
   });

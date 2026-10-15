@@ -1,19 +1,27 @@
 import { assistantMessageFromTextOutput, createToolActionRequest, createUnboundActionContext, executeActionInvocation, hasActionOutputMessages, normalizeSchema,
   type CompiledInference, type ExecutorRunRequest, type ExecutorRunResult, type ExecutorRealizePromptRequest, type ProjectorExecutor } from "@projectors/core";
-import { json, object, type Projection, type Rpc } from "./protocol.ts";
-export type { Rpc } from "./protocol.ts";
+import { json, NATIVE_LABELS, object, type NativeBackend, type Projection, type Rpc } from "./protocol.ts";
+export { NATIVE_LABELS, type NativeBackend, type Rpc } from "./protocol.ts";
 
-/** Projector supplies an IR, not an exact model transcript. Native session policy lives in the host. */
-export class CodexExecutor implements ProjectorExecutor {
-  readonly identity = { name: "codex" };
-  constructor(private readonly rpc: Rpc) {}
+/**
+ * Projector supplies an IR, not an exact model transcript. Native session policy lives in the host,
+ * which speaks this RPC for Codex and for other native session backends.
+ */
+export class NativeExecutor implements ProjectorExecutor {
+  readonly identity: { name: string };
+  private readonly label: string;
+  constructor(private readonly rpc: Rpc, private readonly backend: NativeBackend) {
+    this.identity = { name: backend };
+    this.label = NATIVE_LABELS[backend];
+  }
 
   realizePrompt(request: ExecutorRealizePromptRequest) {
-    return { provider: "codex", input: { projection: project(request.inference), note: "The host appends changes to a persistent Codex thread; this is the input IR, not its full native transcript." } };
+    return { provider: this.backend, input: { projection: project(request.inference), note: `The host appends changes to a persistent ${this.label} session; this is the input IR, not its full native transcript.` } };
   }
 
   async run(request: ExecutorRunRequest): Promise<ExecutorRunResult> {
     if (request.signal?.aborted) return { completionReason: "cancelled" };
+    const { label } = this;
     const abort = new AbortController();
     const signal = request.signal ? AbortSignal.any([request.signal, abort.signal]) : abort.signal;
     const observed: string[] = [];
@@ -38,7 +46,7 @@ export class CodexExecutor implements ProjectorExecutor {
             request: actionRequest,
             enqueueRequestBeforeRun: true,
             enqueueMessages(messages) {
-              if (!open || request.signal?.aborted) throw new Error("Codex activation is closed");
+              if (!open || request.signal?.aborted) throw new Error(`${label} activation is closed`);
               request.enqueueFrame({ messages, ...(hasActionOutputMessages(messages, actionRequest) ? {} : { inert: true }) });
               observed.push(...history(messages));
             },
@@ -68,10 +76,10 @@ export class CodexExecutor implements ProjectorExecutor {
       if (request.signal?.aborted) return { completionReason: "cancelled" };
       await calls;
       if (toolError) throw toolError;
-      if (!object(result)) throw new Error("Invalid Codex turn result");
+      if (!object(result)) throw new Error(`Invalid ${label} turn result`);
       if (result.status === "continue") return { completionReason: "continue", continuationState: { token: result.continuation } };
       if (request.signal?.aborted || result.status === "interrupted" && !terminal) return { completionReason: "cancelled" };
-      if (result.status === "failed") throw new Error(result.error ?? "Codex turn failed");
+      if (result.status === "failed") throw new Error(result.error ?? `${label} turn failed`);
       const text = typeof result.text === "string" ? result.text : "";
       if (text) {
         const message = assistantMessageFromTextOutput(text, request.output);

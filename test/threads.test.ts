@@ -1,12 +1,15 @@
 import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openSqliteStore } from "../src/store/sqlite.ts";
 import { threadStore } from "../src/store/threads.ts";
 import { agentQuery } from "../src/client.ts";
-import { PROTOCOL_VERSION as v } from "../src/protocol/wire.ts";
+import { newId, PROTOCOL_VERSION as v, readReply } from "../src/protocol/wire.ts";
+import { openAgent } from "../src/harness/agent.ts";
+import { allFrames } from "../src/store/types.ts";
+import { answer, scripted } from "./fixtures/agent/scripted.ts";
 
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), "endo-threads-"));
@@ -110,4 +113,22 @@ test("independent clients serialize thread creation and messages without duplica
     expect((await agentQuery(f.dir, { op: "threads.list" }) as any).threads).toHaveLength(1);
     expect((await agentQuery(f.dir, { op: "frames.list" }) as any).total).toBe(1);
   } finally { f.remove(); }
+});
+test("a thread request queued by a client is served in that discussion", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "endo-threads-"));
+  cpSync(join(import.meta.dir, "fixtures/agent"), dir, { recursive: true });
+  mkdirSync(join(dir, ".endo/program"), { recursive: true });
+  writeFileSync(join(dir, ".endo/scripted.ts"), readFileSync(join(dir, "scripted.ts"), "utf8").replaceAll('"@projectors/core"', `"${import.meta.resolve("@projectors/core")}"`));
+  cpSync(join(import.meta.dir, "fixtures/program.ts"), join(dir, ".endo/program/agent.ts"));
+  await agentQuery(dir, { op: "threads.create", id: "discussion", title: "Arithmetic" });
+  const id = newId();
+  await agentQuery(dir, { op: "messages.send", id, threadId: "discussion", text: "2+2?" });
+  const agent = await openAgent({ agentDir: dir, executor: scripted(answer) });
+  try {
+    await agent.poll();
+    expect(readReply(agent.paths.outbox, id)).toMatchObject({ ok: true, text: "4" });
+    const page = await agentQuery(dir, { op: "messages.list", threadId: "discussion" }) as any;
+    expect(page.messages.map((m: any) => [m.kind, m.threadId])).toEqual([["request", "discussion"], ["reply", "discussion"]]);
+    expect(JSON.stringify([...allFrames(agent.store)])).toContain("thread=discussion"); // the agent sees which discussion it answers
+  } finally { await agent.stop(); rmSync(dir, { recursive: true, force: true }); }
 });

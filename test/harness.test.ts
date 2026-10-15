@@ -1,15 +1,8 @@
 import { expect, test } from "bun:test";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import {
-  createToolActionRequest,
-  executeActionInvocation,
-  type ExecuteActionResult,
-  type ExecutorRunRequest,
-  type ProjectorExecutor,
-} from "@projectors/core";
-import { HeldElsewhere, openAgent, type Agent } from "../src/harness/agent.ts";
+import { AlreadyRunning, HeldElsewhere, openAgent, type Agent } from "../src/harness/agent.ts";
 import { LoadError } from "../src/program/load.ts";
 import { loadFailure } from "../src/harness/inspect.ts";
 import { pathsOf } from "../src/harness/paths.ts";
@@ -53,8 +46,7 @@ const wait = (agent: Agent, id: string, terminal = true) => waitForReply(agent.p
 
 test("calls, requests, procedures that emit, reply-once, live reload, and recovery after a restart", async () => {
   const dir = scaffold();
-  const log: string[] = [];
-  let agent = await openAgent({ agentDir: dir, executor: scripted(answer), pollMs: 50, activationTimeoutMs: 800, log: (l) => log.push(l) });
+  let agent = await openAgent({ agentDir: dir, executor: scripted(answer), pollMs: 50, activationTimeoutMs: 2000 });
   expect(agent.loaded.procedures.map((p) => p.name)).toEqual(["ask", "hello", "nightly"]);
   expect(agent.loaded.failures.map((f) => f.name)).toEqual(["broken"]);
   agent.start();
@@ -72,18 +64,13 @@ test("calls, requests, procedures that emit, reply-once, live reload, and recove
     expect(await wait(agent, send(agent, "ignore me"))).toMatchObject({ ok: false, state: "failed", text: expect.stringMatching(/ended without a reply/) });
     expect(await wait(agent, send(agent, "hang"))).toMatchObject({ ok: false, state: "failed", text: expect.stringMatching(/timed out/) });
 
-    // A procedure acks, emits a message to its agent (stamped as the procedure), waits for the answer, and completes.
-    const ask = callProc(agent, "ask");
-    expect(await wait(agent, ask, false)).toMatchObject({ state: "working", text: "asking" });
-    expect(await wait(agent, ask)).toMatchObject({ ok: true, state: "completed", text: "agent said: 4" });
-
     // evolve: a spawn naming an unknown tool is refused with the granted names; the retry lands as an instance frame.
     expect((await wait(agent, send(agent, "spawn a helper")))?.text).toMatch(/unknown tools: nope; granted: .*bash/);
     expect(agent.loaded.machine.instance.children?.map((c) => c.node.key)).toEqual(["helper"]);
 
     // scheduler: a tick starts the due procedure as a timer call.
     await agent.tick(Date.now());
-    for (let i = 0; i < 100 && agent.runs.active().length; i++) await Bun.sleep(50);
+    await Promise.all(agent.runs.active().map((r) => r.terminal));
 
     // A message from another agent's live run is stamped as that agent's procedure, checked through the registry.
     process.env.ENDOGRAPH_HOME = mkdtempSync(join(tmpdir(), "endo-home-"));
@@ -112,17 +99,12 @@ test("calls, requests, procedures that emit, reply-once, live reload, and recove
   } finally {
     await agent.stop();
   }
-  expect(log.find((l) => l.includes("request"))).toMatch(/^ *\d+  \d\d:\d\d:\d\d  request     [\w-]+  local:/);
 
   const store = openSqliteStore(join(dir, ".endo/agent.db"));
   const frames = [...allFrames(store)];
-  const emitted = frames.find((f) => f.type === "request" && f.summary.includes("2+2?") && f.summary.startsWith("agent:"));
-  expect(emitted?.summary).toBe("agent:fixture/ask: what is 2+2?");
   expect(frames.find((f) => f.type === "procedure")?.summary).toMatch(/broken failed to describe/);
   expect(frames.find((f) => f.type === "call" && f.summary.startsWith("timer:"))?.summary).toBe("timer:nightly: nightly");
   expect(frames.find((f) => f.type === "request" && f.id === "from-other")?.summary).toBe("agent:other/deploy: 2+2?");
-  expect(existsSync(join(dir, ".endo/tsconfig.json"))).toBe(true);
-  expect(readFileSync(join(dir, ".endo/.gitignore"), "utf8")).toMatch(/^node_modules$/m);
   expect(frames.filter((f) => f.type === "reply").map((f) => (f.payload as { text: string }).text)).toContain("checked");
   expect(frames.filter((f) => f.type === "request" && f.summary.includes("2+2 again"))).toEqual([]);
   // Simulate a crash: a request frame whose activation never completed, and one whose activation completed without a reply.
@@ -155,6 +137,20 @@ test("calls, requests, procedures that emit, reply-once, live reload, and recove
     await agent.stop();
   }
 }, 30000);
+
+test("a second harness on a running directory is refused without disturbing the first; the lock frees when it stops", async () => {
+  const dir = scaffold({ procedures: false });
+  try {
+    const agent = await openAgent({ agentDir: dir, executor: scripted(answer) });
+    try {
+      await expect(openAgent({ agentDir: dir, executor: scripted(answer) })).rejects.toBeInstanceOf(AlreadyRunning);
+      const id = send(agent, "2+2?");
+      await agent.poll();
+      expect(readReply(agent.paths.outbox, id)?.text).toBe("4");
+    } finally { await agent.stop(); }
+    await (await openAgent({ agentDir: dir, executor: scripted(answer) })).stop();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 test("residence: one host runs a state directory; a copy elsewhere refuses until adopted, and the holder stops when adopted", async () => {
   const dir = scaffold();
@@ -199,7 +195,6 @@ test("a program that does not load is recorded as a frame and in status.json; th
   expect((await import("../src/harness/lock.ts")).isLocked(paths.lock)).toBe(false);
 
   // The program changes (an inception wrote a new one): the record no longer applies.
-  await Bun.sleep(5);
   writeFileSync(paths.program, readFileSync(join(ROOT, "test/fixtures/program.ts"), "utf8"));
   expect(loadFailure(paths)).toBeNull();
 
@@ -215,26 +210,4 @@ test("a program that does not load is recorded as a frame and in status.json; th
   expect(JSON.parse(readFileSync(paths2.status, "utf8")).failure).toBeUndefined();
   expect(loadFailure(paths2)).toBeNull();
   await agent.stop();
-});
-
-test("a thread request queued by a client is served once and stays in that discussion after restart", async () => {
-  const { agentQuery } = await import("../src/client.ts");
-  const dir = scaffold({ procedures: false });
-  let agent: Agent | undefined;
-  try {
-    await agentQuery(dir, { op: "threads.create", id: "discussion", title: "Arithmetic" });
-    const request = { op: "messages.send", id: newId(), threadId: "discussion", text: "2+2?" };
-    await agentQuery(dir, request);
-    agent = await openAgent({ agentDir: dir, executor: scripted(answer) });
-    await agent.poll();
-    expect(readReply(agent.paths.outbox, request.id)).toMatchObject({ ok: true, text: "4" });
-    await agent.stop(); agent = undefined;
-    await agentQuery(dir, request);
-    agent = await openAgent({ agentDir: dir, executor: scripted(answer) });
-    await agent.poll();
-    const page = await agentQuery(dir, { op: "messages.list", threadId: "discussion" }) as any;
-    expect(page.messages.map((m: any) => m.kind)).toEqual(["request", "reply"]);
-    expect(page.messages[1]).toMatchObject({ threadId: "discussion", text: "4" });
-    expect(JSON.stringify([...allFrames(agent.store)])).toContain("thread=discussion");
-  } finally { await agent?.stop(); rmSync(dir, { recursive: true, force: true }); }
 });

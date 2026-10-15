@@ -1,5 +1,13 @@
-import { existsSync, lstatSync, mkdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, lstatSync, mkdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
+
+/** The path the OS sandbox sees. A missing path resolves through its nearest existing ancestor, so a deny still matches what it would create. */
+export function canonical(path: string): string {
+  path = resolve(path);
+  if (existsSync(path)) return realpathSync(path);
+  const parent = dirname(path);
+  return parent === path ? path : join(canonical(parent), basename(path));
+}
 
 /** The agent directory and everything under `.endo/`, the state directory. */
 export interface Paths {

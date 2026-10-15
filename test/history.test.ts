@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { serializeInstance, type ExecutorRunRequest, type ProjectorExecutor } from "@projectors/core";
 import { loadGrant } from "../src/grant/grant.ts";
 import { bindRuntime } from "../src/grant/bind.ts";
-import { openAgent, type Agent } from "../src/harness/agent.ts";
+import { openAgent, OVERFLOW, type Agent } from "../src/harness/agent.ts";
 import { loadAgent } from "../src/program/load.ts";
 import { newId, PROTOCOL_VERSION, readReply, writeMessage } from "../src/protocol/wire.ts";
 import { scripted } from "./fixtures/agent/scripted.ts";
@@ -27,6 +27,9 @@ function executor(histories: ExecutorRunRequest["inference"]["history"][]): Proj
         expect((await call("compact", { summary: "The earlier request has been settled." })).success).toBe(true);
       } else if (request.text === "remember this") {
         expect((await call("update_state", { state: "notes", op: "append", path: ["lines"], values: ["once"] })).success).toBe(true);
+      } else if (request.text === "still working marker") {
+        await call("reply", { id: request.id, ok: true, state: "working", text: "on it" });
+        continue;
       }
       await call("reply", { id: request.id, ok: true, text: "done" });
     }
@@ -138,3 +141,106 @@ test("loading an inception's migrated instance restores history but applies only
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+const horizons = (agent: Agent) => agent.loaded.machine.frames.filter((f) => f.messages.some((m) => m.type === "horizon"));
+const noticed = (agent: Agent) => agent.loaded.machine.frames.some((f) => f.messages.some((m) => m.type === "user" && (m.actor as { id?: string } | undefined)?.id === "endo"));
+
+test("history past its limits carries a compaction notice, then the harness compacts it before the next request", async () => {
+  const dir = fixture();
+  const histories: ExecutorRunRequest["inference"]["history"][] = [];
+  const agent = await openAgent({ agentDir: dir, executor: executor(histories), history: { noticeBytes: 1500, compactBytes: 6000 } });
+  try {
+    await send(agent, "remember this");
+    const working = newId();
+    writeMessage(agent.paths.inbox, { v: PROTOCOL_VERSION, kind: "request", id: working, text: "still working marker", at: Date.now() });
+    await agent.poll();
+    expect(readReply(agent.paths.outbox, working)).toMatchObject({ state: "working" });
+    await send(agent, "earliest marker");
+    for (let i = 0; JSON.stringify(histories.at(-1)).includes("earliest marker"); i++) {
+      expect(i).toBeLessThan(40);
+      await send(agent, `filler ${i}`);
+    }
+    expect(noticed(agent)).toBe(true);
+    expect(horizons(agent).length).toBeGreaterThan(0); // recent summaries can carry the marker past a first compaction
+    const after = JSON.stringify(histories.at(-1));
+    expect(after).toContain(`id=${working}`); // still owed a reply, so carried past the horizon
+    expect(after).not.toContain("earliest marker");
+    expect(agent.loaded.machine.instance.states?.notes?.value).toEqual({ lines: ["once"] });
+    expect(JSON.stringify(agent.loaded.machine.frames)).toContain("earliest marker");
+  } finally {
+    await agent.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an activation whose history overflows is compacted and delivered once more", async () => {
+  const dir = fixture();
+  const histories: ExecutorRunRequest["inference"]["history"][] = [];
+  const delegate = executor(histories);
+  let refused = 0;
+  const runtime: ProjectorExecutor = {
+    ...delegate,
+    async run(request) {
+      if (JSON.stringify(request.inference.history).includes("oversized marker")) { refused++; throw new Error("host request too large"); }
+      return delegate.run(request);
+    },
+  };
+  const agent = await openAgent({ agentDir: dir, executor: runtime });
+  try {
+    const id = newId();
+    writeMessage(agent.paths.inbox, { v: PROTOCOL_VERSION, kind: "request", id, text: "an oversized request\noversized marker", at: Date.now() });
+    await agent.poll();
+    expect(readReply(agent.paths.outbox, id)).toMatchObject({ ok: false, state: "failed" }); // the request itself is too large
+    expect(refused).toBe(2);
+    await send(agent, "after the overflow");
+    expect(refused).toBe(2);
+    expect(horizons(agent).length).toBeGreaterThan(0);
+    expect(JSON.stringify(histories.at(-1))).not.toContain("oversized marker");
+  } finally {
+    await agent.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an activation that overflows after acting is delivered once more with the actions it started", async () => {
+  const dir = fixture();
+  const histories: ExecutorRunRequest["inference"]["history"][] = [];
+  let runs = 0;
+  const acting = scripted(async ({ call }) => {
+    expect((await call("update_state", { state: "notes", op: "append", path: ["lines"], values: ["once"] })).success).toBe(true);
+    throw new Error("host request too large");
+  });
+  const delegate = executor(histories);
+  const runtime: ProjectorExecutor = { ...delegate, run: (request) => (runs++ === 0 ? acting : delegate).run(request) };
+  const agent = await openAgent({ agentDir: dir, executor: runtime });
+  try {
+    const id = newId();
+    writeMessage(agent.paths.inbox, { v: PROTOCOL_VERSION, kind: "request", id, text: "act then overflow", at: Date.now() });
+    await agent.poll();
+    expect(runs).toBe(2);
+    expect(readReply(agent.paths.outbox, id)).toMatchObject({ ok: true, state: "completed" });
+    expect(horizons(agent)).toHaveLength(1);
+    expect(JSON.stringify(histories.at(-1))).toContain("update_state");
+    expect(agent.loaded.machine.instance.states?.notes?.value).toBeUndefined(); // the failed attempt recorded nothing
+  } finally {
+    await agent.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  "host request too large",
+  "context_length_exceeded",
+  "This model's maximum context length is 200000 tokens",
+  "prompt is too long: 210000 tokens > 200000 maximum",
+  "input exceeds the context window",
+])("%s is a context overflow", (error) => expect(OVERFLOW.test(error)).toBe(true));
+
+test.each([
+  "context canceled",
+  "context deadline exceeded",
+  "TypeError: undefined is not an object (evaluating 'Context.x')",
+  "host result too large",
+  "model chunk too large",
+  "max_tokens: 64000 > 32000, which is the maximum allowed number of output tokens",
+])("%s is not a context overflow", (error) => expect(OVERFLOW.test(error)).toBe(false));

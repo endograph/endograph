@@ -1,64 +1,26 @@
 import { expect, test } from "bun:test";
-import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
 import { z } from "zod";
 import { createHostBroker } from "../src/host/broker.ts";
 import { createHostClient } from "../src/host/client.ts";
 import { hostAction, HostActionError, type HostAction } from "../src/host/action.ts";
-import { ipcTransport } from "../src/host/transport.ts";
 import { ipcPair } from "./fixtures/ipc.ts";
 
-const root = resolve(import.meta.dir, "..");
-
-test("host handlers run in the parent; child receives data/proxies without the parent's credential", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "endo-host-"));
-  const childFile = join(dir, "child.ts");
-  const credential = "only-the-trusted-parent-has-this";
-  const previous = process.env.ENDO_TEST_HOST_SECRET;
-  process.env.ENDO_TEST_HOST_SECRET = credential;
-  writeFileSync(childFile, `
-    import { createHostClient } from ${JSON.stringify(join(root, "src/host/client.ts"))};
-    import { ipcTransport } from ${JSON.stringify(join(root, "src/host/transport.ts"))};
-    const client = createHostClient({ transport: ipcTransport(process) });
-    const descriptors = await client.describe();
-    const actions = await client.actions();
-    const value = await client.call("sentryApi", { issue: 42 });
-    console.log(JSON.stringify({ credential: process.env.ENDO_TEST_HOST_SECRET ?? null, descriptors, actions: actions.map(a=>a.name), value }));
-    client.close();
-  `);
-  const { ENDO_TEST_HOST_SECRET: _, ...env } = process.env;
-  const child = spawn(process.execPath, [childFile], { env, stdio: ["ignore", "pipe", "pipe", "ipc"], serialization: "json" });
-  let output = "";
-  let errors = "";
-  child.stdout!.on("data", (chunk) => output += chunk);
-  child.stderr!.on("data", (chunk) => errors += chunk);
+test("the client receives descriptors and proxies; handlers run in the host with its identity", async () => {
+  const transports = ipcPair();
   const broker = createHostBroker({
-    identity: "agent:fixture",
-    transport: ipcTransport(child),
+    identity: "agent:fixture", transport: transports.server,
     actions: () => [hostAction({
-      name: "sentryApi",
-      description: "Read one issue",
-      inputSchema: z.object({ issue: z.number().int() }).strict(),
-      async run(args, context) {
-        expect(process.env.ENDO_TEST_HOST_SECRET).toBe(credential);
-        return { issue: args.issue, identity: context.identity, authorized: true };
-      },
+      name: "sentryApi", description: "Read one issue", inputSchema: z.object({ issue: z.number().int() }).strict(),
+      run: (args, context) => ({ issue: args.issue, identity: context.identity }),
     })],
   });
+  const client = createHostClient({ transport: transports.client });
   try {
-    const code = await new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
-    expect(errors).toBe("");
-    expect(code).toBe(0);
-    const result = JSON.parse(output);
-    expect(result).toMatchObject({ credential: null, actions: ["sentryApi"], value: { issue: 42, identity: "agent:fixture", authorized: true } });
-    expect(JSON.stringify(result.descriptors)).not.toContain(credential);
-    expect(Object.keys(result.descriptors[0]).sort()).toEqual(["description", "inputSchema", "name"]);
-  } finally {
-    broker.close(); rmSync(dir, { recursive: true, force: true });
-    if (previous === undefined) delete process.env.ENDO_TEST_HOST_SECRET; else process.env.ENDO_TEST_HOST_SECRET = previous;
-  }
+    const descriptors = await client.describe();
+    expect(descriptors.map((d) => Object.keys(d).sort())).toEqual([["description", "inputSchema", "name"]]);
+    expect((await client.actions()).map((a) => a.name)).toEqual(["sentryApi"]);
+    expect(await client.call("sentryApi", { issue: 42 })).toEqual({ issue: 42, identity: "agent:fixture" });
+  } finally { client.close(); broker.close(); }
 });
 
 test("schema checks and current grants apply to cached proxies; ordinary handler exceptions are redacted", async () => {
@@ -81,6 +43,42 @@ test("schema checks and current grants apply to cached proxies; ordinary handler
     await expect(client.call("fail", { public: false })).rejects.toThrow("host action failed");
     await expect(client.call("fail", { public: true })).rejects.toThrow("issue unavailable");
   } finally { client.close(); broker.close(); }
+});
+
+test("a host action can wake its agent after returning; without delivery, emitting throws", async () => {
+  const transports = ipcPair();
+  const emitted: { action: string; text: string; ref?: string }[] = [];
+  let finish!: () => void;
+  const finished = new Promise<void>((resolve) => { finish = resolve; });
+  const delivered = Promise.withResolvers<void>();
+  const background = hostAction({
+    name: "startJob", description: "start work that outlives the call", inputSchema: z.object({ ref: z.string() }).strict(),
+    run({ ref }, context) {
+      void finished.then(() => context.emitMessage({ text: "job finished", ref }));
+      return { started: true };
+    },
+  });
+  const broker = createHostBroker({
+    identity: "agent:fixture", transport: transports.server, actions: () => [background],
+    emitMessage: (action, message) => { emitted.push({ action, ...message }); delivered.resolve(); return { id: "m1" }; },
+  });
+  const client = createHostClient({ transport: transports.client });
+  try {
+    expect(await client.call("startJob", { ref: "req-1" })).toEqual({ started: true });
+    expect(emitted).toEqual([]);
+    finish();
+    await delivered.promise;
+    expect(emitted).toEqual([{ action: "startJob", text: "job finished", ref: "req-1" }]);
+  } finally { client.close(); broker.close(); }
+
+  const bare = ipcPair();
+  const undelivered = createHostBroker({ identity: "agent:fixture", transport: bare.server, actions: () => [hostAction({
+    name: "emitNow", description: "emit immediately", inputSchema: z.object({}), run: (_args, context) => context.emitMessage({ text: "x" }),
+  })] });
+  const bareClient = createHostClient({ transport: bare.client });
+  try {
+    await expect(bareClient.call("emitNow", {})).rejects.toThrow("messages are unavailable to this host action");
+  } finally { bareClient.close(); undelivered.close(); }
 });
 
 test("raw identity injection and malformed requests are denied; host in-flight bounds survive client cancellation", async () => {

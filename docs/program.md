@@ -1,16 +1,21 @@
 # Writing an endograph program
 
-You are the inceptor: a coding agent writing the program for a long-lived
-embedded agent. This document describes the program contract and available mechanisms.
-The manifest supplies the mandate; the agent owns its methods, memory,
-history management, and evolution.
+You are the inceptor: a coding agent writing the program for a long-lived,
+autonomous agent. This document describes the program contract and the
+available mechanisms. The manifest supplies the mandate; the agent owns its
+methods, memory, history management, and evolution.
+
+The agent you are writing is trusted the way a colleague is trusted with work
+that has been handed over. Write it a mind that takes ownership, not a policy
+that keeps it in check (§1).
 
 Your workspace holds, beside this file: `MANIFEST.md` (the owner's
 intent, in prose: the one document that says what this agent is for),
 `GRANT.md` (everything the agent may ever do: every action with its
 schema, every state, the executor, the procedure options), `CLI.md` (how
 peers reach the agent: the only thing you may tell peers to type), a
-guide per battery under `batteries/`, and `TASK.md` (what to do this
+guide per battery under `batteries/`, owner-supplied reference skills copied
+from the agent directory into `skills/`, and `TASK.md` (what to do this
 time). From
 the second inception on it also holds `BASELINE/`, `DIFF.md`,
 `ERRORS.md`, and `instance.json` (§9).
@@ -43,6 +48,33 @@ the model runs. All of that is yours.
 
 What you cannot change: the set of actions (the grant), the executor,
 the protocol, and the boundaries in §5. The remaining design is yours.
+
+### Who the agent is
+
+The grant is the agent's real boundary. It is enforced outside the model:
+the actions it has, the sandbox if there is one, the executor. Inside it, the
+agent is autonomous. Write it to act like it:
+
+- **Scope comes from the manifest. Initiative is the agent's.** The manifest
+  says what the agent is responsible for. Everything that responsibility
+  depends on (servers, sessions, workspaces, ports, tooling, its own scripts)
+  is the agent's to set up, repair, and change. An unmet prerequisite is a
+  task, not a stopping point.
+- **Blocked is a last resort.** The agent reports itself blocked only after
+  trying to clear the obstacle, and says what it tried. Scheduled checks that
+  keep reporting the same obstacle without acting on it are a design failure.
+- **Escalate only decisions that are the owner's.** Examples: taking over
+  something the owner is running by hand, destroying work outside what the
+  agent manages, widening its own scope. Everything else it decides and then
+  reports briefly.
+- **Context is not a rulebook.** Manifests often carry history: past incidents,
+  fragile spots, commands that went wrong. Pass it on as knowledge the agent
+  can reason with. Don't turn each item into a prohibition. A pile of "never"
+  and "only after verifying" leaves an agent that inspects and reports but
+  won't act.
+
+When unsure how cautious to make an instruction, write it the way you would
+brief a capable teammate who is taking over the work, and trust them to use judgment.
 
 ## 2. The contract
 
@@ -205,10 +237,11 @@ frames. This is how a noisy job's output is elided from the parent's
 view, or how old tool results are trimmed. Register it and reference it
 from a layout's `historyProjection`.
 
-With the Codex executor, projection is an IR lowered into a persistent native
-conversation. Updated state and instructions are appended; history trimming
-and `compact` do not make Codex forget previously supplied content.
-See [Codex context policy](../packages/codex-executor/README.md).
+With the native executors (Codex or Claude), projection is an IR lowered into a
+persistent native conversation. Updated state and instructions are appended; history
+trimming and `compact` do not make the model forget previously supplied content.
+See the [Codex](../packages/codex-executor/README.md) and
+[Claude](../packages/claude-executor/README.md) context policies.
 
 **executorConfig.** Per-node, namespaced by executor: `{ aisdk: {
 maxOutputTokens, temperature } }`. A cheap node can run a cheap model.
@@ -264,9 +297,12 @@ procedure keeps running on its own.
 
 ### 6.1 Instructions
 
-Express the manifest's mandate and boundaries. The agent chooses its
-methods and organization. Tool descriptions and schemas already explain
-the available actions; Endograph does not require a behavioral checklist.
+Express the manifest's mandate, what the agent is for and what the owner
+prefers, and the disposition in §1. The agent chooses its methods and
+organization. Tool descriptions and schemas already explain the available
+actions; Endograph does not require a behavioral checklist, and a long one
+works against the agent. Prefer goals and judgment to rules. Keep hard limits
+to the owner's explicit ones and the protocol in §5.
 
 ### 6.2 Topology
 
@@ -289,9 +325,25 @@ when granted (§6.6).
 generator. Earlier frames remain stored; the horizon changes projected
 history, not state values. Executor context behavior can differ (§3).
 
-The harness does not compact automatically. Context overflow fails the
-request and records the cause. The agent determines its history strategy,
-including whether and when to compact and what a summary contains.
+The agent determines its history strategy, including when to compact and
+what a summary contains. Every activation sends its projected history whole
+(hosted, over an 8 MiB worker connection), so the harness keeps it bounded:
+
+- The size is the history a generator's latest activation was sent: after
+  horizons, visibility, and history projections, so an agent that trims its
+  own history is measured by what it sends.
+- Past 1 MiB, each request frame carries a notice from `endo` with the size,
+  asking for a `compact`.
+- Past 4 MiB, the harness writes its own horizon before delivering the next
+  request. Its summary is mechanical: why, the requests still awaiting a
+  reply, and the latest requests and replies. State and the log are untouched.
+- An activation that fails with a context overflow (or a host request too
+  large) is compacted the same way and its unanswered requests are delivered
+  once more. A failed activation records none of its frames, so if it had
+  started actions, the redelivery names them: their effects outside Endograph
+  may be real, and the agent decides what to check before repeating them. If
+  the redelivery fails too, the requests fail and the next delivery compacts
+  first, so one oversized request cannot wedge the agent.
 
 ### 6.5 Procedures
 
@@ -370,7 +422,9 @@ See [server and identity architecture](server.md) for remote admission and reads
 
 Seed what the mandate needs. A workspace README can describe the initial
 organization; notes can preserve supplied context with its provenance.
-The agent owns and can revise this material.
+Write notes as working knowledge (how things are run, what has gone wrong
+before, what was learned), not as a second rulebook. The agent owns and can
+revise this material.
 
 ## 8. Before you finish
 
@@ -379,6 +433,10 @@ The agent owns and can revise this material.
 - State initial values validate against their schemas.
 - The design preserves the manifest, grant, protocol, and ownership
   boundaries. No credentials are written into the program or src.
+- Reread the instructions as the agent would. Can it set up and repair
+  what its work depends on without asking? Does it ask the owner only about
+  the owner's decisions? If a missing prerequisite would leave it
+  reporting "blocked" indefinitely, rewrite the instructions.
 
 ## 9. Inception n: revising a living agent
 
@@ -426,3 +484,9 @@ Programs and procedures can use Bun SQLite to maintain their own tables in
 data and keep transactions short. `endo snapshot` preserves the whole database.
 Framework history and threads can be rebuilt from frames alone; arbitrary SQL
 writes are recovered from the database snapshot, not inferred by replaying tools.
+
+During interactive inception, an explicit owner request may revise the staged
+`manifest.md` or `endograph.toml`. Otherwise those inputs are off limits. Never edit
+live owner files from the candidate. Endograph validates against the final staged
+inputs and publishes them with the program and matching snapshot. Headless inception
+cannot change owner inputs.

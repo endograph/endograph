@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
+import { mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { runShell } from "../src/batteries/bash.ts";
+import { join } from "node:path";
+import { bash, runShell } from "../src/batteries/bash.ts";
 
 test("exit code and output tail come back; a timeout kills the whole process tree", async () => {
   const ok = await runShell("seq 1 5; echo err >&2; exit 3", { cwd: tmpdir(), tailLines: 3 });
@@ -17,4 +19,10 @@ test("exit code and output tail come back; a timeout kills the whole process tre
     alive = false;
   }
   expect(alive).toBe(false);
+});
+
+test("the bash battery runs in the granted cwd", async () => {
+  const cwd = realpathSync(mkdtempSync(join(tmpdir(), "endo-")));
+  const [action] = bash().actions!({ name: "t", cwd, charter: () => { throw new Error("no charter"); } });
+  expect(await action!.run!({ cmd: "pwd; echo err >&2; exit 2" }, {})).toBe(`exit 2\n${cwd}\nerr`);
 });

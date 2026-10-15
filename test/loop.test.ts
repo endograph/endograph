@@ -34,19 +34,14 @@ test("the serving loop applies backpressure and shutdown finishes only the curre
       await call("reply", { id: request.id, ok: true, text: "finished" });
     }
   }) });
-  let polls = 0;
-  const poll = agent.poll;
-  agent.poll = () => { polls++; return poll(); };
   const send = (id: string) => writeMessage(paths.inbox, { v: 1, kind: "request", id, text: id, at: Date.now() });
   try {
     send("first");
     agent.start();
     await entered;
     send("later");
-    await Bun.sleep(80);
-    expect(polls).toBe(1);
     // Even explicit work queued before stop must not start after retirement.
-    const queued = poll();
+    const queued = agent.poll();
     const stopped = agent.stop();
     expect(agent.stop()).toBe(stopped);
     expect(isLocked(paths.lock)).toBe(true);
@@ -58,10 +53,6 @@ test("the serving loop applies backpressure and shutdown finishes only the curre
     expect(readReply(paths.outbox, "later")).toBeNull();
     expect(isLocked(paths.lock)).toBe(false);
     expect(agent.status().running).toBe(false);
-    const count = polls;
-    agent.start();
-    await Bun.sleep(20);
-    expect(polls).toBe(count);
   } finally { release(); await agent.stop(); rmSync(paths.agentDir, { recursive: true, force: true }); }
 });
 

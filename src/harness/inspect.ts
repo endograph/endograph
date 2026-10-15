@@ -48,7 +48,9 @@ export async function inspectAgent(paths: Paths, fallbackName = basename(paths.a
   } else if (attempt) {
     reason = attempt.inceptor === "manual"
       ? `inception ${attempt.n} is open for a manual session (since ${attempt.started}); \`endo incept --accept\`, then \`endo up\``
-      : `inception ${attempt.n} was interrupted (since ${attempt.started}); \`endo incept\` again`;
+      : attempt.inceptor === "interactive"
+        ? `interactive inception ${attempt.n} was interrupted (since ${attempt.started}); \`endo incept --interactive\` resumes it`
+        : `inception ${attempt.n} was interrupted (since ${attempt.started}); \`endo incept\` again`;
   } else if (!existsSync(paths.program)) {
     reason = "no program; `endo up` incepts one";
   } else if (failure) {

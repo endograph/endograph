@@ -6,7 +6,7 @@ and fake credentials; no model API key is required.
 
 ## Publishing
 
-All three packages share a release version. From the repository root:
+All four packages share a release version. From the repository root:
 
 ```sh
 bun run release:check   # preview current versions; changes nothing
@@ -19,7 +19,7 @@ bun run release major   # bump all major versions, resetting minor and patch
 A bump updates all manifests and the lockfile, without creating a Git commit
 or tag. It also updates the server's Endograph runtime dependency to the same
 version. The root development override resolves that dependency to this checkout;
-consumers install the published version. Publishing is sequential: `@endograph/codex-executor`, `endograph`, then
+consumers install the published version. Publishing is sequential: `@endograph/codex-executor`, `@endograph/endodev`, `endograph`, then
 `@endograph/server`.
 If publishing fails, versions stay bumped. Retry with `bun run release`
 without a bump argument; already-published versions are skipped. Publishing
@@ -68,3 +68,55 @@ inference. The native protocol setup was also smoke-tested with Codex 0.153.3
 (`initialize` and `thread/start` with dynamic tools, no model turn). See
 [the executor package](../packages/codex-executor/README.md) for configuration
 and context semantics.
+
+## Claude backend
+
+`bun test packages/claude-executor/test` checks the same session reuse, recovery,
+tool validation, parking, cancellation and terminal behavior against a fake runtime,
+plus serialized parallel tool calls, output-schema changes, the tool-call limit, and
+a missing transcript. It needs neither a Claude login nor model inference. The real
+runtime was smoke-tested with Agent SDK 0.3.280 and `claude-sonnet-5`: an action call
+through the MCP tool, a follow-up in the same live conversation, a host restart that
+resumed it, and a missing transcript reported as a failed result. A foreground
+`endo up --harness claude` agent with `backend = "claude"` was also incepted headlessly
+by `claude -p` and answered a request end to end.
+
+## Interactive creation
+
+`bun test test/prompts.test.ts` runs the setup prompts in real terminals, checking
+Enter defaults, optional empty intent, cancellation, and inline path validation.
+
+`bun test test/native-session.test.ts test/create.test.ts` exercises a real Bun PTY
+and CLI completion helper with offline Codex and Claude Code stand-ins. It covers exact thread
+resume, cancellation, missing completion, failed exits, terminal restoration,
+suppression of automatic shutdown output after an authenticated finish signal,
+draft recovery, concurrent owner edits, validation, and worktree identity without
+model calls. Native setup requires Bun 1.3.5 or later on macOS or Linux and a
+signed-in Codex CLI. The shutdown/resume mechanism was smoke-tested with Codex
+0.155.1, including quitting while a tool was active. The native create → finish →
+resume → edit → finish flow was also verified against a temporary repository; the
+same thread was retained and both publications passed validation. Endograph
+prompts after terminal shutdown were separately verified. No development
+processes or inception ran in those smoke tests. The Claude Code session (2.1.280)
+was smoke-tested the same way: `--session-id` start, ready/finish handshake while a
+tool was active, `/exit` shutdown, and `--resume` of the same session, including
+when launched from inside another Claude Code session.
+`bun test test/harnesses.test.ts` covers default selection, fallback, and `endo harness`.
+
+The offline CLI fixture also runs create through both native sessions, verifies
+that inception resumes the setup conversation, validates and promotes through the
+same host as standalone inception, and checks that startup follows promotion.
+Core tests cover pending-session precedence and fresh conversations for later inceptions.
+Owner-input tests cover requested staged edits, cancellation/resume, validation with
+changed capabilities, inline and relocated manifests, matching snapshot hashes, and
+promotion recovery for owner files. A real headless subprocess attempts reads,
+writes, and deletion of protected inputs while retaining access to candidate code.
+
+## Interactive inception
+
+The inception tests exercise interactive validation retries, same-thread resume,
+cancellation and round exhaustion, source changes between or during sessions,
+owner-input protection, and promotion. Offline Codex and Claude Code fixtures run
+`endo up --interactive` and `endo incept --interactive` through real PTYs and the
+CLI finish helper, with the trusted host's validator. The shared terminal tests
+also verify that setup and inception use their respective finish commands.

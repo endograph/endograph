@@ -46,12 +46,18 @@ sit in \`.endo/outbox/<id>.json\` as \`{ id, ok, state, text, at }\`.
 export const USAGE = `endo — embedded agents
 
 owner:
+  endo create <prefab> [--harness <h>]        customize a prefab (endodev), install dependencies, then offer interactive inception and startup
+  endo setup [--agent <dir>] [--harness <h>] [request]
+                                              resume the prefab setup conversation to finish or revise owner files
   endo up [--foreground] [--inceptor <cmd>]   run this directory's agent under launchd/systemd (incepting first if its program is missing or cannot load)
+  endo up --interactive [--harness <h>]       use a native coding agent when inception is needed, then start normally
   endo up --adopt                             run a state directory another host still holds (a copy, a synced mirror); the move is a frame
   endo down                                   stop the service and remove its unit
   endo logs [-f]                              the service log
-  endo incept [--manual|--accept] [--inceptor <cmd>]
+  endo incept --interactive [--harness <h>]   start or resume inception in a native coding agent; validate and promote on finish
+  endo incept [--manual|--accept] [--inceptor <cmd>|--harness <h>]
                                               re-incept: headless, or render the workspace and stop / validate and record
+  endo harness [codex|claude]                 show or set the default coding agent (<h>); built-in: codex, else claude
   endo up --template <dir>                    seed endograph.toml + manifest.md from <dir> first; with neither and no template, endo asks
   endo doctor                                 grant, program, registry, unit, env, procedures, inputs vs the last inception
   endo observatory [--port <n>] [--no-open]   open a live, read-only localhost view of projector and inception

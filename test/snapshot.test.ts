@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, watch, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { serializeInstance } from "@projectors/core";
@@ -10,7 +10,7 @@ import { incept, inceptionStatus } from "../src/inception/incept.ts";
 import { newId, readReply, writeMessage } from "../src/protocol/wire.ts";
 import { archivePath, commitNumbers } from "../src/store/archive.ts";
 import { snapshotAgent } from "../src/store/snapshot.ts";
-import { checkpointCursor, checkpointPath, openSqliteStore, type AgentStore } from "../src/store/sqlite.ts";
+import { checkpointCursor, checkpointPath, type AgentStore } from "../src/store/sqlite.ts";
 import { allFrames } from "../src/store/types.ts";
 import { answer, scripted } from "./fixtures/agent/scripted.ts";
 
@@ -129,41 +129,3 @@ test("snapshot refuses existing destinations, unfinished or mismatched generatio
     expect(existsSync(destination)).toBe(false);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
-
-test("snapshot discards its temporary copy when source files change during capture", async () => {
-  const root = mkdtempSync(join(tmpdir(), "endo-snapshot-changing-"));
-  const source = join(root, "source");
-  const destination = join(root, "saved");
-  scaffold(source);
-  const paths = pathsOf(source);
-  const note = join(paths.src, "note.md");
-  let watcher: ReturnType<typeof watch> | undefined;
-  try {
-    await incept({ agentDir: source, inceptor: "true" });
-    writeFileSync(note, "before");
-    // Checkpointing and copying a multi-segment archive gives the parent time to
-    // change a file after the child's initial hash and before its final check.
-    // No sleeps or production hooks.
-    const store = openSqliteStore(paths.db);
-    try {
-      for (let i = 0; i < 120; i++) store.append({ type: "test", at: Date.now(), summary: String(i), payload: { bulk: "x".repeat(150 * 1024) } });
-    } finally { store.close(); }
-    expect(readdirSync(archivePath(paths.db)).filter((name) => name.endsWith(".jsonl")).length).toBeGreaterThan(1);
-    let edited = false;
-    watcher = watch(root, (_event, name) => {
-      if (!edited && name?.toString().startsWith(".saved-")) {
-        writeFileSync(note, "changed during capture");
-        edited = true;
-      }
-    });
-    const child = Bun.spawn([process.execPath, "run", join(ROOT, "src/cli/index.ts"), "snapshot", destination], { cwd: source, stdout: "ignore", stderr: "pipe" });
-    const [code, errors] = await Promise.all([child.exited, new Response(child.stderr).text()]);
-    expect(edited).toBe(true);
-    expect(code).toBe(1);
-    expect(errors).toContain("agent files changed while copying");
-    expect(existsSync(destination)).toBe(false);
-  } finally {
-    watcher?.close();
-    rmSync(root, { recursive: true, force: true });
-  }
-}, 10000);

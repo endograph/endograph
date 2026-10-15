@@ -1,6 +1,7 @@
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Paths } from "../harness/paths.ts";
+import type { NativeSession } from "./harnesses.ts";
 
 /**
  * `.endo/inceptions/<n>/`: the evidence of an inception, kept whether or
@@ -22,6 +23,8 @@ export interface RecordMeta {
 export interface RoundInput {
   /** The inceptor's output; absent for a manual round. */
   stdout?: string;
+  /** Native conversation used for an interactive round; its transcript remains in the harness's storage. */
+  native?: NativeSession;
   stderr?: string;
   exitCode?: number;
   inceptorMs?: number;
@@ -55,6 +58,9 @@ export function openRecord(paths: Paths, meta: RecordMeta, opts: { keep?: boolea
       if (stdout !== undefined) writeFileSync(join(round, "stdout.txt"), stdout);
       if (stderr) writeFileSync(join(round, "stderr.txt"), stderr);
       if (errors) writeFileSync(join(round, "ERRORS.md"), `# ERRORS (round ${k})\n\n${errors}\n`);
+      if (existsSync(paths.grant)) cpSync(paths.grant, join(round, "endograph.toml"));
+      const manifest = join(paths.agentDir, "manifest.md");
+      if (existsSync(manifest)) cpSync(manifest, join(round, "manifest.md"));
       if (existsSync(paths.program)) cpSync(paths.program, join(round, "agent.ts"));
       if (existsSync(paths.src)) cpSync(paths.src, join(round, "src"), { recursive: true });
       for (const f of ["CHANGES.md", "instance.json"]) if (existsSync(join(paths.workspace, f))) cpSync(join(paths.workspace, f), join(round, f));

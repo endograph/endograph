@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join, relative } from "node:path";
 import { inspectAgent, type Inspection } from "../harness/inspect.ts";
@@ -282,10 +281,3 @@ function readJson<T>(path: string): T | null {
   }
 }
 
-function fileHash(path: string): string | undefined {
-  try {
-    return createHash("sha256").update(readFileSync(path)).digest("hex").slice(0, 16);
-  } catch {
-    return undefined;
-  }
-}

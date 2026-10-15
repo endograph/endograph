@@ -1,5 +1,6 @@
 import { copyFileSync, existsSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
+import { chooseHarness, HARNESS_NAMES } from "../inception/harnesses.ts";
 
 /**
  * Three ways into an agent directory: it holds a grant; `--template <dir>`
@@ -17,18 +18,19 @@ export function fromTemplate(dir: string, template: string): string | null {
 }
 
 export async function interactiveSetup(dir: string, ask: (question: string, fallback?: string) => Promise<string>): Promise<void> {
+  const backend = chooseHarness();
+  const label = HARNESS_NAMES[backend];
   const name = await ask("agent name (kebab-case)", basename(dir).toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-|-$/g, ""));
-  const provider = await ask("executor (anthropic | openai | codex)", "anthropic");
-  const model = await ask("model", provider === "codex" ? "" : provider === "openai" ? "gpt-5.6-luna" : "claude-opus-5");
+  const model = await ask(`${label} model (empty uses the ${label} default)`, "");
   const manifest = await ask("manifest: a path to a markdown file, or enter to write a stub to edit", "");
   const batteries = (await ask("batteries (comma-separated: bash)", "bash")).split(",").map((b) => b.trim()).filter(Boolean);
-  const grant = `name = "${name}"
+  const grant = `name = ${JSON.stringify(name)}
 manifest = "manifest.md"
-batteries = [${batteries.map((b) => `"${b}"`).join(", ")}]
+batteries = [${batteries.map((b) => JSON.stringify(b)).join(", ")}]
 
 [executor]
-${provider === "codex" ? 'backend = "codex"' : `provider = "${provider}"`}
-${model ? `model = "${model}"` : "# model omitted: use the Codex default"}
+backend = ${JSON.stringify(backend)}
+${model ? `model = ${JSON.stringify(model)}` : `# model omitted: use the ${label} default`}
 
 [inception]
 rounds = 5

@@ -1,8 +1,9 @@
-import { closeSync, fsyncSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StdioAppServer, type AppServer, type ServerMessage } from "./app-server.ts";
-import { contextUpdate, cursor, digest, type Cursor } from "./context.ts";
+import { contextUpdate, cursor, standingContext } from "./context.ts";
+import { checkpoint, SessionFiles, type SessionRecord } from "./sessions.ts";
 import { DYNAMIC_TOOLS, INSTRUCTIONS, json, object, requestSchema, type Json, type Projection, type RunInput, type ToolResult } from "./protocol.ts";
 export type { AppServer, ServerMessage } from "./app-server.ts";
 
@@ -14,19 +15,24 @@ export interface CodexHostOptions {
   command?: string;
   effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
   maxToolCalls?: number;
+  /** The grant has no sandbox. Codex's native tools are disabled either way; this only keeps the
+   * sandbox mode Codex reports to the model consistent with what Endograph actions can do. */
+  unsandboxed?: boolean;
   /** Dependency injection for offline protocol tests. */
   server?: AppServer;
 }
-interface Session { version: 1; threadId: string; cursor?: Cursor; pending?: string; activationId?: string; model?: string; usage?: Record<string, number> }
+interface Session extends SessionRecord { threadId: string; usage?: Record<string, number> }
 interface Active {
   input: RunInput; session: Session; projection: Projection; emit(event: Json): void;
   resolve(value: Json): void; reject(error: Error): void;
   turnId?: string; stopped: boolean; terminal: boolean; calls: number; text: Map<string, string>;
   usage?: any; startedAt: number;
-  tools: Map<string, { id: string | number; callId: string }>;
+  tools: Map<string, { id: string | number; name: string }>;
   continuation: string;
   waiting: boolean;
-  response?: { id: string | number; success: boolean; text: string; observed: string[] };
+  /** The native turn ended while an Endograph action was still running. */
+  ended: boolean;
+  response?: { id: string | number; name: string; success: boolean; text: string; observed: string[] };
   queued: ServerMessage[];
 }
 
@@ -36,12 +42,14 @@ export class CodexHost {
   private cwd: string;
   private config?: Record<string, Json>;
   private sessions = new Map<string, Session>();
+  private files: SessionFiles<Session>;
   private loaded = new Set<string>();
   private active = new Map<string, Active>();
   private starting = false;
   private closed = false;
   private unsubscribe: () => void;
   constructor(private options: CodexHostOptions) {
+    this.files = new SessionFiles(options, "threadId");
     this.cwd = mkdtempSync(join(tmpdir(), "endograph-codex-"));
     this.server = options.server ?? new StdioAppServer({ command: options.command, cwd: this.cwd });
     this.unsubscribe = this.server.subscribe((m) => this.onMessage(m));
@@ -54,10 +62,8 @@ export class CodexHost {
     if (input.op === "checkpoint") {
       const session = this.sessions.get(input.generatorId);
       if (!session || session.pending !== input.activationId || this.active.has(input.generatorId)) throw new Error("No matching completed Codex activation");
-      session.cursor = cursor(input.projection, input.observed);
-      session.activationId = input.activationId;
-      delete session.pending;
-      this.save(input.generatorId, session);
+      checkpoint(session, input);
+      this.files.save(input.generatorId, session);
       return null;
     }
     if (this.starting) throw new Error("Codex host already has an active executor step");
@@ -73,27 +79,6 @@ export class CodexHost {
       // The pending marker causes a new thread, seeded from committed Projector IR.
       return await this.run(input, signal, emit);
     } finally { this.starting = false; }
-  }
-  private save(generator: string, session: Session) {
-    mkdirSync(this.options.stateDir, { recursive: true, mode: 0o700 });
-    const path = join(this.options.stateDir, `${digest(generator)}.json`);
-    const temp = `${path}.${crypto.randomUUID()}.tmp`;
-    try {
-      writeFileSync(temp, JSON.stringify(session), { mode: 0o600 });
-      const fd = openSync(temp, "r");
-      try { fsyncSync(fd); } finally { closeSync(fd); }
-      renameSync(temp, path);
-      const dir = openSync(this.options.stateDir, "r");
-      try { fsyncSync(dir); } finally { closeSync(dir); }
-    }
-    finally { rmSync(temp, { force: true }); }
-  }
-  private read(generator: string): Session | undefined {
-    try {
-      const value = JSON.parse(readFileSync(join(this.options.stateDir, `${digest(generator)}.json`), "utf8"));
-      if (value.version === 1 && typeof value.threadId === "string" && !value.pending && typeof value.activationId === "string"
-        && value.model === this.options.model && this.options.isActivationCommitted(value.activationId)) return value;
-    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   }
   private async threadConfig() {
     if (this.config) return this.config;
@@ -115,13 +100,14 @@ export class CodexHost {
   private async run(input: RunInput, signal: AbortSignal, emit: (event: Json) => void): Promise<Json> {
     const config = await this.threadConfig();
     signal.throwIfAborted();
-    let session = this.sessions.get(input.generatorId) ?? this.read(input.generatorId);
+    let session = this.sessions.get(input.generatorId) ?? this.files.read(input.generatorId);
     // An uncertain turn may already have performed effects. Never replay its native calls.
     if (session?.pending) session = undefined;
-    const settings = { model: this.options.model, cwd: this.cwd, sandbox: "read-only", approvalPolicy: "never",
+    const settings = { model: this.options.model, cwd: this.cwd, sandbox: this.options.unsandboxed ? "danger-full-access" : "read-only", approvalPolicy: "never",
       baseInstructions: INSTRUCTIONS, config, environments: [] };
     if (session && !this.loaded.has(session.threadId)) {
-      try { await this.server.request("thread/resume", { ...settings, threadId: session.threadId }); }
+      // The response is unused, and a long-lived thread's full turn history can exceed the 16 MiB line cap.
+      try { await this.server.request("thread/resume", { ...settings, threadId: session.threadId, excludeTurns: true }); }
       catch (error) {
         // Only missing rollouts justify a fresh session. Auth/transport failures must surface.
         if (!/thread.*not found|no rollout|failed to load rollout/i.test(String(error))) throw error;
@@ -137,22 +123,24 @@ export class CodexHost {
     this.sessions.set(input.generatorId, session);
     signal.throwIfAborted();
     session.pending = input.activationId;
-    this.save(input.generatorId, session);
+    this.files.save(input.generatorId, session);
     const completion = Promise.withResolvers<Json>();
     const active: Active = { input, session, projection: input.projection, emit, ...completion,
       stopped: false, terminal: false, calls: 0, text: new Map(), tools: new Map(), startedAt: Date.now(),
-      continuation: crypto.randomUUID(), waiting: false, queued: [] };
+      continuation: crypto.randomUUID(), waiting: false, ended: false, queued: [] };
     this.active.set(input.generatorId, active);
     // The completion event can arrive before the turn/start response.
     const resultTask = completion.promise;
     void resultTask.catch(() => {});
     return this.step(active, signal, resultTask, async () => {
       const prefix = `Endograph activation ${input.activationId}\n`;
-      const result = await this.server.request("turn/start", { threadId: session.threadId,
-        input: [{ type: "text", text: prefix + contextUpdate(input.projection, session.cursor, (1 << 20) - prefix.length) }],
-        ...(this.options.effort ? { effort: this.options.effort } : {}), ...(input.outputSchema ? { outputSchema: input.outputSchema } : {}) });
-      active.turnId ??= result.turn?.id;
+      await this.startTurn(active, prefix + contextUpdate(input.projection, session.cursor, (1 << 20) - prefix.length));
     });
+  }
+  private async startTurn(active: Active, text: string) {
+    const result = await this.server.request("turn/start", { threadId: active.session.threadId, input: [{ type: "text", text }],
+      ...(this.options.effort ? { effort: this.options.effort } : {}), ...(active.input.outputSchema ? { outputSchema: active.input.outputSchema } : {}) });
+    active.turnId ??= result.turn?.id;
   }
   private async continue(active: Active, input: RunInput, signal: AbortSignal, emit: (event: Json) => void): Promise<Json> {
     const response = active.response!;
@@ -160,8 +148,15 @@ export class CodexHost {
     const completion = Promise.withResolvers<Json>();
     Object.assign(active, completion, { input, emit, projection: input.projection, waiting: false, response: undefined });
     active.session.pending = input.activationId;
-    this.save(input.generatorId, active.session);
+    this.files.save(input.generatorId, active.session);
     return this.step(active, signal, completion.promise, async () => {
+      if (active.ended) {
+        // The native call is gone; deliver the result as the input of a new turn.
+        active.ended = false;
+        await this.startTurn(active, `Endograph: your ${response.name} action was still running when your turn ended. It has finished; its result follows. `
+          + `Wait for pending actions before ending a turn.\n${response.text}` + (update === "{}" ? "" : `\nEndograph context update:\n${update}`));
+        return;
+      }
       this.server.respond(response.id, { success: response.success, contentItems: [{ type: "inputText", text: response.text + (update === "{}" ? "" : `\nEndograph context update:\n${update}`) }] });
       const queued = active.queued.shift();
       if (queued) this.onMessage(queued);
@@ -184,7 +179,9 @@ export class CodexHost {
     }
   }
   private async interrupt(active: Active) {
-    if (active.stopped || !active.turnId) return;
+    if (active.stopped) return;
+    if (active.ended) { active.stopped = true; active.resolve(json({ status: "interrupted", error: null, text: "" })); return; }
+    if (!active.turnId) return;
     try {
       await this.server.request("turn/interrupt", { threadId: active.session.threadId, turnId: active.turnId });
       // A successful interrupt request still needs its completion event. Bound that wait.
@@ -197,7 +194,10 @@ export class CodexHost {
     const pending = active?.tools.get(input.token);
     if (!active || !pending || active.stopped) throw new Error("Unknown or completed Codex tool call");
     active.tools.delete(input.token);
-    if (input.terminal) {
+    if (input.terminal && active.ended) {
+      active.stopped = true;
+      active.resolve(json({ status: "completed", error: null, text: "" }));
+    } else if (input.terminal) {
       active.terminal = true;
       this.server.respond(pending.id, { success: input.success, contentItems: [{ type: "inputText", text: input.text }] });
       void this.interrupt(active);
@@ -205,7 +205,7 @@ export class CodexHost {
       // Projector applies staged state/topology frames when run() returns.
       // Hold the native response until the next executor step supplies that IR.
       active.waiting = true;
-      active.response = { id: pending.id, success: input.success, text: input.text, observed: input.observed };
+      active.response = { id: pending.id, name: pending.name, success: input.success, text: input.text, observed: input.observed };
       active.resolve({ status: "continue", continuation: active.continuation });
     }
     return null;
@@ -237,7 +237,7 @@ export class CodexHost {
         this.server.respond(message.id, { success: true, contentItems: [{ type: "inputText", text: JSON.stringify(active.projection.tools) }] });
       } else if (p.tool === "endograph_call" && object(p.arguments) && typeof p.arguments.name === "string" && object(p.arguments.arguments)) {
         const token = crypto.randomUUID();
-        active.tools.set(token, { id: message.id, callId: p.callId });
+        active.tools.set(token, { id: message.id, name: p.arguments.name });
         active.emit(json({ type: "tool", token, callId: p.callId, name: p.arguments.name, arguments: p.arguments.arguments }));
       } else this.server.respond(message.id, { success: false, contentItems: [{ type: "inputText", text: "Unknown tool or invalid arguments." }] });
       return;
@@ -247,7 +247,16 @@ export class CodexHost {
     if (message.method === "turn/started") active.turnId = p.turn.id;
     if (message.method === "item/completed" && p.item?.type === "agentMessage" && p.item.phase !== "commentary") active.text.set(p.item.id, p.item.text);
     if (message.method === "thread/tokenUsage/updated") active.usage = p.tokenUsage;
-    if (message.method === "turn/completed") {
+    if (message.method === "item/completed" && p.item?.type === "contextCompaction") this.restore(active);
+    if (message.method === "turn/completed" && p.turn?.status === "completed" && (active.tools.size || active.waiting)) {
+      // Code-mode models poll a long action and may give up on it, ending the turn while it runs.
+      // An interrupted or failed turn still settles the activation.
+      // Its effects are real: keep the activation and deliver the result in a new turn.
+      active.ended = true;
+      delete active.turnId;
+      active.text.clear();
+      active.queued.length = 0;
+    } else if (message.method === "turn/completed") {
       active.stopped = true;
       const total = active.usage?.total;
       const usage = total ? Object.fromEntries(["inputTokens", "cachedInputTokens", "outputTokens"].map((key) => [key, Math.max(0, total[key] - (active.session.usage?.[key] ?? 0))])) : undefined;
@@ -256,6 +265,13 @@ export class CodexHost {
         execution: { model: this.options.model, latencyMs: Date.now() - active.startedAt, threadId: active.session.threadId, turnId: p.turn.id,
           ...(usage ? { usage: { inputTokens: usage.inputTokens, cachedInputTokens: usage.cachedInputTokens, outputTokens: usage.outputTokens } } : {}) } }));
     }
+  }
+  /** Codex keeps only its summary and a recent tail of user messages: give the turn its standing context again. */
+  private restore(active: Active) {
+    const mark = () => { active.session.compacted = true; };
+    if (!active.turnId) return mark();
+    this.server.request("turn/steer", { threadId: active.session.threadId, expectedTurnId: active.turnId, input: [{ type: "text", text: standingContext(active.projection) }] })
+      .catch(mark);
   }
   async close() {
     if (this.closed) return;

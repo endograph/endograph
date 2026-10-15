@@ -83,7 +83,6 @@ test("without an acknowledgement, first resolves to the terminal reply", async (
     const run = runs.start({ procedure: spec(file), args: {} });
     expect(await run.first).toBe(await run.terminal);
     expect(await run.first).toMatchObject({ state: "failed", text: "broken\nexample exited 2" });
-    await Bun.sleep(150);
     expect(replies.map((reply) => reply.state)).toEqual(["failed"]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -96,6 +95,7 @@ test("a model tool call can acknowledge, message its own agent, await its answer
   writeFileSync(join(paths.procedures, "ask.ts"), readFileSync(join(ROOT, "test/fixtures/procedures/ask.ts"), "utf8").replace("20000", "3000"));
   let procedureRun: Run | undefined;
   let result: unknown;
+  let asker: string | undefined;
   const agent = await openAgent({ agentDir: dir, pollMs: 25, activationTimeoutMs: 5000, executor: scripted(async (turn) => {
     for (const request of turn.requests) {
       if (request.text === "start the procedure") {
@@ -104,6 +104,7 @@ test("a model tool call can acknowledge, message its own agent, await its answer
         procedureRun = agent.runs.active().find((run) => run.procedure === "ask");
         await turn.call("reply", { id: request.id, ok: action.success, text: action.success ? String(action.value) : String(action.error) });
       } else {
+        asker = request.from;
         await turn.call("reply", { id: request.id, ok: true, text: "4" });
       }
     }
@@ -116,6 +117,7 @@ test("a model tool call can acknowledge, message its own agent, await its answer
     expect(result).toMatchObject({ success: true, value: "asking" });
     expect(procedureRun).toBeDefined();
     expect(await procedureRun!.terminal).toMatchObject({ state: "completed", text: "agent said: 4" });
+    expect(asker).toBe("agent:fixture/ask"); // stamped as the procedure that emitted it
     expect(agent.runs.active()).toEqual([]);
   } finally {
     await agent.stop();

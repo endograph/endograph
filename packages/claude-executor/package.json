@@ -1,0 +1,23 @@
+{
+  "name": "@endograph/claude-executor",
+  "version": "0.0.5",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/endograph/endograph.git",
+    "directory": "packages/claude-executor"
+  },
+  "homepage": "https://github.com/endograph/endograph/tree/main/packages/claude-executor#readme",
+  "bugs": {
+    "url": "https://github.com/endograph/endograph/issues"
+  },
+  "exports": {
+    "./host": "./src/host.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.280",
+    "@endograph/codex-executor": "workspace:*",
+    "zod": "^4.5.4"
+  }
+}

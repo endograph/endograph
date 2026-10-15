@@ -1,12 +1,10 @@
-import { existsSync, mkdirSync, realpathSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getDefaultWritePaths, SandboxManager, type SandboxRuntimeConfig } from "@endograph/sandbox-runtime";
 import type { Grant } from "../grant/grant.ts";
-import { ENDOGRAPH_ROOT, type Paths } from "../harness/paths.ts";
-
-const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
-const canonical = (path: string) => existsSync(path) ? realpathSync(path) : path;
+import { canonical, ENDOGRAPH_ROOT, type Paths } from "../harness/paths.ts";
+import { shellQuote } from "../harness/shell.ts";
 
 /** One policy per outer process. Every program import and descendant runs under it. */
 export async function sandboxCommand(paths: Paths, grant: Grant, argv: string[]): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }> {
@@ -35,6 +33,7 @@ export async function sandboxCommand(paths: Paths, grant: Grant, argv: string[])
   mkdirSync(paths.local, { recursive: true, mode: 0o700 });
   const runtime = [ENDOGRAPH_ROOT, dirname(canonical(process.execPath)),
     dirname(fileURLToPath(import.meta.resolve("@endograph/codex-executor"))),
+    dirname(fileURLToPath(import.meta.resolve("@endograph/claude-executor/host"))),
     dirname(fileURLToPath(import.meta.resolve("@projectors/core"))),
     dirname(fileURLToPath(import.meta.resolve("@projectors/aisdk-executor")))].map(canonical);
   // Linked packages resolve dependencies from their own ancestor node_modules.
@@ -89,7 +88,7 @@ export async function sandboxCommand(paths: Paths, grant: Grant, argv: string[])
   // runtime directories in the actual sandboxed command, after that wrapper.
   const command = ["/usr/bin/env", `HOME=${canonical(home)}`, `TMPDIR=${canonical(temp)}`, "BUN_RUNTIME_TRANSPILER_CACHE_PATH=0",
     ...argv.map((arg) => arg.startsWith("/") ? canonical(arg) : arg)];
-  const wrapped = await SandboxManager.wrapWithSandboxArgv(command.map(quote).join(" "), "/bin/sh", config, undefined, canonical(paths.agentDir));
+  const wrapped = await SandboxManager.wrapWithSandboxArgv(command.map(shellQuote).join(" "), "/bin/sh", config, undefined, canonical(paths.agentDir));
   const env: NodeJS.ProcessEnv = {};
   for (const key of forwarded) if (process.env[key] !== undefined) env[key] = process.env[key];
   env.HOME = canonical(home);
