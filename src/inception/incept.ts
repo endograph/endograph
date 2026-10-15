@@ -1,27 +1,32 @@
 import { createHash } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
+import { atomicWrite } from "../protocol/wire.ts";
 import { serializeInstance, type SerializedInstance } from "@projectors/core";
 import { grantActions } from "../grant/core.ts";
 import { loadGrant, type Grant } from "../grant/grant.ts";
 import { bindRuntime } from "../grant/bind.ts";
 import type { HostClient } from "../host/client.ts";
 import { acquireLock } from "../harness/lock.ts";
-import { ensureStateDir, pathsOf, type Paths } from "../harness/paths.ts";
+import { canonical, ensureStateDir, pathsOf, type Paths } from "../harness/paths.ts";
 import { loadAgent, LoadError } from "../program/load.ts";
 import type { DescribeFailure } from "../procedures/describe.ts";
 import { hasPersistedStore, openSqliteStore } from "../store/sqlite.ts";
 import { allFrames } from "../store/types.ts";
+import { protectInceptor } from "./sandbox.ts";
+import { readEnv } from "../harness/env.ts";
 import { promote, recoverPromotion } from "./promotion.ts";
 import { renderEvolution } from "./evolution.ts";
 import { openRecord } from "./record.ts";
-import { describeGrant, renderWorkspace, writeSnapshot } from "./workspace.ts";
+import { describeGrant, renderGrant, renderWorkspace, writeSnapshot } from "./workspace.ts";
+import { harnessOrder, HEADLESS, type NativeConversation, type NativeSession } from "./harnesses.ts";
 
 /**
  * Inception: a coding agent writes the program from the owner's inputs,
- * with the agent stopped. Headless (`claude -p` or `codex exec`, or any
+ * with the agent stopped. Headless (`codex exec`, `claude -p`, or any
  * `--inceptor` command given the prompt as its last argument, run in the
- * agent directory), or by hand: `--manual` renders the workspace and
+ * agent directory), interactively through an owner editor callback, or by hand:
+ * `--manual` renders the workspace and
  * stops, `--accept` validates what the owner's session wrote and records
  * it. Every success is an `inception` frame, a fresh machine snapshot,
  * and a copy of the inputs, the program, and src under snapshots/<n>/.
@@ -35,8 +40,12 @@ export interface InceptOptions {
   /** What set this inception off; recorded in the frame. Default "owner" (`endo incept`, or `endo up` with no loadable program). */
   trigger?: "owner" | "auto";
   agentDir: string;
-  /** The inceptor command; default from the grant, else the first of claude, codex on PATH. */
+  /** The inceptor command; default from the grant, else the preferred installed harness. */
   inceptor?: string;
+  /** Owner-driven editing of the staged candidate; returns only after an explicit finish handoff. */
+  interactive?: InteractiveInceptor;
+  /** Optional prior conversation for the first inception only; pending sessions take precedence. */
+  initialSession?: NativeSession;
   manual?: boolean;
   accept?: boolean;
   log?: (line: string) => void;
@@ -44,12 +53,30 @@ export interface InceptOptions {
   loadRuntime?: RuntimeLoader;
 }
 
+export interface InteractiveInceptionSession extends NativeConversation {
+  directory: string;
+  instructions: string;
+}
+export type InteractiveInceptor = (session: InteractiveInceptionSession) => Promise<void>;
+
+interface InteractiveState {
+  version: 1;
+  n: number;
+  source: string;
+  rounds: number;
+  native?: NativeSession;
+}
+const interactiveFile = (paths: Paths) => join(paths.local, "inception", "session.json");
+export const hasInteractiveInception = (paths: Paths) => existsSync(interactiveFile(paths));
+
 export interface RuntimeLoadInput {
   /** Candidate program/procedures and live store paths. */
   paths: Paths;
   /** Original owner grant/executor locations, even when paths points at a candidate. */
   ownerPaths: Paths;
   cwd: string;
+  /** Host-parsed final owner inputs for this validation; never supplied by generated code. */
+  grant?: Grant;
   instance?: SerializedInstance;
 }
 export interface RuntimeLoadResult {
@@ -77,12 +104,10 @@ export class InceptionFailed extends Error {
 
 const VERSION = (JSON.parse(readFileSync(resolve(import.meta.dir, "../../package.json"), "utf8")) as { version: string }).version;
 const PROMPT = "Read .endo/workspace/TASK.md and do exactly what it says.";
-const DEFAULT_INCEPTORS = [
-  ["claude", "claude -p --dangerously-skip-permissions"],
-  ["codex", "codex exec --dangerously-bypass-approvals-and-sandbox"],
-] as const;
 
 export async function incept(opts: InceptOptions): Promise<InceptResult | { workspace: string; manual: true }> {
+  if (opts.interactive && (opts.manual || opts.accept || opts.inceptor))
+    throw new Error("interactive inception cannot be combined with manual, accept, or a custom inceptor");
   const paths = pathsOf(resolve(opts.agentDir));
   ensureStateDir(paths);
   // Inception owns the state directory while it runs: the harness's own lock, so no `endo up` loads a
@@ -107,47 +132,110 @@ async function inceptHolding(paths: Paths, opts: InceptOptions): Promise<InceptR
   recoverPromotion(paths);
   const log = opts.log ?? (() => {});
   const grant = await loadGrant(paths);
+  let finalGrant = grant;
   const grantHash = hashOf(paths.grant);
   const last = lastInception(paths);
   const n = (last?.n ?? 0) + 1;
   const started = Date.now();
-  const inceptor = opts.accept || opts.manual ? "manual" : (opts.inceptor ?? grant.inception.inceptor ?? (await defaultInceptor()));
+  const inceptor = opts.interactive ? "interactive" : opts.accept || opts.manual ? "manual" : (opts.inceptor ?? grant.inception.inceptor ?? (await defaultInceptor()));
 
-  if (!opts.accept) {
+  const stateFile = interactiveFile(paths);
+  const source = opts.interactive ? interactiveSource(paths, grant) : undefined;
+  let session = opts.accept ? undefined : resumableDraft(paths, n, source, log);
+  if (!opts.accept && !session) {
     const baseline = last ? await baselineOf(paths, grant, last, opts.loadRuntime) : undefined;
     const workspace = renderWorkspace({ paths, grant, description: describeGrant(paths, grant), n, version: VERSION, baseline });
     log(`workspace rendered at ${workspace} (inception ${n})`);
     const candidate = prepareCandidate(paths);
+    writeFileSync(join(candidate.agentDir, "manifest.md"), grant.manifest.text);
     if (opts.manual) {
       openRecord({ ...candidate, inceptions: paths.inceptions }, { n, version: VERSION, inceptor });
       return { workspace: candidate.workspace, manual: true };
     }
   }
+  const resumed = !!session;
+  if (opts.interactive && !session) {
+    session = { version: 1, n, source: source!, rounds: 0, ...(n === 1 && opts.initialSession ? { native: opts.initialSession } : {}) };
+    saveInteractive(stateFile, session);
+  }
   const candidate = candidatePaths(paths);
   if (!existsSync(candidate.workspace)) throw new Error("no staged inception; run endo incept --manual first");
   // Validate against live state and runtime cwd, while importing only candidate code.
-  if (hashOf(candidate.grant) !== grantHash || readFileSync(join(candidate.workspace, "MANIFEST.md"), "utf8") !== grant.manifest.text)
+  const candidateMatches = () => existsSync(candidate.grant) && hashOf(candidate.grant) === grantHash &&
+    existsSync(join(candidate.workspace, "MANIFEST.md")) && readFileSync(join(candidate.workspace, "MANIFEST.md"), "utf8") === grant.manifest.text;
+  if (!opts.interactive && !candidateMatches())
     throw new Error("owner inputs changed since the candidate was prepared; start a new inception");
   const staged = { ...candidate, db: paths.db, snapshots: paths.snapshots, inceptions: paths.inceptions };
   // --accept keeps the record --manual opened, so the workspace as rendered survives.
-  const record = openRecord(staged, { n, version: VERSION, inceptor, ...(opts.accept ? {} : { prompt: PROMPT }) }, { keep: opts.accept });
+  const record = openRecord(staged, { n, version: VERSION, inceptor, ...(opts.accept ? {} : { prompt: PROMPT }) }, { keep: opts.accept || resumed });
 
-  let rounds = 0;
+  let rounds = session?.rounds ?? 0;
+  let attempts = 0;
   let state: SerializedInstance;
+  let manifestTargetBefore: string | undefined;
+  let finalConfig = readFileSync(candidate.grant, "utf8");
   const maxRounds = opts.accept ? 1 : grant.inception.rounds;
   for (;;) {
     rounds++;
+    attempts++;
     let run: Awaited<ReturnType<typeof runInceptor>> | undefined;
     if (!opts.accept) {
-      log(`inceptor round ${rounds}/${grant.inception.rounds}: ${inceptor}`);
-      const prompt = rounds > 1 ? `${PROMPT} Validation failed; ERRORS.md in the workspace has the stage and the error. Fix the program and src.` : PROMPT;
-      run = await runInceptor(inceptor, prompt, candidate.agentDir, log);
+      log(`inceptor round ${attempts}/${grant.inception.rounds}: ${inceptor}`);
+      const prompt = existsSync(join(candidate.workspace, "ERRORS.md"))
+        ? `${PROMPT} Validation failed; ERRORS.md in the workspace has the stage and the error. Fix the program and src.` : PROMPT;
+      if (opts.interactive && session) {
+        const t = Date.now();
+        try {
+          await opts.interactive({
+            directory: candidate.agentDir,
+            instructions: `${prompt}\nThis is interactive inception ${n}. Collaborate with the owner on the program in this staged candidate.\nIf this conversation previously configured owner files, that setup phase is complete. Its editing restrictions and draft paths no longer apply. Use the current candidate directory and TASK.md: now build the program and procedures.\nThe staged manifest.md and endograph.toml are off limits unless the owner explicitly requests a change. Only then edit those staged files (inline manifests are edited in the config), and adapt the program to the requested inputs. This interactive instruction overrides TASK.md's general prohibition. Never edit live owner files. Endograph validates and publishes the final inputs with the program. Workspace MANIFEST.md and GRANT.md describe the previous inputs and may be stale after your edits.\nPreserve the program contract, and the agent's existing work and instance migration.\nEndograph holds the agent lock and will validate and promote the candidate after you finish. Do not run endo up or another inception.`,
+            previous: session.native,
+            save(native) { session!.native = native; saveInteractive(stateFile, session!); },
+          });
+          run = { exitCode: 0, stdout: "", stderr: "", inceptorMs: Date.now() - t };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          record.round(rounds, { native: session.native, validateMs: 0, inceptorMs: Date.now() - t, errors: `interactive: ${message}` });
+          session.rounds = rounds;
+          saveInteractive(stateFile, session);
+          throw new Error(`${message}. Candidate preserved; resume with endo incept --interactive --agent ${JSON.stringify(paths.agentDir)}`);
+        }
+      } else run = await runInceptor(inceptor, prompt, candidate.agentDir, log, paths, grant);
     }
     const t = Date.now();
-    const result: Validation = run && run.exitCode !== 0
-      ? { ok: false, error: `inceptor: exited ${run.exitCode}` }
-      : await validateProgram({ paths: staged, ownerPaths: paths, grant, candidate: true, loadRuntime: opts.loadRuntime });
-    record.round(rounds, { ...run, validateMs: Date.now() - t, errors: result.ok ? null : result.error });
+    let result: Validation;
+    try {
+      if (opts.interactive) {
+        finalConfig = readFileSync(candidate.grant, "utf8");
+        finalGrant = await loadGrant(paths, {
+          config: finalConfig,
+          manifest: readFileSync(join(candidate.agentDir, "manifest.md"), "utf8"),
+        });
+        if (finalGrant.manifest.path) {
+          const target = canonical(finalGrant.manifest.path);
+          if (target === canonical(paths.grant) || target === canonical(paths.env) || target.startsWith(canonical(paths.state) + "/"))
+            throw new Error("manifest must be an owner file separate from endograph.toml, .env, and .endo state");
+          // A relocated manifest carries the staged text to its new path; it never replaces an unrelated file.
+          if (target !== (grant.manifest.path && canonical(grant.manifest.path)) && existsSync(target) && readFileSync(target, "utf8") !== finalGrant.manifest.text)
+            throw new Error(`manifest = ${JSON.stringify(finalGrant.manifest.path)} would overwrite an existing file; choose a new path, or copy the manifest there first`);
+        }
+        manifestTargetBefore = finalGrant.manifest.path && existsSync(finalGrant.manifest.path)
+          ? readFileSync(finalGrant.manifest.path, "utf8") : undefined;
+        writeFileSync(join(candidate.workspace, "MANIFEST.md"), finalGrant.manifest.text);
+        writeFileSync(join(candidate.agentDir, "manifest.md"), finalGrant.manifest.text);
+        const description = describeGrant(paths, finalGrant);
+        writeFileSync(join(candidate.workspace, "GRANT.md"), renderGrant({ paths, grant: finalGrant, description, n, version: VERSION }));
+        for (const battery of description.batteries)
+          writeFileSync(join(candidate.workspace, "batteries", `${battery.name}.md`), battery.guide);
+      } else if (!candidateMatches() || readFileSync(join(candidate.agentDir, "manifest.md"), "utf8") !== grant.manifest.text) {
+        throw new Error("owner inputs changed during non-interactive inception");
+      }
+      result = run && run.exitCode !== 0
+        ? { ok: false, error: `inceptor: exited ${run.exitCode}` }
+        : await validateProgram({ paths: staged, ownerPaths: paths, grant: finalGrant, candidate: true, loadRuntime: opts.loadRuntime });
+    } catch (error) { result = { ok: false, error: `owner inputs: ${error instanceof Error ? error.message : String(error)}` }; }
+    record.round(rounds, { ...run, ...(session?.native ? { native: session.native } : {}), validateMs: Date.now() - t, errors: result.ok ? null : result.error });
+    if (session) { session.rounds = rounds; saveInteractive(stateFile, session); }
     if (result.ok) {
       state = result.state;
       break;
@@ -160,27 +248,38 @@ async function inceptHolding(paths: Paths, opts: InceptOptions): Promise<InceptR
       writeFileSync(join(candidate.workspace, "ERRORS.md"), `# ERRORS (round ${rounds})\n\n${result.error}\n`);
       log(`validation failed: ${result.error.split("\n")[0]}`);
     }
-    if (rounds === maxRounds) {
-      record.close("failed", rounds, result.error);
+    if (attempts === maxRounds) {
+      if (!opts.interactive) record.close("failed", rounds, result.error);
       throw new InceptionFailed(result.error, candidate.workspace, record.dir);
     }
   }
 
-  // Promote the instance from the successful validation, without invoking generated code again.
-  if (hashOf(paths.grant) !== grantHash || hashOf(candidate.grant) !== grantHash || (await loadGrant(paths)).manifest.text !== grant.manifest.text) {
-    record.close("failed", rounds, "owner inputs changed during inception");
-    throw new Error("owner inputs changed during inception; retry against the current inputs");
+  // Promote only what was validated, against the inputs it was validated with, without invoking
+  // generated code again. An interactive session stays resumable unless live agent work moved underneath it.
+  const stale = !!session && interactiveSource(paths, await loadGrant(paths)) !== session.source;
+  const changed = stale ? "owner inputs or agent state changed during interactive inception; rerun --interactive to prepare a fresh candidate"
+    : hashOf(paths.grant) !== grantHash || (await loadGrant(paths)).manifest.text !== grant.manifest.text ? "owner inputs changed during inception; retry against the current inputs"
+    : readFileSync(candidate.grant, "utf8") !== finalConfig ? "staged config changed during validation; retry inception"
+    : opts.interactive && finalGrant.manifest.path && (existsSync(finalGrant.manifest.path) ? readFileSync(finalGrant.manifest.path, "utf8") : undefined) !== manifestTargetBefore
+      ? "manifest destination changed during validation; retry inception"
+    : undefined;
+  if (changed) {
+    if (stale || !opts.interactive) record.close("failed", rounds, changed);
+    throw new Error(changed);
   }
-  const hashes = { manifest: hashText(grant.manifest.text), grant: hashOf(paths.grant), program: hashOf(candidate.program) };
+  const hashes = { manifest: hashText(finalGrant.manifest.text), grant: hashOf(candidate.grant), program: hashOf(candidate.program) };
   const changes = existsSync(join(candidate.workspace, "CHANGES.md")) ? readFileSync(join(candidate.workspace, "CHANGES.md"), "utf8").trim() : undefined;
-  const snapshot = writeSnapshot(staged, grant, n, state);
+  const snapshot = writeSnapshot(staged, finalGrant, n, state);
   try {
     promote(paths, candidate, n, {
       type: "inception",
-      summary: `inception ${n}${opts.accept ? " (manual)" : opts.trigger === "auto" ? " (auto)" : ""} after ${rounds} round${rounds === 1 ? "" : "s"}`,
+      summary: `inception ${n}${opts.interactive ? " (interactive)" : opts.accept ? " (manual)" : opts.trigger === "auto" ? " (auto)" : ""} after ${rounds} round${rounds === 1 ? "" : "s"}`,
       at: Date.now(),
       payload: { n, ...hashes, version: VERSION, inceptor, rounds, trigger: opts.trigger ?? "owner", ms: Date.now() - started, ...(changes ? { changes } : {}) },
-    }, { at: Date.now(), state });
+    }, { at: Date.now(), state }, opts.interactive ? [
+      { path: paths.grant, contents: finalConfig },
+      ...(finalGrant.manifest.path ? [{ path: finalGrant.manifest.path, contents: finalGrant.manifest.text }] : []),
+    ] : []);
   } catch (err) {
     record.close("failed", rounds, err instanceof Error ? err.message : String(err));
     throw err;
@@ -189,8 +288,29 @@ async function inceptHolding(paths: Paths, opts: InceptOptions): Promise<InceptR
   rmSync(paths.workspace, { recursive: true, force: true });
   cpSync(candidate.workspace, paths.workspace, { recursive: true });
   record.close("recorded", rounds);
+  if (session) {
+    renameSync(stateFile, join(dirname(stateFile), `completed-${n}.json`));
+  } else rmSync(stateFile, { force: true });
   log(`inception ${n} recorded; snapshot at ${snapshot}`);
   return { n, rounds, workspace: paths.workspace, snapshot };
+}
+
+/** A saved interactive draft resumes only into the same interactive inception; anything else archives it. */
+function resumableDraft(paths: Paths, n: number, source: string | undefined, log: (line: string) => void): InteractiveState | undefined {
+  const stateFile = interactiveFile(paths);
+  if (!existsSync(stateFile)) return undefined;
+  const saved = JSON.parse(readFileSync(stateFile, "utf8")) as InteractiveState;
+  if (source && saved.version === 1 && saved.n === n && saved.source === source && existsSync(candidatePaths(paths).workspace)) {
+    log(`resuming interactive inception ${n}`);
+    return saved;
+  }
+  // Retain the draft, but never migrate stale runtime state over newer agent work.
+  const archive = join(paths.local, "inception", `previous-${Date.now()}`);
+  mkdirSync(archive, { recursive: true });
+  if (existsSync(candidatePaths(paths).agentDir)) renameSync(candidatePaths(paths).agentDir, join(archive, "candidate"));
+  renameSync(stateFile, join(archive, "session.json"));
+  log(`${source ? "owner inputs or agent state changed" : "a non-interactive inception replaces the interactive draft"}; previous draft preserved at ${archive}`);
+  return undefined;
 }
 
 function candidatePaths(paths: Paths): Paths {
@@ -227,7 +347,7 @@ export async function validateProgram(opts: {
     return { ok: false, error: `program: the two-line header is missing or malformed (PROGRAM.md §2); got:\n${header.join("\n")}` };
   try {
     const loaded = await runtimeLoad({
-      paths, ownerPaths, cwd: resolve(ownerPaths.agentDir, grant.cwd),
+      paths, ownerPaths, grant, cwd: resolve(ownerPaths.agentDir, grant.cwd),
       instance: opts.candidate ? editedInstance(paths) : undefined,
     }, grant, opts.loadRuntime);
     if (loaded.failures.length) return { ok: false, error: loaded.failures.map((f) => `procedures: ${f.name} (${f.file}) failed to describe: ${f.error}`).join("\n") };
@@ -240,7 +360,7 @@ export async function validateProgram(opts: {
 /** Entry point for the sandbox worker. The caller must establish its process
  * boundary before calling this function: it imports generated agent code. */
 export async function loadInceptionRuntime(input: RuntimeLoadInput, host?: HostClient): Promise<RuntimeLoadResult> {
-  const grant = await loadGrant(input.ownerPaths);
+  const grant = input.grant ?? await loadGrant(input.ownerPaths);
   const bindings = await bindRuntime(input.ownerPaths, grant, host);
   const actions = grantActions(bindings, { name: grant.name, cwd: input.cwd, charter: notRunning }, { reply: () => "not running" });
   const store = openSqliteStore(input.paths.db);
@@ -264,9 +384,13 @@ const dryStart = () => {
   throw new Error("a procedure cannot run during a dry load");
 };
 
-async function runInceptor(command: string, prompt: string, cwd: string, log: (line: string) => void) {
+async function runInceptor(command: string, prompt: string, cwd: string, log: (line: string) => void, paths: Paths, grant: Grant) {
   const started = Date.now();
-  const child = Bun.spawn(["sh", "-c", `${command} "$0"`, prompt], { cwd, stdout: "pipe", stderr: "pipe", env: { ...process.env, FORCE_COLOR: "0" } });
+  const wrapped = protectInceptor(paths, grant, cwd, ["/bin/sh", "-c", `${command} "$0"`, prompt]);
+  // The agent's credentials are not the author's: it authenticates with its own CLI login.
+  const env: NodeJS.ProcessEnv = { ...process.env, ...wrapped.env, FORCE_COLOR: "0" };
+  for (const [key] of readEnv(paths)) delete env[key];
+  const child = Bun.spawn(wrapped.argv, { cwd, stdout: "pipe", stderr: "pipe", env });
   const capture = async (stream: ReadableStream<Uint8Array>) => {
     const decoder = new TextDecoder();
     let output = "";
@@ -291,8 +415,8 @@ async function runInceptor(command: string, prompt: string, cwd: string, log: (l
 }
 
 async function defaultInceptor(): Promise<string> {
-  for (const [bin, command] of DEFAULT_INCEPTORS) if (Bun.which(bin)) return command;
-  throw new Error("no inceptor: install claude or codex, set inception.inceptor in the grant, or pass --inceptor <command>");
+  for (const harness of harnessOrder()) if (Bun.which(harness)) return HEADLESS[harness];
+  throw new Error("no inceptor: install codex or claude, set inception.inceptor in the grant, or pass --inceptor <command>");
 }
 
 interface InceptionRecord {
@@ -398,4 +522,31 @@ export function hashOf(path: string): string {
 
 export function hashText(text: string): string {
   return createHash("sha256").update(text).digest("hex").slice(0, 16);
+}
+
+/** Durable identity and progress, separate from the agent's runtime state and snapshots. */
+const saveInteractive = (file: string, session: InteractiveState) => atomicWrite(dirname(file), basename(file), session);
+
+/** Fence a resumed draft against intervening activations or changes to the agent's own code. */
+function interactiveSource(paths: Paths, grant: Grant): string {
+  const hash = createHash("sha256").update(VERSION).update(readFileSync(paths.grant)).update(grant.manifest.text);
+  const tree = (directory: string) => {
+    if (!existsSync(directory)) return;
+    for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const file = join(directory, entry.name);
+      hash.update(file.slice(paths.agentDir.length));
+      if (entry.isDirectory()) tree(file);
+      else if (entry.isSymbolicLink()) hash.update(readlinkSync(file));
+      else if (entry.isFile()) hash.update(readFileSync(file));
+    }
+  };
+  tree(dirname(paths.program));
+  tree(paths.src);
+  let seq = 0;
+  if (hasPersistedStore(paths.db)) {
+    const store = openSqliteStore(paths.db);
+    try { seq = store.lastSeq(); } finally { store.close(); }
+  }
+  hash.update(String(seq));
+  return hash.digest("hex");
 }

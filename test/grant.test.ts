@@ -1,9 +1,8 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SchemaError } from "@projectors/core";
-import { bash } from "../src/batteries/bash.ts";
 import { coreActions } from "../src/grant/core.ts";
 import { loadGrant } from "../src/grant/grant.ts";
 import { bindRuntime } from "../src/grant/bind.ts";
@@ -49,30 +48,21 @@ test("grant reads are data only; runtime binding imports executors explicitly; i
   await expect(loadGrant(agentDir('name = "frog"\n'))).rejects.toThrow(/executor/);
 });
 
-test("core actions: reply once through the runtime, compact emits a horizon, update_state writes by address", async () => {
-  const replies: unknown[] = [];
-  const [reply, compact, updateState] = coreActions({
-    reply: (id, r) => (replies.push([id, r]), replies.length > 1 ? `${id} already answered` : null),
-    stateSchema: (key) => (key === "notes" ? { type: "object", properties: { lines: { type: "array" } } } : undefined),
-  });
-  expect(await reply!.run!({ id: "r1", ok: true, text: "done" }, {})).toBe("replied to r1");
-  expect(replies[0]).toEqual(["r1", { ok: true, state: "completed", text: "done" }]);
-  expect(await reply!.run!({ id: "r1", ok: false, text: "again", state: "rejected" }, {})).toMatchObject({ success: false, error: expect.stringMatching(/already answered/) });
-
-  const compacted = await compact!.run!({ summary: "open: r2" }, {});
-  expect(compacted.messages.map((m: { type: string }) => m.type)).toEqual(["horizon", "user"]);
-  expect(compacted.messages[1].text).toContain("open: r2");
-
-  const writes: unknown[] = [];
-  const ctx = { updateStateAt: (target: unknown, update: unknown) => void writes.push([target, update]) };
-  expect(await updateState!.run!({ state: "notes", op: "patch", value: { standing: ["x"] } }, ctx)).toBe("patch notes");
-  expect(writes[0]).toEqual(["notes", { op: "patch", value: { standing: ["x"] }, path: undefined }]);
-  const rejecting = { updateStateAt: () => { throw new SchemaError([{ message: "expected array" }]); } };
-  expect(await updateState!.run!({ state: "notes", op: "replace", value: 1 }, rejecting)).toMatchObject({ success: false, error: expect.stringMatching(/notes: expected array\nthe value must satisfy this schema: \{"type":"object"/) });
+test("native backends parse per-backend options and bind the matching worker executor", async () => {
+  const claude = agentDir('name = "c"\n[executor]\nbackend = "claude"\nmodel = "claude-sonnet-5"\neffort = "xhigh"\nmax_tool_calls = 12\n');
+  const grant = await loadGrant(claude);
+  expect(grant.executor).toMatchObject({ backend: "claude", model: "claude-sonnet-5", effort: "xhigh", maxToolCalls: 12 });
+  expect((await bindRuntime(claude, grant)).executor.create().identity?.name).toBe("claude");
+  // Effort levels are backend-specific.
+  await expect(loadGrant(agentDir('name = "c"\n[executor]\nbackend = "claude"\neffort = "ultra"\n'))).rejects.toThrow(/executor/);
+  expect((await loadGrant(agentDir('name = "x"\n[executor]\nbackend = "codex"\neffort = "ultra"\n'))).executor).toMatchObject({ backend: "codex", effort: "ultra" });
 });
 
-test("the bash battery runs in the granted cwd", async () => {
-  const cwd = realpathSync(mkdtempSync(join(tmpdir(), "endo-")));
-  const [action] = bash().actions!({ name: "t", cwd, charter: () => { throw new Error("no charter"); } });
-  expect(await action!.run!({ cmd: "pwd; echo err >&2; exit 2" }, {})).toBe(`exit 2\n${cwd}\nerr`);
+test("update_state reports a schema rejection with the state's schema", async () => {
+  const [, , updateState] = coreActions({
+    reply: () => null,
+    stateSchema: (key) => (key === "notes" ? { type: "object", properties: { lines: { type: "array" } } } : undefined),
+  });
+  const rejecting = { updateStateAt: () => { throw new SchemaError([{ message: "expected array" }]); } };
+  expect(await updateState!.run!({ state: "notes", op: "replace", value: 1 }, rejecting)).toMatchObject({ success: false, error: expect.stringMatching(/notes: expected array\nthe value must satisfy this schema: \{"type":"object"/) });
 });

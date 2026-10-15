@@ -55,11 +55,12 @@ loading. Model traffic uses IPC even with
 Custom executor modules execute inside the worker and must fit its network
 and environment policy.
 
-The Codex backend's app-server process runs in the trusted parent environment
-with native effectful capabilities disabled; Projector actions still execute
-in the worker or through its granted host proxies. `.endo/local/` (including
-`executors/codex/`) is protected from worker reads/writes, so generated code cannot replace a persisted thread
-association. Authentication remains in the service user's Codex home.
+The native backends' processes (Codex app-server, Claude Code) run in the trusted
+parent environment with native effectful capabilities disabled; Projector actions
+still execute in the worker or through its granted host proxies. `.endo/local/`
+(including `executors/codex/` and `executors/claude/`) is protected from worker
+reads/writes, so generated code cannot replace a persisted session association.
+Authentication remains in the service user's Codex or Claude Code home.
 
 Endograph uses the pinned `@endograph/sandbox-runtime` fork of upstream 0.0.75
 (Seatbelt on macOS, bubblewrap on Linux), with the Linux nested writable mount
@@ -146,3 +147,21 @@ automatic inception nor installs an OS sandbox. Ordinary procedure reloads
 remain within that generation and preserve conversation history.
 The one-second inbox poll also checks procedure and owner-input contents;
 reloads do not depend on OS file events, which may be suppressed by a sandbox.
+
+### Headless inception inputs
+
+Headless inceptors, including custom commands, run inside an additional narrow
+filesystem sandbox even when the agent itself is unsandboxed. Live
+`endograph.toml`, the resolved manifest, and `.env` are denied for reads and writes,
+and every key named in `.env` is removed from the inceptor's environment: the agent's
+credentials are not the author's, which authenticates with its own CLI login.
+The candidate's config, manifest, and workspace mandate are readable but protected
+from writes and deletion. Other access, native CLI authentication, and network
+access remain available. This restriction requires the supported macOS/Linux
+sandbox runtime; startup fails rather than silently running the inceptor without it.
+The inceptor's policy runs in its own process (`src/inception/sandbox-child.ts`).
+The sandbox runtime's network proxy applies its policy live to every process it
+sandboxes, so setting the inceptor's open network in the host would also open
+the agent's running worker.
+Interactive inception relies on explicit owner requests and prompting for owner
+edits; it does not use this headless restriction.

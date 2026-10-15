@@ -5,6 +5,19 @@ export interface HostActionContext {
   /** Bound by the trusted parent when the connection is opened, never supplied by a request. */
   readonly identity: string;
   readonly signal: AbortSignal;
+  /**
+   * Wakes this agent later with a request from `agent:<name>/<action>`, for work
+   * that outlives the call: start it, return, and emit when it finishes. Pass the
+   * originating request's `ref` so the agent can answer it. Throws outside a
+   * running agent, such as during validation.
+   */
+  readonly emitMessage: (message: HostMessage) => { id: string };
+}
+
+export interface HostMessage {
+  text: string;
+  ref?: string;
+  thread?: string;
 }
 export interface HostActionDescriptor {
   name: string;

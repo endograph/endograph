@@ -67,7 +67,7 @@ export function describeGrant(paths: Paths, grant: Grant): GrantDescription {
     actions.push(descriptor);
   }
   return {
-    executor: "module" in grant.executor ? `module ${grant.executor.module}` : "backend" in grant.executor ? `codex:${grant.executor.model ?? "default"}` : `${grant.executor.provider}:${grant.executor.model}`,
+    executor: "module" in grant.executor ? `module ${grant.executor.module}` : "backend" in grant.executor ? `${grant.executor.backend}:${grant.executor.model ?? "default"}` : `${grant.executor.provider}:${grant.executor.model}`,
     actions,
     states: batteries.flatMap((battery) => (battery.states ?? []).map((state) => ({ key: state.key, schema: normalizeSchema(state.schema).jsonSchema() }))),
     batteries: batteries.map((battery) => ({
@@ -86,6 +86,8 @@ export function renderWorkspace(input: WorkspaceInput): string {
   writeFileSync(join(dir, "GRANT.md"), renderGrant(input));
   writeFileSync(join(dir, "PROGRAM.md"), readFileSync(PROGRAM_DOC, "utf8"));
   writeFileSync(join(dir, "CLI.md"), CONSUMER_DOC);
+  const skills = join(paths.agentDir, "skills");
+  if (existsSync(skills)) cpSync(skills, join(dir, "skills"), { recursive: true });
   for (const b of input.description.batteries) writeFileSync(join(dir, "batteries", `${b.name}.md`), b.guide);
   if (input.baseline) {
     const { baseline } = input;
@@ -171,7 +173,9 @@ agent directory; the files you read and write are under \`.endo/\`.
 ${revising}
 Read \`MANIFEST.md\` for the mandate, \`GRANT.md\` for capabilities,
 \`PROGRAM.md\` for the program contract, \`CLI.md\` for peer commands,
-and the guides under \`batteries/\` for their APIs.
+and the guides under \`batteries/\` for their APIs. Owner-supplied reference
+skills, if present, are copied under \`skills/\` in this workspace. Read those
+relevant to the mandate and make their original paths available to the running agent.
 
 Then write:
 

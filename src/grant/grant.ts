@@ -1,4 +1,5 @@
-import { existsSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import type { AnyAction, AnySchema, Charter, StateDescriptor } from "@projectors/core";
 import { z } from "zod";
@@ -56,7 +57,16 @@ export interface CodexOptions {
   effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
   maxToolCalls?: number;
 }
-export type ExecutorConfig = AiSdkOptions | CodexOptions | { module: string };
+export interface ClaudeOptions {
+  backend: "claude";
+  model?: string;
+  command?: string;
+  effort?: "low" | "medium" | "high" | "xhigh" | "max";
+  maxToolCalls?: number;
+}
+/** A native agent session owned by the trusted host. */
+export type NativeExecutorOptions = CodexOptions | ClaudeOptions;
+export type ExecutorConfig = AiSdkOptions | NativeExecutorOptions | { module: string };
 
 /** Validated owner configuration: data only, safe to read in any process. */
 export interface Grant {
@@ -95,6 +105,7 @@ const NAME = /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/;
 const SCHEMA = z
   .object({
     name: z.string().regex(NAME, "kebab-case: lowercase words joined by single hyphens"),
+    name_scope: z.enum(["global", "directory"]).optional(),
     manifest: z.union([z.string(), z.object({ text: z.string().min(1) }).strict()]).optional(),
     cwd: z.string().optional(),
     batteries: z.array(z.string()).optional(),
@@ -110,9 +121,12 @@ const SCHEMA = z
       z.object({ backend: z.literal("codex"), model: z.string().min(1).optional(), command: z.string().min(1).optional(),
         effort: z.enum(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]).optional(),
         max_tool_calls: z.number().int().positive().optional() }).strict(),
+      z.object({ backend: z.literal("claude"), model: z.string().min(1).optional(), command: z.string().min(1).optional(),
+        effort: z.enum(["low", "medium", "high", "xhigh", "max"]).optional(),
+        max_tool_calls: z.number().int().positive().optional() }).strict(),
       z
         .object({
-          provider: z.enum(["anthropic", "openai"]),
+          provider: z.literal("openai"),
           model: z.string(),
           max_output_tokens: z.number().int().positive().optional(),
           temperature: z.number().optional(),
@@ -125,11 +139,11 @@ const SCHEMA = z
   .strict();
 
 /** Read, parse, validate, and resolve `endograph.toml`. Throws with the file and the reason. */
-export async function loadGrant(paths: Paths): Promise<Grant> {
+export async function loadGrant(paths: Paths, staged?: { config: string; manifest: string }): Promise<Grant> {
   if (!existsSync(paths.grant)) throw new Error(`no grant at ${paths.grant}`);
   let raw: unknown;
   try {
-    raw = Bun.TOML.parse(readFileSync(paths.grant, "utf8"));
+    raw = Bun.TOML.parse(staged?.config ?? readFileSync(paths.grant, "utf8"));
   } catch (err) {
     throw new Error(`${paths.grant}: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -147,16 +161,20 @@ export async function loadGrant(paths: Paths): Promise<Grant> {
     batteries.push(name);
   }
   const executor: ExecutorConfig = "module" in config.executor ? { module: config.executor.module } : "backend" in config.executor ? {
-    backend: "codex", model: config.executor.model, command: config.executor.command, effort: config.executor.effort, maxToolCalls: config.executor.max_tool_calls,
-  } : {
+    backend: config.executor.backend, model: config.executor.model, command: config.executor.command, effort: config.executor.effort, maxToolCalls: config.executor.max_tool_calls,
+  } as NativeExecutorOptions : {
     provider: config.executor.provider,
     model: config.executor.model,
     maxOutputTokens: config.executor.max_output_tokens,
     temperature: config.executor.temperature,
   };
   return {
-    name: config.name,
-    manifest: manifestOf(paths, config.manifest),
+    name: config.name_scope === "directory"
+      ? `${config.name}-${createHash("sha256").update(realpathSync(paths.agentDir)).digest("hex").slice(0, 12)}`
+      : config.name,
+    manifest: staged && typeof config.manifest !== "object"
+      ? { text: staged.manifest, path: resolve(paths.agentDir, config.manifest ?? "manifest.md") }
+      : manifestOf(paths, config.manifest),
     executor,
     cwd: config.cwd ?? ".",
     batteries,

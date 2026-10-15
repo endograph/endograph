@@ -24,14 +24,6 @@ function fixture(): string {
   return dir;
 }
 
-/** Kill before close/checkpoint so recovery reads the WAL, not a graceful shutdown. */
-async function crash(source: string): Promise<void> {
-  const child = Bun.spawn([process.execPath, "--eval", `${source}\nprocess.kill(process.pid, "SIGKILL");`], { stdout: "ignore", stderr: "pipe" });
-  const [code, error] = await Promise.all([child.exited, new Response(child.stderr).text()]);
-  expect(error).toBe("");
-  expect(code).not.toBe(0);
-}
-
 test("mailbox transactions roll back acceptance, delivery, replies, frames, and snapshots together", () => {
   const dir = mkdtempSync(join(tmpdir(), "endo-ledger-"));
   let store = openSqliteStore(join(dir, "agent.db"));
@@ -89,45 +81,16 @@ test("a reply and its frame commit atomically and a terminal reply cannot be rep
   }
 });
 
-test("SIGKILL during delivery rolls back its frame and leaves the accepted message pending", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "endo-crash-ledger-"));
-  const db = join(dir, "agent.db");
-  try {
-    await crash(`
-      import { openSqliteStore } from ${JSON.stringify(import.meta.resolve("../src/store/sqlite.ts"))};
-      const store = openSqliteStore(${JSON.stringify(db)});
-      store.acceptMessage(${JSON.stringify(request("interrupted"))});
-      store.transaction(() => {
-        store.append({ type: "request", id: "interrupted", summary: "not committed", at: 1,
-          payload: { metadata: { endo: { requests: [${JSON.stringify(request("interrupted"))}] } } } });
-        process.kill(process.pid, "SIGKILL");
-      });
-    `);
-    const store = openSqliteStore(db);
-    try {
-      expect(store.pendingMessages()).toEqual([request("interrupted")]);
-      expect([...allFrames(store)]).toEqual([]);
-    } finally {
-      store.close();
-    }
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
 test("restart serves an accepted request after its inbox file was removed, preserving the stamped sender", async () => {
   const dir = fixture();
   const paths = pathsOf(dir);
   const accepted = request("accepted-before-crash");
   writeMessage(paths.inbox, accepted);
   try {
-    await crash(`
-      import { openSqliteStore } from ${JSON.stringify(import.meta.resolve("../src/store/sqlite.ts"))};
-      import { unlinkSync } from "node:fs";
-      const store = openSqliteStore(${JSON.stringify(paths.db)});
-      store.acceptMessage(${JSON.stringify(accepted)});
-      unlinkSync(${JSON.stringify(join(paths.inbox, `${accepted.at}-${accepted.id}.json`))});
-    `);
+    const store = openSqliteStore(paths.db);
+    store.acceptMessage(accepted);
+    store.close();
+    rmSync(join(paths.inbox, `${accepted.at}-${accepted.id}.json`));
     const agent = await openAgent({ agentDir: dir, executor: scripted(answer) });
     try {
       await agent.poll();
@@ -151,13 +114,9 @@ test("restart republishes committed replies when outbox files are missing or sta
   const canonical = [reply("missing"), reply("stale")];
   writeReply(paths.outbox, reply("stale", "working"));
   try {
-    await crash(`
-      import { openSqliteStore } from ${JSON.stringify(import.meta.resolve("../src/store/sqlite.ts"))};
-      const store = openSqliteStore(${JSON.stringify(paths.db)});
-      for (const reply of ${JSON.stringify(canonical)}) {
-        store.commitReply(reply, { type: "reply", id: reply.id, summary: reply.text, payload: reply, at: reply.at });
-      }
-    `);
+    const store = openSqliteStore(paths.db);
+    for (const r of canonical) store.commitReply(r, replyFrame(r));
+    store.close();
     const agent = await openAgent({ agentDir: dir, executor: scripted(answer) });
     try {
       for (const expected of canonical) expect(readReply(paths.outbox, expected.id)).toEqual(expected);

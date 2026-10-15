@@ -76,6 +76,40 @@ again to obtain another instance. The archive commit decides whether promotion
 recovery keeps the new files or restores the backup. A committed generation
 requires a fresh worker even if final cleanup fails.
 
+### Interactive inception
+
+`endo incept --interactive` passes a native editor callback (Codex or Claude Code) into the same
+inception pipeline as headless execution. It uses the terminal and authenticated
+finish handoff shared with prefab setup. The harness holds the agent lock for the
+whole editing/validation cycle; each explicit finish validates only the staged
+candidate through the trusted host's isolated loader. Validation failure supplies
+`ERRORS.md` and reopens the same native conversation, within the configured round limit.
+Only successful validation reaches the promotion transaction.
+
+Interactive sessions may edit the staged `manifest.md` and `endograph.toml` only
+when the owner explicitly requests it; this is a prompting rule, not an approval
+protocol. The staged `manifest.md` represents the configured manifest file even
+when its published path differs; inline manifests remain in the config. The host
+parses final inputs with paths resolved relative to the live owner directory and
+validates using that final grant, including its sandbox and executor. Owner files,
+program, migrated instance, snapshot, and recorded input hashes are promoted as
+one recoverable generation. Cancellation preserves draft inputs; rollback restores
+live inputs with the old program. Edits made separately to live inputs still
+invalidate the draft. Headless inception gets protected copies and cannot read or
+write the live owner files.
+
+An interrupted session leaves its candidate and per-round evidence intact. Its
+thread ID, cumulative round count, and source fingerprint live under
+`.endo/local/inception`, outside snapshots. Repeating the interactive command
+resumes that candidate. Changes to owner inputs, Endograph version, live program
+or src, or committed frame position invalidate the draft's baseline; the previous
+candidate is retained locally and a fresh one starts. Publication also checks
+that fingerprint to avoid replacing work changed during the conversation.
+
+`endo up --interactive` uses this path when inception is needed, then follows the
+normal startup lifecycle. The flag is not installed into the service or used by
+later automatic inception. Existing `--manual` and `--accept` remain available.
+
 ## Recovering and cancelling
 
 Immutable archive files are the durable frame and checkpoint record. SQLite
@@ -94,10 +128,21 @@ occupies capacity until it settles. Current grants are checked on every host
 action invocation, including calls through an old proxy. See
 [sandboxing](sandbox.md) for the enforced process boundary.
 
-## Codex executor
+A host action's context also carries `emitMessage({ text, ref?, thread? })`, for
+work that outlives the call: the action starts it, returns, and emits when it
+ends. The parent writes a request from `agent:<name>/<action>` to the agent's
+own inbox, the same delivery as a procedure's `emitMessage`. Pass the
+originating request's `ref` so the agent can give its terminal reply after
+answering `working`. Validation loads cannot emit. Work the action started
+lives in the parent: a restart loses it, and the open request fails as
+interrupted.
+
+## Native executors
 
 `packages/codex-executor` implements `ProjectorExecutor` using a persistent
-`codex app-server` stdio connection. The parent owns that process and its
+`codex app-server` stdio connection. `packages/claude-executor` speaks the same host
+RPC and reuses the worker side; its host runs one Claude Code process per generator
+through the Claude Agent SDK, with Endograph's two tools as an in-process MCP server. The parent owns that process and its
 per-generator session associations. The worker lowers Projector context into
 serializable IR and dispatches dynamic tool calls through Projector actions.
 The existing model IPC carries turns, tool callbacks and checkpoint messages;
@@ -106,10 +151,11 @@ app-server. Validation loads do not start it.
 
 Context realization belongs to the executor: updated projections are appended
 to a native thread, and Projector compaction does not force a session reset.
-State/action semantics remain Projector's. Session metadata under `.endo/local/executors/codex`
+State/action semantics remain Projector's. Session metadata under `.endo/local/executors/<backend>`
 is parent-only and not included in snapshots. Clean restarts resume; uncertain
 turns are replaced using Projector context. See the
-[package documentation](../packages/codex-executor/README.md) for details.
+[Codex](../packages/codex-executor/README.md) and
+[Claude](../packages/claude-executor/README.md) package documentation for details.
 
 ## Keeping the foundation small
 
@@ -122,3 +168,40 @@ The behavioral tests cover history/compaction, self-messaging, reply publication
 interrupted promotion, archive restore, grant revocation, IPC cancellation, and
 real sandbox execution. Run `bun test` and `bun run typecheck`; platform coverage
 and dependency setup are documented in [verification](testing.md).
+
+## Prefabs and checkout identity
+
+`endo create <prefab>` prepares owner inputs, reference skills, and a pinned local
+runtime, then offers the existing `up` lifecycle. Prefabs contain declarative
+setup briefs and templates, never agent programs or procedures. The CLI collects
+the repository and initial intent, then opens the native coding agent (Codex, or
+Claude Code; see `src/inception/harnesses.ts`) through Bun's PTY API. The owner
+converses directly with it. A per-invocation authenticated loopback endpoint records
+the session identity (Codex exports its thread ID; Endograph assigns Claude's with
+`--session-id`) and accepts the finish handshake; the wrapper then submits the native
+`/quit` or `/exit` command. A successful exit alone
+does not authorize publication: the finish handshake and schema validation must
+also succeed. Validation imports no generated code.
+
+Drafts and session metadata live under `.endo/local/setup`, excluded from Git and
+snapshots. `endo setup --agent <directory>` resumes the recorded native session, or
+starts one around existing files when no thread is recorded. Interrupted or invalid
+drafts are preserved. After a successful publication, later sessions seed the draft
+from the current owner inputs. A setup lock prevents concurrent editors; owner
+files changed externally during a session are never overwritten by publication.
+Setup does not start or re-incept the agent, though publishing changed owner inputs
+can trigger an already-running agent's normal automatic inception.
+The repository's `AGENTS.md` receives a marked section pointing peers to the agent.
+
+`name_scope = "directory"` opts into a runtime name formed from the configured
+name and a hash of the canonical agent directory. Global names remain the default.
+Registry, service, messaging, and worker identity all use the resolved grant name.
+This lets identical checked-in owner files run in separate worktrees without
+copying state or stealing another checkout's registration. Moving a directory
+changes its runtime identity; stop its old service before moving it.
+
+Agent runtime CLI commands prefer an installed local Endograph. Startup installs the
+locked dependencies first, then hands off to that pinned version, so an older local
+version never installs over itself; other commands use the installed version as is.
+The local package therefore owns the generated program's API and service path,
+even when a user starts through `npx endograph@latest`.

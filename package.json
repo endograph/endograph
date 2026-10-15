@@ -29,15 +29,17 @@
     "release:check": "bun scripts/release.ts --dry-run"
   },
   "dependencies": {
-    "@endograph/codex-executor": "workspace:*",
-    "@ai-sdk/anthropic": "3.0.96",
     "@ai-sdk/openai": "3.0.83",
+    "@clack/prompts": "1.8.1",
+    "@endograph/claude-executor": "workspace:*",
+    "@endograph/codex-executor": "workspace:*",
+    "@endograph/endodev": "workspace:*",
+    "@endograph/sandbox-runtime": "0.0.75-endograph.2",
     "@projectors/aisdk-executor": "latest",
     "@projectors/core": "latest",
     "@types/bun": "latest",
     "ai": "6.0.222",
-    "zod": "^4.5.4",
-    "@endograph/sandbox-runtime": "0.0.75-endograph.2"
+    "zod": "^4.5.4"
   },
   "devDependencies": {
     "typescript": "^5.7.0"

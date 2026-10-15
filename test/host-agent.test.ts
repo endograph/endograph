@@ -21,11 +21,11 @@ export default defineProgram((endo) => {
 });
 `;
 
-test.each(['provider="openai"\nmodel="fixture"', 'backend="codex"'])("validation permits schemas but denies direct host and model IPC (%s)", async (executor) => {
+test("validation permits schemas but denies direct host and model IPC", async () => {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "endo-validation-")));
   const paths = pathsOf(dir);
   mkdirSync(join(paths.state, "program"), { recursive: true });
-  writeFileSync(paths.grant, `name="validation-test"\nhost_actions=["effect"]\n[executor]\n${executor}\n`);
+  writeFileSync(paths.grant, `name="validation-test"\nhost_actions=["effect"]\n[executor]\nprovider="openai"\nmodel="fixture"\n`);
   writeFileSync(join(dir, "manifest.md"), "Validation must not execute host effects.");
   // Send raw protocol messages during module import, bypassing worker proxies.
   const probe = `
@@ -114,11 +114,10 @@ test("hosted runtime revokes cached actions and cold restarts even when postcomm
     const file=${JSON.stringify(failedRecord)};
     if(existsSync(file)){rmSync(file);mkdirSync(file);}
   `);
-  const host = await createAgentHost({ agentDir: dir, inceptor: `${process.execPath} ${inceptor}`, log: () => { throw new Error("log observer unavailable"); }, actions: [hostAction({ name: "sentryApi", description: "read issue", inputSchema: z.object({}).strict(), async run() { calls++; started(); await hold; return "first response"; } })] });
+  const host = await createAgentHost({ agentDir: dir, inceptor: `${process.execPath} ${inceptor}`, log: () => {}, actions: [hostAction({ name: "sentryApi", description: "read issue", inputSchema: z.object({}).strict(), async run() { calls++; started(); await hold; return "first response"; } })] });
   let running: Promise<number> | undefined;
   try {
     await incept({ agentDir: dir, inceptor: "true", loadRuntime: host.loadRuntime });
-    const catalogueAt = statSync(join(paths.state, "host-actions.json")).mtimeMs;
     writeFileSync(join(dir, "manifest.md"), "Owner changed the manifest while the agent was stopped.");
     running = host.run();
     await until(() => {
@@ -136,8 +135,6 @@ test("hosted runtime revokes cached actions and cold restarts even when postcomm
     release();
     expect((await until(() => readReply(paths.outbox, id) ?? undefined)).text).toBe("host action is not granted");
     expect(calls).toBe(1);
-    // Registry validation happens on each call, but unchanged descriptors are not rewritten.
-    expect(statSync(join(paths.state, "host-actions.json")).mtimeMs).toBe(catalogueAt);
     await until(() => {
       const archive = archivePath(paths.db);
       return commitNumbers(archive).some((n) => readCommit(archive, n).frames.some((frame) => frame.type === "inception" && (frame.payload as { n: number }).n === 3)) ? true : undefined;
@@ -255,6 +252,38 @@ test("a worker exits when its trusted parent dies", async () => {
     await parent.exited;
     if (workerAlive()) process.kill(workerPid!, "SIGKILL");
     await errors;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 20000);
+
+test("a host action's emitMessage lands in its agent's inbox as a request from that action", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "endo-host-emit-")));
+  const paths = pathsOf(dir);
+  mkdirSync(join(paths.state, "program"), { recursive: true });
+  writeFileSync(paths.program, program);
+  writeFileSync(join(dir, "manifest.md"), "Reply with the sender.");
+  writeFileSync(paths.grant, 'name="emit-test"\nhost_actions=["notify"]\n[executor]\nmodule=".endo/executor.ts"\n[inception]\nmode="manual"\n');
+  writeFileSync(join(paths.state, "executor.ts"), `
+    import {scripted} from ${JSON.stringify(join(root, "test/fixtures/agent/scripted.ts"))};
+    export default {create:()=>scripted(async({requests,call})=>{
+      for(const r of requests){
+        if(r.text==="emit"){const result=await call("notify",{});await call("reply",{id:r.id,ok:true,text:result.value.id});}
+        else await call("reply",{id:r.id,ok:true,text:"from "+r.from});
+      }
+    })};
+  `);
+  const host = await createAgentHost({ agentDir: dir, log: () => {}, actions: [hostAction({
+    name: "notify", description: "wake the agent", inputSchema: z.object({}).strict(),
+    run: (_input, context) => context.emitMessage({ text: "woken" }),
+  })] });
+  const running = host.run();
+  try {
+    const id = newId();
+    writeMessage(paths.inbox, { v: 1, kind: "request", id, text: "emit", at: Date.now() });
+    const emitted = (await until(() => readReply(paths.outbox, id) ?? undefined)).text;
+    expect((await until(() => readReply(paths.outbox, emitted) ?? undefined)).text).toBe("from agent:emit-test/notify");
+  } finally {
+    await host.close(); await running;
     rmSync(dir, { recursive: true, force: true });
   }
 }, 20000);

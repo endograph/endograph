@@ -26,7 +26,7 @@ function send(agent: Agent): string {
   return id;
 }
 
-test("a rolled-back delivery stops the worker and a fresh open delivers it once", async () => {
+test("a rolled-back delivery stops the worker without snapshotting it, and a fresh open delivers it once", async () => {
   const dir = scaffold();
   let executions = 0;
   const executor = scripted(async (turn) => {
@@ -56,9 +56,11 @@ test("a rolled-back delivery stops the worker and a fresh open delivers it once"
     await expect(agent.reload()).rejects.toThrow(StoreRecoveryRequired);
     await expect(agent.poll()).rejects.toThrow(StoreRecoveryRequired);
     expect(agent.loaded.machine).toBe(oldMachine);
+    await agent.stop();
 
     agent = await openAgent({ agentDir: dir, executor });
     const recovered = agent.store as AgentStore;
+    expect(recovered.readSnapshot()).toBeNull();
     expect(recovered.pendingMessages().map((m) => m.id)).toEqual([id]);
     expect([...allFrames(recovered)].filter((f) => f.type === "request")).toHaveLength(0);
     expect(agent.loaded.machine).not.toBe(oldMachine);
@@ -67,37 +69,6 @@ test("a rolled-back delivery stops the worker and a fresh open delivers it once"
     expect(readReply(agent.paths.outbox, id)).toMatchObject({ state: "completed", text: "answered" });
     expect([...allFrames(recovered)].filter((f) => f.type === "request")).toHaveLength(1);
     expect(recovered.pendingMessages()).toEqual([]);
-  } finally {
-    await agent.stop();
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("stop cleans up after a failed delivery without snapshotting uncommitted work", async () => {
-  const dir = scaffold();
-  let executions = 0;
-  const executor = scripted(async (turn) => {
-    for (const request of turn.requests) {
-      executions++;
-      await turn.call("reply", { id: request.id, ok: true, text: "answered" });
-    }
-  });
-  let agent = await openAgent({ agentDir: dir, executor });
-  try {
-    const id = send(agent);
-    const store = agent.store as AgentStore;
-    const append = store.append;
-    store.append = (frame) => {
-      if (frame.type === "request") throw new Error("delivery failed");
-      return append(frame);
-    };
-    await expect(agent.poll()).rejects.toThrow("delivery failed");
-    await agent.stop();
-    agent = await openAgent({ agentDir: dir, executor });
-    expect(agent.store.readSnapshot()).toBeNull();
-    await agent.poll();
-    expect(executions).toBe(1);
-    expect(readReply(agent.paths.outbox, id)).toMatchObject({ state: "completed", text: "answered" });
   } finally {
     await agent.stop();
     rmSync(dir, { recursive: true, force: true });

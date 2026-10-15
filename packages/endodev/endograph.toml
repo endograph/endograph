@@ -1,0 +1,13 @@
+name = "endodev"
+name_scope = "directory"
+manifest = "manifest.md"
+cwd = ".."
+batteries = ["bash", "scheduler", "evolve"]
+
+# Intentionally unsandboxed: no [sandbox] table.
+[executor]
+backend = "codex"
+
+[inception]
+mode = "auto"
+rounds = 5

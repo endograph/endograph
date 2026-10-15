@@ -24,5 +24,5 @@ export {
   tool,
 } from "@projectors/core";
 export { z } from "zod";
-export { hostAction, HostActionError, type HostAction, type HostActionContext, type JsonValue } from "./host/action.ts";
+export { hostAction, HostActionError, type HostAction, type HostActionContext, type HostMessage, type JsonValue } from "./host/action.ts";
 export { createAgentHost, type AgentHost } from "./host/agent.ts";

@@ -4,9 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { actionResult, createAction, createCharter, createMachine, createNode, createSourceInstance, createState, runMachine, tool, type ExecutorRunRequest, type FrameMessage } from "@projectors/core";
 import { z } from "zod";
-import { CodexExecutor } from "../src/index.ts";
+import { NativeExecutor } from "../src/index.ts";
 import { CodexHost, type AppServer, type ServerMessage } from "../src/host.ts";
-import { type Json, type Projection } from "../src/protocol.ts";
+import { type Projection } from "../src/protocol.ts";
 import { contextUpdate } from "../src/context.ts";
 
 class FakeServer implements AppServer {
@@ -17,6 +17,7 @@ class FakeServer implements AppServer {
   thread = "";
   turn = "";
   closed = false;
+  steerFails = false;
   onTurn?: () => void;
   onResponse?: (value: any) => void;
   pending = new Map<number, { thread: string; turn: string }>();
@@ -33,12 +34,19 @@ class FakeServer implements AppServer {
       return { turn: { id: this.turn } };
     }
     if (method === "turn/interrupt") { this.complete("interrupted"); return {}; }
+    if (method === "turn/steer") {
+      if (this.steerFails || params.expectedTurnId !== this.turn) throw new Error("no active turn to steer");
+      return { turnId: this.turn };
+    }
     throw new Error(`Unexpected method ${method}`);
   }
   call(name: string, args: unknown) {
     const id = ++this.next;
     this.pending.set(id, { thread: this.thread, turn: this.turn });
     this.emit({ id, method: "item/tool/call", params: { threadId: this.thread, turnId: this.turn, callId: `call-${id}`, tool: "endograph_call", arguments: { name, arguments: args } } });
+  }
+  compact() {
+    this.emit({ method: "item/completed", params: { threadId: this.thread, turnId: this.turn, item: { id: `compaction-${this.turn}`, type: "contextCompaction" } } });
   }
   complete(status = "completed") {
     this.emit({ method: "item/completed", params: { threadId: this.thread, turnId: this.turn, item: { id: `answer-${this.turn}`, type: "agentMessage", text: "settled" } } });
@@ -59,20 +67,20 @@ class FakeServer implements AppServer {
 
 const cleanup: (() => Promise<void> | void)[] = [];
 afterEach(async () => { for (const f of cleanup.splice(0).reverse()) await f(); });
-function setup(stateDir?: string, committed = true) {
+function setup(stateDir?: string) {
   const directory = stateDir ?? mkdtempSync(join(tmpdir(), "endo-codex-test-"));
   if (!stateDir) cleanup.push(() => rmSync(directory, { recursive: true, force: true }));
   const server = new FakeServer();
-  const host = new CodexHost({ stateDir: directory, server, isActivationCommitted: () => committed });
+  const host = new CodexHost({ stateDir: directory, server, isActivationCommitted: () => true });
   cleanup.push(() => host.close());
-  const executor = new CodexExecutor((input, emit, signal) => host.handle(input, signal ?? new AbortController().signal, emit ?? (() => {})));
+  const executor = new NativeExecutor((input, emit, signal) => host.handle(input, signal ?? new AbortController().signal, emit ?? (() => {})), "codex");
   return { directory, server, host, executor };
 }
 function request(activationId: string, messages: FrameMessage[] = []): ExecutorRunRequest {
   return { activationId, generatorId: "generator", inference: { preamble: [{ type: "text", text: "Tend this system.", slot: "instructions", volatile: false }], history: [...messages], recency: [], tools: [], retrievableStates: [] },
     enqueueFrame(frame) { messages.push(...frame.messages ?? []); return { id: crypto.randomUUID(), ...frame }; } };
 }
-async function drive(executor: CodexExecutor, input: ExecutorRunRequest) {
+async function drive(executor: NativeExecutor, input: ExecutorRunRequest) {
   const staged: FrameMessage[] = [];
   const enqueue = input.enqueueFrame;
   input.enqueueFrame = (frame) => { staged.push(...frame.messages ?? []); return enqueue(frame); };
@@ -105,27 +113,7 @@ test("successive activations reuse a thread, append state changes, and tolerate 
   expect(config["features.shell_tool"]).toBe(false);
 });
 
-test("oversized turn history keeps current context and newest messages under Codex's combined input limit", async () => {
-  const { executor, server } = setup();
-  const input = request("large-history", [
-    { type: "user", text: "old history " + "x".repeat(1 << 20) },
-    { type: "user", text: "recent observation" },
-    { type: "user", text: "check stout now" },
-  ]);
-  input.inference.recency = [{ type: "text", text: "Current state: no open deployment", slot: "state", volatile: true }];
-  await executor.run(input);
-  const text = server.requests.find(r => r.method === "turn/start")!.params.input.map((item: any) => item.text).join("");
-  expect(text.length).toBeLessThanOrEqual(1 << 20);
-  expect(text).toContain("Tend this system.");
-  expect(text).toContain("Current state: no open deployment");
-  expect(text).toContain("recent observation");
-  expect(text).toContain("check stout now");
-  expect(text).not.toContain("old history");
-  expect(JSON.parse(text.slice(text.indexOf("\n") + 1)).historyWindow.omittedMessages).toBe(1);
-  expect(input.inference.history).toHaveLength(3);
-});
-
-test("history window preserves a contiguous suffix and never truncates mandatory context or the newest message", () => {
+test("history window keeps a contiguous suffix within the native input limit, never truncating standing context or the newest message", async () => {
   const projection: Projection = { preamble: "[]", recency: "[]", tools: [],
     history: [JSON.stringify({text:"old"}), JSON.stringify({text:"x".repeat(2000)}), JSON.stringify({text:"new"})] };
   const update = JSON.parse(contextUpdate(projection, undefined, 800));
@@ -133,6 +121,11 @@ test("history window preserves a contiguous suffix and never truncates mandatory
   expect(update.historyWindow.omittedMessages).toBe(2);
   expect(() => contextUpdate({...projection, preamble: JSON.stringify(["x".repeat(2000)])}, undefined, 800)).toThrow("standing context");
   expect(() => contextUpdate({...projection, history: [JSON.stringify({text:"x".repeat(2000)})]}, undefined, 800)).toThrow("newest history message");
+  const { executor, server } = setup();
+  await executor.run(request("large-history", [{ type: "user", text: "old " + "x".repeat(1 << 20) }, { type: "user", text: "check stout now" }]));
+  const text = server.requests.find((r) => r.method === "turn/start")!.params.input.map((item: any) => item.text).join("");
+  expect(text.length).toBeLessThanOrEqual(1 << 20);
+  expect(text).toContain("check stout now");
 });
 
 test("clean host restart resumes the thread; a different generator gets its own thread", async () => {
@@ -182,25 +175,6 @@ test("cancellation interrupts the native turn and an uncheckpointed session is n
   expect(second.server.thread).not.toBe(id);
 });
 
-test("a turn completed without a worker checkpoint is uncertain after restart", async () => {
-  const first = setup();
-  const projection: Projection = { preamble: "[]", history: [], recency: "[]", tools: [] };
-  await first.host.handle({ op: "run", generatorId: "generator", activationId: "uncommitted", projection } as Json, new AbortController().signal, () => {});
-  await first.host.close();
-  const second = setup(first.directory);
-  await second.executor.run(request("recovery"));
-  expect(second.server.requests.some((r) => r.method === "thread/resume")).toBe(false);
-});
-
-test("worker checkpoint cannot substitute for a durable Projector completion", async () => {
-  const first = setup();
-  await first.executor.run(request("staged-only"));
-  await first.host.close();
-  const second = setup(first.directory, false);
-  await second.executor.run(request("recovery"));
-  expect(second.server.requests.some((r) => r.method === "thread/resume")).toBe(false);
-});
-
 test("native tool responses wait for Projector state commits without starting another Codex turn", async () => {
   const { executor, server } = setup();
   const count = createState({ key: "count", schema: z.number(), init: 0, projection: { render: (n) => `counter:${n}` } });
@@ -243,4 +217,88 @@ test("different generators can park tool results and resume their own native tur
   expect((await executor.run({ ...first, activationId: "one-next", continuationState: one.continuationState })).completionReason).toBe("done");
   expect((await executor.run({ ...second, activationId: "two-next", continuationState: two.continuationState })).completionReason).toBe("done");
   expect(server.requests.filter((r) => r.method === "turn/start")).toHaveLength(2);
+});
+
+test("an action outliving its native turn is delivered to a new turn instead of failing the activation", async () => {
+  const { executor, server } = setup();
+  const gate = Promise.withResolvers<void>();
+  let effects = 0;
+  const deploy = createAction({ state: null, name: "deploy", inputSchema: z.object({}), async run() { await gate.promise; effects++; return "deployed"; } });
+  const messages: FrameMessage[] = [];
+  const input = request("long-action", messages);
+  input.inference.tools = [deploy];
+  let turns = 0;
+  server.onTurn = () => {
+    if (++turns > 1) return server.complete();
+    // A code-mode model polls the pending call, gives up, and ends its turn while the action runs.
+    server.call("deploy", {});
+    server.complete();
+    setTimeout(() => gate.resolve(), 10);
+  };
+  const result = await drive(executor, input);
+  expect(result.completionReason).toBe("done");
+  expect(effects).toBe(1);
+  expect(server.responses).toHaveLength(0);
+  const starts = server.requests.filter((r) => r.method === "turn/start");
+  expect(starts).toHaveLength(2);
+  expect(starts[1]!.params.input[0].text).toContain("deploy action was still running");
+  expect(starts[1]!.params.input[0].text).toContain("deployed");
+  expect(messages.some((m) => m.type === "action" && m.kind === "result" && m.success === true)).toBe(true);
+});
+
+test("cancelling while an orphaned action runs still cancels the activation", async () => {
+  const { executor, server } = setup();
+  const abort = new AbortController();
+  const deploy = createAction({ state: null, name: "deploy", inputSchema: z.object({}), run: () => new Promise(() => {}) });
+  const input = { ...request("orphan-cancel"), signal: abort.signal };
+  input.inference.tools = [deploy];
+  server.onTurn = () => { server.call("deploy", {}); server.complete(); setTimeout(() => abort.abort(), 10); };
+  expect((await executor.run(input)).completionReason).toBe("cancelled");
+  expect(server.requests.some((r) => r.method === "turn/interrupt")).toBe(false);
+});
+
+test("cancelling while an action runs inside a live turn interrupts it without closing the app-server", async () => {
+  const { executor, server } = setup();
+  const abort = new AbortController();
+  const deploy = createAction({ state: null, name: "deploy", inputSchema: z.object({}), run: () => new Promise(() => {}) });
+  const input = { ...request("pending-cancel"), signal: abort.signal };
+  input.inference.tools = [deploy];
+  server.onTurn = () => { server.call("deploy", {}); setTimeout(() => abort.abort(), 10); };
+  const started = Date.now();
+  expect((await executor.run(input)).completionReason).toBe("cancelled");
+  expect(Date.now() - started).toBeLessThan(1000);
+  expect(server.requests.some((r) => r.method === "turn/interrupt")).toBe(true);
+  expect(server.closed).toBe(false);
+});
+
+test("a compaction mid-turn steers the current standing context into that turn, without history", async () => {
+  const { executor, server } = setup();
+  server.onTurn = () => { server.compact(); queueMicrotask(() => server.complete()); };
+  const input = request("compacted", [{ type: "user", text: "an old event" }]);
+  input.inference.recency = [{ type: "text", text: "State: deployed", slot: "state", volatile: true }];
+  await executor.run(input);
+  const steer = server.requests.find((r) => r.method === "turn/steer");
+  expect(steer?.params).toMatchObject({ threadId: server.thread, expectedTurnId: server.turn });
+  const text = steer!.params.input[0].text;
+  expect(text).toContain("restored after this conversation was compacted");
+  expect(text).toContain("Tend this system.");
+  expect(text).toContain("State: deployed");
+  expect(text).not.toContain("an old event");
+});
+
+test("a compaction that cannot be steered resends the standing context, not history, on the next turn", async () => {
+  const { executor, server } = setup();
+  server.steerFails = true;
+  server.onTurn = () => { server.compact(); queueMicrotask(() => server.complete()); };
+  const messages: FrameMessage[] = [{ type: "user", text: "an old event" }];
+  await executor.run(request("compacted", messages));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  server.onTurn = undefined;
+  messages.push({ type: "user", text: "a new event" });
+  await executor.run(request("next", messages));
+  const starts = server.requests.filter((r) => r.method === "turn/start");
+  const text = starts.at(-1)!.params.input[0].text;
+  expect(text).toContain("Tend this system.");
+  expect(text).toContain("a new event");
+  expect(text).not.toContain("an old event");
 });

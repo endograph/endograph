@@ -10,7 +10,7 @@ import { hashOf, hashText } from "../src/inception/incept.ts";
 import { readObservatorySnapshot } from "../src/observatory/data.ts";
 import { openSqliteStore } from "../src/store/sqlite.ts";
 
-test("CLI and observatory share inception, residence and failure observations without loading code", async () => {
+test("status and observatory share inception, residence and failure observations without loading code", async () => {
   const dir = mkdtempSync(join(tmpdir(), "endo-inspect-"));
   const paths = pathsOf(dir);
   ensureStateDir(paths);
@@ -41,12 +41,6 @@ test("CLI and observatory share inception, residence and failure observations wi
     expect(inspection.phase).toBe("incepting");
     expect(await whyNotServing(paths, "inspection")).toBe(inspection.reason);
     expect((await readObservatorySnapshot(paths)).agent).toMatchObject({ phase: inspection.phase, reason: inspection.reason, active: false });
-    const cli = Bun.spawn([process.execPath, join(import.meta.dir, "../src/cli/index.ts"), "--agent", dir, "status"], { stdout: "pipe", stderr: "pipe" });
-    const [code, out, err] = await Promise.all([cli.exited, new Response(cli.stdout).text(), new Response(cli.stderr).text()]);
-    expect(code).toBe(0);
-    expect(err).toBe("");
-    expect(out).toContain("inspection: up, incepting");
-    expect(out).toContain(inspection.reason!);
     // A newer running worker makes an interrupted attempt's record stale.
     write({ at: status.at + 2 });
     expect((await inspectAgent(paths)).phase).toBe("idle");

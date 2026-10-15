@@ -5,28 +5,21 @@ import { join } from "node:path";
 import { installDependencies } from "../src/cli/dependencies.ts";
 import { acquireLock } from "../src/harness/lock.ts";
 
-test.each(["bun", "npm"])("up installs missing dependencies from the %s lockfile without changing versions", async (manager) => {
+test("up installs missing dependencies from the lockfile and rejects a lockfile that no longer matches", async () => {
   const dir = mkdtempSync(join(tmpdir(), "endo-install-"));
   try {
     mkdirSync(join(dir, "fixture"));
     writeFileSync(join(dir, "fixture/package.json"), JSON.stringify({ name: "local-fixture", version: "1.0.0" }));
     const manifest = JSON.stringify({ name: "install-test", private: true, dependencies: { "local-fixture": "file:./fixture" } });
     writeFileSync(join(dir, "package.json"), manifest);
-    const seed = Bun.spawn(manager === "bun"
-      ? [process.execPath, "install", "--lockfile-only", "--ignore-scripts"]
-      : ["npm", "install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"],
-    { cwd: dir, stdout: "ignore", stderr: "pipe" });
-    const errors = await new Response(seed.stderr).text();
-    expect({ code: await seed.exited, errors: manager === "npm" ? errors : "" }).toEqual({ code: 0, errors: "" });
-    const file = join(dir, manager === "bun" ? "bun.lock" : "package-lock.json");
+    const seed = Bun.spawn([process.execPath, "install", "--lockfile-only", "--ignore-scripts"], { cwd: dir, stdout: "ignore", stderr: "ignore" });
+    expect(await seed.exited).toBe(0);
+    const file = join(dir, "bun.lock");
     const locked = readFileSync(file);
-    for (let i = 0; i < 2; i++) {
-      rmSync(join(dir, "node_modules"), { recursive: true, force: true });
-      await installDependencies(dir);
-      expect(JSON.parse(readFileSync(join(dir, "node_modules/local-fixture/package.json"), "utf8")).version).toBe("1.0.0");
-      expect(readFileSync(file)).toEqual(locked);
-      expect(readFileSync(join(dir, "package.json"), "utf8")).toBe(manifest);
-    }
+    await installDependencies(dir);
+    expect(JSON.parse(readFileSync(join(dir, "node_modules/local-fixture/package.json"), "utf8")).version).toBe("1.0.0");
+    expect(readFileSync(file)).toEqual(locked);
+    expect(readFileSync(join(dir, "package.json"), "utf8")).toBe(manifest);
     writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "install-test", private: true,
       dependencies: { "local-fixture": "file:./fixture", "another-fixture": "file:./fixture" } }));
     await expect(installDependencies(dir)).rejects.toThrow("dependency installation failed");

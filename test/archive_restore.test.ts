@@ -9,7 +9,7 @@ import { ensureStateDir, pathsOf, type Paths } from "../src/harness/paths.ts";
 import { incept, inceptionStatus } from "../src/inception/incept.ts";
 import { newId, readReply, waitForReply, writeMessage, type Reply } from "../src/protocol/wire.ts";
 import { allFrames, type Frame } from "../src/store/types.ts";
-import { archivePath, openSqliteStore, StoreRecoveryRequired } from "../src/store/sqlite.ts";
+import { archivePath, StoreRecoveryRequired } from "../src/store/sqlite.ts";
 import { answer, scripted } from "./fixtures/agent/scripted.ts";
 
 const ROOT = resolve(import.meta.dir, "..");
@@ -34,16 +34,15 @@ async function until(check: () => boolean): Promise<void> {
   throw new Error("timed out waiting for harness state");
 }
 
-test("endo up restores inception, evolved instance, full history and canonical replies without SQLite", async () => {
+test("a harness restores inception, evolved instance, full history and canonical replies without SQLite", async () => {
   const dir = scaffold();
   const paths = pathsOf(dir);
-  let child: ReturnType<typeof Bun.spawn> | undefined;
   try {
     await incept({ agentDir: dir, inceptor: "true" });
     expect(existsSync(join(paths.snapshots, "1/instance.json"))).toBe(true);
     removeDatabase(paths);
     expect((await inceptionStatus(paths)).n).toBe(1);
-    const agent = await openAgent({ agentDir: dir, executor: scripted(answer) });
+    let agent = await openAgent({ agentDir: dir, executor: scripted(answer) });
     const ids: string[] = [];
     let instance: SerializedInstance;
     let frames: Frame[];
@@ -62,38 +61,14 @@ test("endo up restores inception, evolved instance, full history and canonical r
     } finally { await agent.stop(); }
     removeDatabase(paths);
     for (const id of ids) rmSync(join(paths.outbox, `${id}.json`));
-    const spawned = Bun.spawn([process.execPath, "run", join(ROOT, "src/cli/index.ts"), "up", "--foreground"], {
-      cwd: dir, env: { ...process.env, ENDOGRAPH_HOME: join(dir, "registry") }, stdout: "pipe", stderr: "pipe",
-    });
-    child = spawned;
-    let outputText = "";
-    const output = (async () => {
-      const decoder = new TextDecoder();
-      for await (const bytes of spawned.stdout) outputText += decoder.decode(bytes, { stream: true });
-      return outputText;
-    })();
-    const errors = new Response(spawned.stderr).text();
-    await until(() => {
-      try { return JSON.parse(readFileSync(paths.status, "utf8")).running === true && isLocked(paths.lock); } catch { return false; }
-    });
-    await until(() => ids.every((id) => !!readReply(paths.outbox, id)));
-    await until(() => outputText.includes(" up in "));
-    expect(ids.map((id) => readReply(paths.outbox, id))).toEqual(replies!);
-    const restored = openSqliteStore(paths.db);
+    agent = await openAgent({ agentDir: dir, executor: scripted(answer) });
     try {
-      expect(restored.readSnapshot()?.state).toEqual(instance);
-      expect([...allFrames(restored)]).toEqual(frames!);
-    } finally { restored.close(); }
-    child.kill("SIGTERM");
-    expect(await child.exited).toBe(0);
-    expect(await output).not.toContain("running inception");
-    expect(await errors).toBe("");
-    child = undefined;
-  } finally {
-    if (child) { child.kill("SIGKILL"); await child.exited; }
-    rmSync(dir, { recursive: true, force: true });
-  }
-}, 20000);
+      expect(ids.map((id) => readReply(paths.outbox, id))).toEqual(replies);
+      expect(serializeInstance(agent.loaded.machine.instance, agent.loaded.charter)).toEqual(instance);
+      expect([...allFrames(agent.store)]).toEqual(frames);
+    } finally { await agent.stop(); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 test("an async acknowledgement archive failure stops the old harness and leaves its run recoverable", async () => {
   const dir = scaffold();

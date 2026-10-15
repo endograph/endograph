@@ -10,13 +10,15 @@ import { loadEnv } from "../harness/env.ts";
 import { ensureStateDir, pathsOf } from "../harness/paths.ts";
 import { incept, inceptionStatus, type RuntimeLoader, type RuntimeLoadResult } from "../inception/incept.ts";
 import { recoverPromotion } from "../inception/promotion.ts";
-import { atomicWrite } from "../protocol/wire.ts";
+import { atomicWrite, newId, PROTOCOL_VERSION, writeMessage } from "../protocol/wire.ts";
 import { describeHostActions, hostAction, HostActionError, type HostAction } from "./action.ts";
 import { createHostBroker } from "./broker.ts";
 import { createHostModelHandler } from "./model.ts";
 import { closeSandbox, sandboxCommand } from "./sandbox.ts";
 import { ipcTransport } from "./transport.ts";
 import { CodexHost } from "@endograph/codex-executor/host";
+import { NATIVE_LABELS } from "@endograph/codex-executor/protocol";
+import { ClaudeHost } from "@endograph/claude-executor/host";
 import { hasCommittedActivation } from "../store/activation.ts";
 
 const WORKER = join(import.meta.dir, "worker.ts");
@@ -45,8 +47,8 @@ export async function createAgentHost(opts: {
     try { (opts.log ?? console.log)(line); } catch {} // Observers cannot decide activation.
   };
   let catalogueJson: string | undefined;
-  const loadGrantedActions = async (): Promise<HostAction[]> => {
-    const grant = await loadGrant(paths);
+  const loadGrantedActions = async (override?: Grant): Promise<HostAction[]> => {
+    const grant = override ?? await loadGrant(paths);
     const actions = [...(opts.actions ?? [])];
     for (const module of grant.hostModules) {
       const file = resolve(paths.agentDir, module);
@@ -72,15 +74,15 @@ export async function createAgentHost(opts: {
   let lastAttemptedInputs: string | undefined;
   let closing = false;
   let closeTask: Promise<void> | undefined;
-  const launch = async (mode: "run" | "load", inputFile?: string) => {
+  const launch = async (mode: "run" | "load", inputFile?: string, validationGrant?: Grant) => {
     if (closing) throw new Error("agent host is closing");
     if (mode === "run" && existsSync(join(paths.state, "promotion.json"))) {
       const lock = acquireLock(paths.lock);
       if (!lock) throw new Error("cannot recover promotion while the agent is running");
       try { recoverPromotion(paths); } finally { lock.release(); }
     }
-    const grant = await host.grant();
-    if ("backend" in grant.executor) mkdirSync(join(paths.local, "executors", "codex"), { recursive: true, mode: 0o700 });
+    const grant = validationGrant ?? await host.grant();
+    if ("backend" in grant.executor) mkdirSync(join(paths.local, "executors", grant.executor.backend), { recursive: true, mode: 0o700 });
     const wrapped = await sandboxCommand(paths, grant, [process.execPath, WORKER, mode, paths.agentDir, ...(inputFile ? [inputFile] : [])]);
     if (closing) throw new Error("agent host is closing");
     const child = spawn(wrapped.argv[0]!, wrapped.argv.slice(1), {
@@ -122,8 +124,8 @@ export async function createAgentHost(opts: {
         } finally { incepting = false; }
       },
     }) : undefined;
-    // One session owner per worker connection. Validation loads never start Codex.
-    let codex: CodexHost | undefined;
+    // One session owner per worker connection. Validation loads never start a native session.
+    let native: CodexHost | ClaudeHost | undefined;
     const aiModel = createHostModelHandler(async () => {
       const currentGrant = await host.grant();
       if (!("provider" in currentGrant.executor)) throw new Error("this executor does not provide a hosted language model");
@@ -132,28 +134,39 @@ export async function createAgentHost(opts: {
     const broker = createHostBroker({
       describeOnly: mode === "load",
       identity: grant.name, transport: ipcTransport(child), maxBytes: 8 * 1024 * 1024, timeoutMs: 2 * 60 * 60 * 1000,
+      // A host action's message is a request from agent:<name>/<action> in this
+      // agent's inbox: the same delivery as a procedure's emitMessage.
+      emitMessage: mode === "run" ? (action, message) => {
+        const id = newId();
+        writeMessage(paths.inbox, {
+          v: PROTOCOL_VERSION, kind: "request", id, from: `agent:${grant.name}/${action}`,
+          text: message.text, ref: message.ref, thread: message.thread, at: Date.now(),
+        });
+        return { id };
+      } : undefined,
       actions: async () => {
-        const actions = await loadGrantedActions();
+        const actions = await loadGrantedActions(validationGrant);
         if (inceptionAction) actions.push(inceptionAction);
         return actions;
       },
       model: async (input, context, emit) => {
         const currentGrant = await host.grant();
         if ("backend" in currentGrant.executor) {
-          if (mode !== "run" || !("backend" in grant.executor) || JSON.stringify(currentGrant.executor) !== JSON.stringify(grant.executor))
-            throw new HostActionError("Codex configuration changed; restart the worker");
-          codex ??= new CodexHost({ ...currentGrant.executor, stateDir: join(paths.local, "executors", "codex"),
-            isActivationCommitted: (id) => hasCommittedActivation(paths.db, id) });
-          try { return await codex.handle(input, context.signal, emit); }
+          const config = currentGrant.executor;
+          if (mode !== "run" || !("backend" in grant.executor) || JSON.stringify(config) !== JSON.stringify(grant.executor))
+            throw new HostActionError(`${NATIVE_LABELS[config.backend]} configuration changed; restart the worker`);
+          const options = { stateDir: join(paths.local, "executors", config.backend), unsandboxed: !currentGrant.sandbox, isActivationCommitted: (id: string) => hasCommittedActivation(paths.db, id) };
+          native ??= config.backend === "codex" ? new CodexHost({ ...config, ...options }) : new ClaudeHost({ ...config, ...options });
+          try { return await native.handle(input, context.signal, emit); }
           catch (error) {
             // A failed connection/turn is replaced on the next activation. Pending
             // metadata prevents an uncertain native turn from being replayed.
             if (input && typeof input === "object" && !Array.isArray(input) && input.op !== "tool-result") {
-              const failed = codex;
-              codex = undefined;
+              const failed = native;
+              native = undefined;
               await failed.close();
             }
-            throw new HostActionError(error instanceof Error ? error.message : "Codex execution failed");
+            throw new HostActionError(error instanceof Error ? error.message : `${NATIVE_LABELS[config.backend]} execution failed`);
           }
         }
         return aiModel(input, context, emit);
@@ -164,7 +177,7 @@ export async function createAgentHost(opts: {
       child.once("close", (code) => resolve(code ?? 1));
     }).finally(async () => {
       broker.close();
-      await codex?.close();
+      await native?.close();
       children.delete(child);
     });
     children.set(child, exited);
@@ -179,7 +192,7 @@ export async function createAgentHost(opts: {
       const resultFile = `${file}.result`;
       atomicWrite(dir, basename(file), input);
       try {
-        const { child, exited } = await launch("load", file);
+        const { child, exited } = await launch("load", file, input.grant);
         let timedOut = false;
         const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, opts.loadTimeoutMs ?? 60_000);
         let code: number;

@@ -14,7 +14,10 @@
   },
   "exports": {
     ".": "./src/index.ts",
-    "./host": "./src/host.ts"
+    "./host": "./src/host.ts",
+    "./protocol": "./src/protocol.ts",
+    "./context": "./src/context.ts",
+    "./sessions": "./src/sessions.ts"
   },
   "dependencies": {
     "@projectors/core": "latest",

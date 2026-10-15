@@ -1,7 +1,7 @@
 import { existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { userInfo } from "node:os";
 import { join, resolve } from "node:path";
-import { collectRunnableActivations, normalizeSchema, runMachine, serializeInstance, type ProjectorExecutor } from "@projectors/core";
+import { collectRunnableActivations, normalizeSchema, runMachine, serializeInstance, type AnyAction, type ExecutorRunRequest, type ProjectorExecutor } from "@projectors/core";
 import { grantActions } from "../grant/core.ts";
 import { loadGrant, type Grant } from "../grant/grant.ts";
 import { bindRuntime } from "../grant/bind.ts";
@@ -51,6 +51,8 @@ export interface OpenOptions {
   host?: HostClient;
   /** A hosted worker receives its environment from the trusted parent. */
   environmentLoaded?: boolean;
+  /** History bytes since the last horizon at which requests carry a compaction notice, and at which the harness compacts. */
+  history?: { noticeBytes: number; compactBytes: number };
 }
 
 
@@ -81,6 +83,29 @@ export class HeldElsewhere extends Error {}
 const REQUEST_HEADER = (m: Delivered<RequestMessage>) =>
   `[request id=${m.id} from=${m.from}${m.thread ? ` thread=${m.thread}` : ""}${m.ref ? ` ref=${m.ref}` : ""}${m.origin ? ` origin=${m.origin}` : ""}]`;
 
+/** Every activation sends its projected history whole: hosted, over an 8 MiB worker connection. */
+const HISTORY = { noticeBytes: 1 << 20, compactBytes: 4 << 20 };
+/** Errors that a smaller history can fix: the worker connection's cap, or a model's context window. */
+export const OVERFLOW = /host request too large|context.{0,20}(window|length|limit)|prompt is too long|maximum context|too many tokens/i;
+const size = (bytes: number) => bytes < 1 << 20 ? `${Math.ceil(bytes / 1024)} KB` : `${(bytes / (1 << 20)).toFixed(1)} MB`;
+
+/** Reports each activation as it starts, and each action it starts. */
+function observe(executor: ProjectorExecutor, on: { run(request: ExecutorRunRequest): void; action(name: string): void }): ProjectorExecutor {
+  return new Proxy(executor, {
+    get(target, key) {
+      if (key === "run") return (request: ExecutorRunRequest) => {
+        on.run(request);
+        return target.run({
+          ...request,
+          ...(request.createActionContext ? { createActionContext: (action: AnyAction) => { on.action(action.name); return request.createActionContext!(action); } } : {}),
+        });
+      };
+      const value = Reflect.get(target, key);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
 export async function openAgent(opts: OpenOptions): Promise<Agent> {
   const paths = pathsOf(resolve(opts.agentDir));
   ensureStateDir(paths);
@@ -104,7 +129,14 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
     closeStore = () => store.close();
     const threads = threadStore(store);
     threads.list(); // Rebuild recorded thread indexes and queued requests when restoring.
-    const executor = opts.executor ?? bindings.executor.create();
+    // The actions the current drive started; a failed activation commits no frames to show them.
+    let started: string[] = [];
+    // The history each generator's latest activation sent: its projection after horizons, visibility, and history projections.
+    const sent = new Map<string, number>();
+    const executor = observe(opts.executor ?? bindings.executor.create(), {
+      run: (request) => { sent.set(request.generatorId, Buffer.byteLength(JSON.stringify(request.inference.history))); },
+      action: (name) => { started.push(name); },
+    });
     const activationTimeoutMs = opts.activationTimeoutMs ?? 2 * 60 * 60 * 1000;
 
     // A logging observer must never roll back persistence or interrupt a
@@ -130,6 +162,10 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
     let abortActive: ((reason: string) => void) | undefined;
     let unsubscribe = () => {};
     const lastFailure = new Map<string, string>();
+    const limits = opts.history ?? HISTORY;
+    const historyBytes = () => Math.max(0, ...sent.values());
+    /** Why the next delivery compacts first, when an overflow persisted after compaction. */
+    let compactNext: string | undefined;
 
     const status = (): Status => ({
       name,
@@ -342,11 +378,13 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
       };
       return (busy = busy.then(run, run));
     };
-    const drive = async (ids: string[]) => {
+    /** Drive the machine to quiescence and fail what it left open; return an overflow. With retryOverflow, an overflow leaves the requests open. */
+    const drive = async (ids: string[], retryOverflow = false): Promise<string | undefined> => {
       const machine = loaded.machine;
       active = true;
       writeStatus();
       const inFlight = new Set<string>();
+      started = [];
       const unsub = machine.subscribe((frame) => {
         for (const m of frame.messages) {
           if (m.type === "work" && m.kind === "activation") inFlight.add(m.activationId);
@@ -367,7 +405,7 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
         for await (const _ of runMachine(machine)) void _;
       } catch (err) {
         const text = err instanceof Error ? err.message : String(err);
-        failure = /context|too long|too many tokens|maximum.*tokens/i.test(text) ? `context overflow: ${text}` : text;
+        failure = OVERFLOW.test(text) ? `context overflow: ${text}` : text;
         record({ type: "error", summary: `activation failed: ${firstLine(failure)}`, payload: { error: text } });
         abortAll("aborted after a failure");
         try {
@@ -378,7 +416,8 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
         clearTimeout(timer);
         unsub();
       }
-      for (const id of ids) {
+      const overflow = failure?.startsWith("context overflow") ? failure : undefined;
+      for (const id of overflow && retryOverflow && !retiring ? [] : ids) {
         const o = open.get(id);
         if (!o || o.working) continue;
         fail(id, failure ? `the activation failed: ${failure}` : timedOut ? `the activation timed out after ${activationTimeoutMs / 1000}s` : "the activation ended without a reply");
@@ -386,6 +425,36 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
       store.writeSnapshot({ asOfSeq: store.lastSeq(), at: Date.now(), state: serializeInstance(machine.instance, machine.charter) });
       active = false;
       writeStatus();
+      return overflow;
+    };
+
+    /** The harness's own horizon, for history the agent let outgrow what an activation can send. */
+    const compactHistory = (reason: string, delivering: ReadonlySet<string>) => {
+      const recent: string[] = [];
+      const owed = new Map<string, Delivered<RequestMessage>>();
+      for (const f of allFrames(store)) {
+        if (f.type === "request" || f.type === "reply") {
+          recent.push(`- ${f.type}${f.id ? ` ${f.id}` : ""}: ${f.summary}`);
+          if (recent.length > 20) recent.shift();
+        }
+        const requests = (f.payload as { metadata?: { endo?: { requests?: Delivered<RequestMessage>[] } } } | undefined)?.metadata?.endo?.requests;
+        for (const r of requests ?? []) if (open.has(r.id) && !delivering.has(r.id)) owed.set(r.id, r);
+      }
+      const summary = [
+        `Endograph compacted this history automatically because ${reason}; no summary of yours was recorded. ` +
+          `Older frames left the view. State values are unchanged, and every frame remains in the log (\`endo replay\`, \`endo why <id>\`).`,
+        ...(owed.size ? ["", "Requests still awaiting your reply:", ...[...owed.values()].map((m) => `${REQUEST_HEADER(m)}\n${m.text}`)] : []),
+        ...(recent.length ? ["", "The latest requests and replies before this point:", ...recent] : []),
+      ].join("\n");
+      loaded.machine.enqueueFrame({
+        inert: true,
+        messages: [
+          { type: "horizon" },
+          { type: "user", text: `Summary of everything before this point (older frames are in the log, not in view):\n\n${summary}`, actor: { id: "endo:compaction", label: "compaction" } },
+        ],
+        metadata: endoMeta({ type: "compaction", summary: `compacted automatically: ${reason}` }),
+      });
+      sent.clear();
     };
 
     const handleCall = (call: Delivered<CallMessage>) => {
@@ -428,14 +497,19 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
       }
     };
 
-    const deliverRequests = async (batch: Delivered<RequestMessage>[]) => {
-      if (batch.length === 0) return;
+    const enqueueRequests = (batch: Delivered<RequestMessage>[], compactReason?: string, note?: string) => {
       const froms = [...new Set(batch.map((m) => m.from))].join(", ");
       const inceptor = batch.find((m) => m.from.startsWith("inceptor:"));
+      const text = note ?? (!compactReason && historyBytes() > limits.noticeBytes
+        ? `[endo] Your history since its last horizon is about ${size(historyBytes())}, and every activation sends it whole. ` +
+          `Record what you need to carry forward with the compact action; at ${size(limits.compactBytes)} Endograph compacts it without your summary.`
+        : undefined);
+      const notice = text ? [{ type: "user" as const, actor: { id: "endo", label: "endo" }, text }] : [];
       try {
         store.transaction(() => {
+          if (compactReason) compactHistory(compactReason, new Set(batch.map((m) => m.id)));
           loaded.machine.enqueueFrame({
-            messages: batch.map((m) => ({ type: "user", text: `${REQUEST_HEADER(m)}\n${m.text}`, actor: { id: m.from, label: m.from } })),
+            messages: [...batch.map((m) => ({ type: "user" as const, text: `${REQUEST_HEADER(m)}\n${m.text}`, actor: { id: m.from, label: m.from } })), ...notice],
             metadata: endoMeta({
               type: "request",
               summary: batch.length === 1 ? `${batch[0]!.from}: ${firstLine(batch[0]!.text)}` : `${batch.length} requests from ${froms}`,
@@ -453,9 +527,26 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
         if (!persistenceFailure) persistenceFailed(failure);
         throw failure;
       }
+    };
+
+    const deliverRequests = async (batch: Delivered<RequestMessage>[]) => {
+      if (batch.length === 0) return;
+      enqueueRequests(batch, compactNext ?? (historyBytes() > limits.compactBytes ? `its history since the last horizon reached ${size(historyBytes())}` : undefined));
+      compactNext = undefined;
       briefing = undefined;
       for (const m of batch) open.set(m.id, { working: false });
-      await drive(batch.map((m) => m.id));
+      const overflow = await drive(batch.map((m) => m.id), true);
+      if (!overflow) return;
+      const reason = `an activation failed with ${firstLine(overflow)}`;
+      // Once: compact, then deliver what is still unanswered again after the horizon, with what the failed attempt started.
+      const again = batch.filter((m) => open.has(m.id) && !open.get(m.id)!.working);
+      if (again.length === 0) { compactNext = reason; return; }
+      const actions = [...new Set(started)];
+      enqueueRequests(again, reason, actions.length ? `[endo] An earlier attempt at ${again.length === 1 ? "this request" : "these requests"} overflowed after starting ${actions.join(", ")}. ` +
+        "Its results and state changes were not recorded, but effects outside Endograph may have happened; check before repeating them." : undefined);
+      // A request too large on its own stays after this horizon; cut it off before the next one.
+      const persisted = await drive(again.map((m) => m.id));
+      if (persisted) compactNext = `an activation failed with ${firstLine(persisted)}`;
     };
 
     const poll = async () => {
@@ -628,7 +719,7 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
       status,
     };
     writeStatus();
-    if (redrive.length) await serially(() => drive(redrive));
+    if (redrive.length) await serially(async () => { await drive(redrive); });
     if (briefing) await serially(poll);
     return agent;
   } catch (err) {

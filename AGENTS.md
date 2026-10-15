@@ -27,7 +27,8 @@ optional discussion IDs, with no prescribed workflow, ownership, or isolation.
   the committed lockfile; startup installs dependencies, never upgrades them.
 - Update `@projectors/core` and `@projectors/aisdk-executor` together; keep `latest`
   in the manifest and tested versions in `bun.lock`. Upstream AI SDK executor
-  fixes belong in Projector; the Codex adapter lives in `packages/codex-executor`.
+  fixes belong in Projector; the native adapters live in `packages/codex-executor`
+  and `packages/claude-executor` (which reuses the Codex worker side and RPC).
 - Projector schemas validate only: no defaults, transforms, or coercion. Put
   initialization in `init` or code.
 - Keep the program contract and inception guidance accurate when APIs change.

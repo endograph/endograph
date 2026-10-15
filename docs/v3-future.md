@@ -149,20 +149,12 @@ so the supervisor does not crash-loop.
 **What.** `endo up -d --system`: a system unit with `User=endo`; needs
 root. In containers `up` is the entrypoint and `-d` is an error.
 
-## 14. Last-resort compaction
-
-**What.** The harness compacting on its own when a program keeps
-overflowing its context. The plan's floor is a `failed` reply with a
-frame naming the cause and the program's own compaction routine.
-
-**Usage must tell us.** Whether a program ever gets stuck there.
-
-## 15. Poly-agents from one grant
+## 14. Poly-agents from one grant
 
 **What.** A dynamic name token, `endo up --name`, so one grant runs as
 several agents. Unchanged from v2, unscheduled.
 
-## 16. Instance carry-over at re-inception
+## 15. Instance carry-over at re-inception
 
 **What.** Re-incepting an agent whose persisted instance has evolved
 (spawns, cedes, transitions, state updates through the evolve battery)

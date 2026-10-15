@@ -1,4 +1,4 @@
-import { describeHostActions, HostActionError, type HostAction, type HostActionContext, type JsonValue } from "./action.ts";
+import { describeHostActions, HostActionError, type HostAction, type HostActionContext, type HostMessage, type JsonValue } from "./action.ts";
 import { DEFAULT_MAX_BYTES, type HostTransport } from "./transport.ts";
 import { assertJson, object, validId, VERSION } from "./wire.ts";
 
@@ -9,19 +9,23 @@ export interface HostBrokerOptions {
   describeOnly?: boolean;
   /** Called for every invocation; revocation applies even to previously obtained proxies. */
   actions: () => readonly HostAction[] | Promise<readonly HostAction[]>;
+  /** Delivers an action's `emitMessage` to the agent's own inbox; absent, emitting throws. */
+  emitMessage?: (action: string, message: HostMessage) => { id: string };
   /** The parent selects the model; requests carry model inputs only. */
-  model?: (args: JsonValue, context: HostActionContext, emit: (chunk: JsonValue) => void) => Promise<JsonValue>;
+  model?: (args: JsonValue, context: CallContext, emit: (chunk: JsonValue) => void) => Promise<JsonValue>;
   timeoutMs?: number;
   modelTimeoutMs?: number;
   maxInFlight?: number;
   maxBytes?: number;
 }
 
+/** What every call carries; only host actions also get `emitMessage`. */
+type CallContext = Omit<HostActionContext, "emitMessage">;
 type Result = { ok: true; value: unknown } | { ok: false; error: { code: string; message: string } };
 const failure = (code: string, message: string): Result => ({ ok: false, error: { code, message } });
 
 /** Dispatch computes a result; the connection owns cancellation and replying exactly once. */
-async function dispatch(opts: HostBrokerOptions, request: Record<string, unknown>, context: HostActionContext, emit: (chunk: JsonValue) => void): Promise<Result> {
+async function dispatch(opts: HostBrokerOptions, request: Record<string, unknown>, context: CallContext, emit: (chunk: JsonValue) => void): Promise<Result> {
   if (opts.describeOnly && request.kind !== "describe")
     return failure("denied", "host execution is unavailable during validation");
   if (request.kind === "model") {
@@ -40,7 +44,11 @@ async function dispatch(opts: HostBrokerOptions, request: Record<string, unknown
   const validation = await action.inputSchema["~standard"].validate(request.args);
   context.signal.throwIfAborted();
   if (validation.issues) return failure("invalid_args", "host action arguments failed validation");
-  return { ok: true, value: await action.run(validation.value, context) };
+  const emitMessage = (message: HostMessage) => {
+    if (!opts.emitMessage) throw new HostActionError("messages are unavailable to this host action");
+    return opts.emitMessage(action.name, message);
+  };
+  return { ok: true, value: await action.run(validation.value, { ...context, emitMessage }) };
 }
 
 export function createHostBroker(opts: HostBrokerOptions): { close(): void } {

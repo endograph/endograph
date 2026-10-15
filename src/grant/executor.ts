@@ -1,4 +1,3 @@
-import { anthropic } from "@ai-sdk/anthropic";
 import { openai } from "@ai-sdk/openai";
 import { AiSdkExecutor } from "@projectors/aisdk-executor";
 import type { ProjectorExecutor } from "@projectors/core";
@@ -18,16 +17,15 @@ const TURN_DEADLINE_MS = 2 * 60 * 60 * 1000;
 const MAX_STEPS = 40;
 
 export interface AiSdkOptions {
-  provider: "anthropic" | "openai";
+  provider: "openai";
   model: string;
   maxOutputTokens?: number;
   temperature?: number;
 }
 
 /**
- * The default executor: projector's AI SDK executor over a provider the
- * AI SDK speaks. Credentials come from the environment (ANTHROPIC_API_KEY,
- * OPENAI_API_KEY).
+ * Projector's optional AI SDK executor. The CLI defaults to Codex;
+ * explicitly configured OpenAI API executors use OPENAI_API_KEY.
  */
 export function aisdk(opts: AiSdkOptions, model?: LanguageModelV3): ExecutorSpec {
   const node: Record<string, unknown> = {};
@@ -50,7 +48,5 @@ export function languageModelFor(opts: AiSdkOptions): LanguageModelV3 {
   switch (opts.provider) {
     case "openai":
       return openai(opts.model);
-    case "anthropic":
-      return anthropic(opts.model);
   }
 }
