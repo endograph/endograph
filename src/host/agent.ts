@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import { loadGrant, type Grant } from "../grant/grant.ts";
 import { languageModelFor } from "../grant/executor.ts";
+import { logTime } from "../harness/agent.ts";
 import { acquireLock, isLocked } from "../harness/lock.ts";
 import { loadEnv } from "../harness/env.ts";
 import { ensureStateDir, pathsOf } from "../harness/paths.ts";
@@ -206,13 +207,15 @@ export async function createAgentHost(opts: {
       } finally { rmSync(file, { force: true }); rmSync(resultFile, { force: true }); }
     },
     async run() {
-      const stop = () => { void host.close(); };
+      // The service log is the only record of why a host stopped or its worker restarted.
+      const stop = (signal: NodeJS.Signals) => { log(`${logTime(Date.now())}  ${signal}: stopping`); void host.close(); };
       process.on("SIGINT", stop);
       process.on("SIGTERM", stop);
       try {
         for (;;) {
-          const { exited } = await launch("run");
+          const { child, exited } = await launch("run");
           const code = await exited;
+          log(`${logTime(Date.now())}  worker ${child.pid} exited ${code}${code === RESTART && !closing ? "; restarting to load the new program" : ""}`);
           if (closing || code !== RESTART) return code;
         }
       } finally { process.off("SIGINT", stop); process.off("SIGTERM", stop); }

@@ -87,6 +87,8 @@ const REQUEST_HEADER = (m: Delivered<RequestMessage>) =>
 const HISTORY = { noticeBytes: 1 << 20, compactBytes: 4 << 20 };
 /** Errors that a smaller history can fix: the worker connection's cap, or a model's context window. */
 export const OVERFLOW = /host request too large|context.{0,20}(window|length|limit)|prompt is too long|maximum context|too many tokens/i;
+/** A log line's time: dated and marked UTC, since endo.log outlives any one day. */
+export const logTime = (at: number) => new Date(at).toISOString().replace(/\.\d+Z$/, "Z");
 const size = (bytes: number) => bytes < 1 << 20 ? `${Math.ceil(bytes / 1024)} KB` : `${(bytes / (1 << 20)).toFixed(1)} MB`;
 
 /** Reports each activation as it starts, and each action it starts. */
@@ -146,7 +148,7 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
     };
     const append = (input: FrameInput) => {
       const frame = store.append(input);
-      log(`${String(frame.seq).padStart(4)}  ${new Date(frame.at).toISOString().slice(11, 19)}  ${frame.type.padEnd(11)} ${frame.id ?? ""}  ${frame.summary}`);
+      log(`${String(frame.seq).padStart(4)}  ${logTime(frame.at)}  ${frame.type.padEnd(11)} ${frame.id ?? ""}  ${frame.summary}`);
       return frame;
     };
     const record = (input: Omit<FrameInput, "at"> & { at?: number }) => append({ ...input, at: input.at ?? Date.now() });
@@ -198,7 +200,7 @@ export async function openAgent(opts: OpenOptions): Promise<Agent> {
     const commitReply = (r: Reply): Reply => {
       r = { ...r, from: `agent:${name}`, to: store.readMessage(r.id)?.from ?? r.to ?? `agent:${name}` };
       const frame: FrameInput = { type: "reply", id: r.id, summary: `${r.state}: ${firstLine(r.text)}`, payload: r, at: r.at };
-      if (store.commitReply(r, frame)) log(`${String(store.lastSeq()).padStart(4)}  ${new Date(r.at).toISOString().slice(11, 19)}  reply       ${r.id}  ${frame.summary}`);
+      if (store.commitReply(r, frame)) log(`${String(store.lastSeq()).padStart(4)}  ${logTime(r.at)}  reply       ${r.id}  ${frame.summary}`);
       return store.readReply(r.id)!;
     };
     const publishReply = (r: Reply): Reply => {

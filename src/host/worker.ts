@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
-import { openAgent, type Agent } from "../harness/agent.ts";
+import { logTime, openAgent, type Agent } from "../harness/agent.ts";
 import { loadInceptionRuntime, type RuntimeLoadInput } from "../inception/incept.ts";
 import { atomicWrite } from "../protocol/wire.ts";
 import { createHostClient } from "./client.ts";
@@ -50,7 +50,7 @@ if (mode === "load" && inputFile) {
       onFailure: (error) => { console.error(error.message); void stop(1); },
     });
     agent.start();
-    console.log(`${agent.name} up in ${agentDir} (${agent.loaded.procedures.length} procedures)`);
+    console.log(`${logTime(Date.now())}  ${agent.name} up in ${agentDir} (${agent.loaded.procedures.length} procedures)`);
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     await stop(1);

@@ -47,7 +47,7 @@ function startAgent(cwd: string, ...args: string[]) {
     output: () => stdout,
     ready: () => waitFor("serving readiness", () => {
       const status = join(cwd, ".endo/status.json");
-      try { return /^fixture up in /m.test(stdout) && JSON.parse(readFileSync(status, "utf8")).running === true; }
+      try { return /^\S+  fixture up in /m.test(stdout) && JSON.parse(readFileSync(status, "utf8")).running === true; }
       catch { return false; } // The live status file can be between writes.
     }),
     async stop() {
