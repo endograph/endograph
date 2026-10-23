@@ -66,3 +66,13 @@ test("update_state reports a schema rejection with the state's schema", async ()
   const rejecting = { updateStateAt: () => { throw new SchemaError([{ message: "expected array" }]); } };
   expect(await updateState!.run!({ state: "notes", op: "replace", value: 1 }, rejecting)).toMatchObject({ success: false, error: expect.stringMatching(/notes: expected array\nthe value must satisfy this schema: \{"type":"object"/) });
 });
+
+test("update_state refuses an append without values rather than writing nothing", async () => {
+  const [, , updateState] = coreActions({ reply: () => null });
+  const writes: unknown[] = [];
+  const ctx = { updateStateAt: (_: string, update: unknown) => { writes.push(update); } };
+  expect(await updateState!.run!({ state: "notes", op: "append", path: ["lines"], value: "once" }, ctx)).toMatchObject({ success: false, error: expect.stringMatching(/append takes `values`/) });
+  expect(writes).toEqual([]);
+  expect(await updateState!.run!({ state: "notes", op: "append", path: ["lines"], values: ["once"] }, ctx)).toBe("append notes");
+  expect(writes).toEqual([{ op: "append", values: ["once"], path: ["lines"] }]);
+});

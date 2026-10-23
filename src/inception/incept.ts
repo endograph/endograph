@@ -12,7 +12,6 @@ import { canonical, ensureStateDir, pathsOf, type Paths } from "../harness/paths
 import { loadAgent, LoadError } from "../program/load.ts";
 import type { DescribeFailure } from "../procedures/describe.ts";
 import { hasPersistedStore, openSqliteStore } from "../store/sqlite.ts";
-import { allFrames } from "../store/types.ts";
 import { protectInceptor } from "./sandbox.ts";
 import { readEnv } from "../harness/env.ts";
 import { promote, recoverPromotion } from "./promotion.ts";
@@ -433,9 +432,9 @@ function lastInception(paths: Paths): InceptionRecord | null {
   if (!hasPersistedStore(paths.db)) return null;
   const store = openSqliteStore(paths.db);
   try {
-    let last: InceptionRecord | null = null;
-    for (const f of allFrames(store)) if (f.type === "inception") last = { ...(f.payload as Omit<InceptionRecord, "seq">), seq: f.seq };
-    return last;
+    // `endo list` and `status` ask this of every agent: read one row, not the whole log.
+    const row = store.database.query("SELECT seq, payload FROM frames WHERE type = 'inception' ORDER BY seq DESC LIMIT 1").get() as { seq: number; payload: string } | null;
+    return row ? { ...(JSON.parse(row.payload) as Omit<InceptionRecord, "seq">), seq: row.seq } : null;
   } finally {
     store.close();
   }

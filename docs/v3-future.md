@@ -190,8 +190,11 @@ inception would compound it.
   spawns over transitioning the root: they are the easiest to carry
   across an inception, and a transition replaces a node wholesale.
 
-**Now.** The evolve battery and `instance.json` in the workspace are in
-place (plan §8, §9); `EVOLUTION.md` and the briefing are not.
+**Now.** The evolve battery, `instance.json` and `EVOLUTION.md` in the
+workspace, and the `inceptor:<n>` briefing are in place.
 
 **Usage must tell us.** Whether inceptors migrate well from the log
-alone, and whether the briefing message is read or ignored.
+alone, and whether the briefing message is read or ignored. So far both
+happen: in October 2026 endodev answered and acted on its briefing, while
+endofrog left one unanswered. A briefing is delivered once and never
+redelivered.

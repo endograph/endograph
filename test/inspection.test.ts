@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { framesAbout } from "../src/cli/frames.ts";
 import { inspectAgent, whyNotServing } from "../src/harness/inspect.ts";
 import { acquireLock } from "../src/harness/lock.ts";
 import { ensureStateDir, pathsOf } from "../src/harness/paths.ts";
@@ -9,6 +10,7 @@ import { HOST, writeLoadFailure } from "../src/harness/residence.ts";
 import { hashOf, hashText } from "../src/inception/incept.ts";
 import { readObservatorySnapshot } from "../src/observatory/data.ts";
 import { openSqliteStore } from "../src/store/sqlite.ts";
+import type { Frame } from "../src/store/types.ts";
 
 test("status and observatory share inception, residence and failure observations without loading code", async () => {
   const dir = mkdtempSync(join(tmpdir(), "endo-inspect-"));
@@ -58,4 +60,21 @@ test("status and observatory share inception, residence and failure observations
     writeFileSync(paths.grant, "invalid TOML [");
     expect((await readObservatorySnapshot(paths)).inception.inputError).toBeTruthy();
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("why follows an activation through its continuations, and not into other requests", () => {
+  const work = (activationId: string, sourceFrameId: string) => ({ type: "work", kind: "activation", activationId, sourceFrameId });
+  const step = (id: string, activationId: string, ...messages: object[]) => ({ id, activationId, messages: [{ type: "action", kind: "request", name: "x" }, ...messages] });
+  const frames = [
+    { type: "request", id: "r1", summary: "deploy", payload: { id: "f-r1" } },
+    { type: "activation", summary: "", payload: { id: "f-s1", messages: [work("a1", "f-r1")] } },
+    { type: "activation", summary: "", payload: step("f-1", "a1", work("a1|continuation|f-1", "f-1")) },
+    { type: "activation", summary: "", payload: step("f-2", "a1|continuation|f-1", work("a1|continuation|f-2", "f-2")) },
+    { type: "request", id: "r2", summary: "other", payload: { id: "f-r2" } },
+    { type: "activation", summary: "", payload: { id: "f-s2", messages: [work("a2", "f-r2")] } },
+    { type: "activation", summary: "", payload: step("f-3", "a1|continuation|f-2") },
+    { type: "activation", summary: "", payload: step("f-4", "a2") },
+  ].map((f, i) => ({ seq: i + 1, at: 0, ...f })) as Frame[];
+  expect(framesAbout(frames, "r1").map((f) => f.seq)).toEqual([1, 2, 3, 4, 7]);
+  expect(framesAbout(frames, "r2").map((f) => f.seq)).toEqual([5, 6, 8]);
 });

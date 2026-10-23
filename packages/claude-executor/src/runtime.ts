@@ -78,6 +78,9 @@ class SdkSession implements NativeSession {
       // No built-in tools, filesystem settings, hooks, plugins, skills or other MCP servers:
       // every effect goes through Endograph actions in the worker.
       tools: [], settingSources: [], skills: [], plugins: [], strictMcpConfig: true, mcpServers: { [SERVER]: server },
+      // Auto-memory ignores settingSources: it would load the owner's own Claude Code memory for this
+      // repository as instructions. The agent's memory is its state and log.
+      settings: { autoMemoryEnabled: false, autoDreamEnabled: false },
       allowedTools: TOOL_NAMES, permissionPrompts: "none",
       ...(options.resume ? { resume: options.sessionId } : { sessionId: options.sessionId }),
       ...(options.outputSchema ? { outputFormat: { type: "json_schema", schema: options.outputSchema } } : {}),
