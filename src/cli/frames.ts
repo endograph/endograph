@@ -25,23 +25,23 @@ function indent(text: string): string {
     .join("\n");
 }
 
-/** The frames about one request or call: its own, and every activation its frame sourced. */
+/**
+ * The frames about one request or call: its own, and every activation its frame sourced,
+ * with their continuations. A continuation is sourced by the step frame before it, so
+ * frames are walked in order.
+ */
 export function framesAbout(frames: Frame[], id: string): Frame[] {
   const sourceFrames = new Set<string>();
-  for (const f of frames) {
-    const payload = f.payload as { id?: string; metadata?: { endo?: { ids?: string[] } } } | undefined;
-    if ((f.id === id || payload?.metadata?.endo?.ids?.includes(id)) && payload?.id) sourceFrames.add(payload.id);
-  }
   const activations = new Set<string>();
-  for (const f of frames) {
-    for (const m of ((f.payload as { messages?: Record<string, unknown>[] } | undefined)?.messages ?? [])) {
+  return frames.filter((f) => {
+    const payload = f.payload as { id?: string; activationId?: string; metadata?: { endo?: { ids?: string[] } }; messages?: Record<string, unknown>[] } | undefined;
+    const messages = payload?.messages ?? [];
+    const own = f.id === id || payload?.metadata?.endo?.ids?.includes(id);
+    const step = !!payload?.activationId && activations.has(payload.activationId);
+    if ((own || step) && payload?.id) sourceFrames.add(payload.id);
+    for (const m of messages) {
       if (m.type === "work" && m.kind === "activation" && sourceFrames.has(m.sourceFrameId as string)) activations.add(m.activationId as string);
     }
-  }
-  return frames.filter((f) => {
-    const payload = f.payload as { activationId?: string; metadata?: { endo?: { ids?: string[] } }; messages?: Record<string, unknown>[] } | undefined;
-    if (f.id === id || payload?.metadata?.endo?.ids?.includes(id)) return true;
-    if (payload?.activationId && activations.has(payload.activationId)) return true;
-    return (payload?.messages ?? []).some((m) => typeof m.activationId === "string" && activations.has(m.activationId));
+    return own || step || messages.some((m) => typeof m.activationId === "string" && activations.has(m.activationId));
   });
 }
