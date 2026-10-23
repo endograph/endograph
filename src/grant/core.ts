@@ -72,8 +72,8 @@ export function coreActions(runtime: CoreRuntime): AnyAction[] {
     name: "update_state",
     description:
       "Write a declared state by key. replace sets the whole value; patch merges " +
-      "keys into the object at path (default: the root); append pushes values onto " +
-      "the array at path. The write is checked against the state's schema and a " +
+      "keys into the object at path (default: the root); append pushes the items of " +
+      "`values` onto the array at path. The write is checked against the state's schema and a " +
       "rejected write changes nothing.",
     inputSchema: z.object({
       state: z.string(),
@@ -84,12 +84,14 @@ export function coreActions(runtime: CoreRuntime): AnyAction[] {
     }),
     run: ({ state, op, value, values, path }, ctx) => {
       if (!ctx.updateStateAt) return actionResult({ success: false, error: "state writes are not available here" });
+      // An append without `values` would succeed and write nothing.
+      if (op === "append" && !values) return actionResult({ success: false, error: "append takes `values`, an array of the items to push" });
       const update: StateUpdate =
         op === "replace"
           ? { op, value }
           : op === "patch"
             ? { op, value: value as Record<string, unknown>, path }
-            : { op, values: values ?? [], path };
+            : { op, values: values!, path };
       try {
         ctx.updateStateAt(state, update);
       } catch (err) {
