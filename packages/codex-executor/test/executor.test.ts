@@ -175,8 +175,7 @@ test("cancellation interrupts the native turn and an uncheckpointed session is n
   expect(second.server.thread).not.toBe(id);
 });
 
-test("native tool responses wait for Projector state commits without starting another Codex turn", async () => {
-  const { executor, server } = setup();
+function counter(executor: NativeExecutor) {
   const count = createState({ key: "count", schema: z.number(), init: 0, projection: { render: (n) => `counter:${n}` } });
   const increment = createAction({ state: count, name: "increment", inputSchema: z.object({}), run(_args, context) {
     const next = context.state! + 1;
@@ -185,11 +184,21 @@ test("native tool responses wait for Projector state commits without starting an
   } });
   const node = createNode({ key: "counter", instructions: "Increment twice.", states: [count], parts: [tool(increment)], runtime: { type: "generator", trigger: { type: "actor-frame" } } });
   const charter = createCharter({ nodes: [node], actions: [increment], states: [count] });
-  const machine = createMachine({ charter, executor, instance: createSourceInstance({ id: "counter", node }) });
+  return createMachine({ charter, executor, instance: createSourceInstance({ id: "counter", node }) });
+}
+
+test("native tool responses wait for Projector state commits without starting another Codex turn", async () => {
+  const { executor, server } = setup();
+  const machine = counter(executor);
   server.onTurn = () => server.call("increment", {});
   server.onResponse = (result) => {
     const n = server.responses.length;
-    expect(result.contentItems[0].text).toContain(`counter:${n}`);
+    // The state change is steered into the turn, not appended to output code mode may truncate.
+    const steers = server.requests.filter((r) => r.method === "turn/steer");
+    expect(steers).toHaveLength(n);
+    expect(steers.at(-1)!.params).toMatchObject({ threadId: server.thread, expectedTurnId: server.turn });
+    expect(steers.at(-1)!.params.input[0].text).toMatch(new RegExp(`^Endograph context update:\\n.*counter:${n}`, "s"));
+    expect(result.contentItems[0].text).not.toContain("Endograph context update");
     if (n === 1) server.call("increment", {});
     else server.complete();
   };
@@ -198,6 +207,22 @@ test("native tool responses wait for Projector state commits without starting an
   expect(machine.instance.states?.count?.value).toBe(2);
   expect(server.requests.filter((r) => r.method === "turn/start")).toHaveLength(1);
   expect(server.requests.some((r) => r.method === "turn/interrupt")).toBe(false);
+});
+
+test("a context update that cannot be steered rides on the action result", async () => {
+  const { executor, server } = setup();
+  server.steerFails = true;
+  const machine = counter(executor);
+  server.onTurn = () => server.call("increment", {});
+  server.onResponse = (result) => {
+    const n = server.responses.length;
+    expect(result.contentItems[0].text).toMatch(new RegExp(`\\nEndograph context update:\\n.*counter:${n}`, "s"));
+    if (n === 1) server.call("increment", {});
+    else server.complete();
+  };
+  machine.enqueueFrame({ messages: [{ type: "user", text: "Go" }] });
+  for await (const _ of runMachine(machine)) void _;
+  expect(machine.instance.states?.count?.value).toBe(2);
 });
 
 test("different generators can park tool results and resume their own native turns", async () => {

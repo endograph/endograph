@@ -51,8 +51,11 @@ Projection is an intermediate representation, not a required exact transcript:
   `contextCompaction` item completes, the host steers the current preamble, state
   and action catalog back into that turn (`turn/steer`); if the turn has already
   ended, the next turn resends them. History is not resent.
-- Changes during an action are included in its tool response. A terminal
-  Projector action interrupts the native turn and completes the activation.
+- Changes during an action are steered into the turn (`turn/steer`) before its
+  tool response is released: code-mode models read tool responses through
+  script output, which Codex truncates. If the turn cannot be steered, the
+  changes ride on the tool response. A terminal Projector action interrupts the
+  native turn and completes the activation.
 
 Tool results are held at the host until Projector commits the action's frames.
 The executor returns `continue`, and the next Projector step supplies the

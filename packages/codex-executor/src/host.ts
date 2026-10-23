@@ -145,6 +145,8 @@ export class CodexHost {
   private async continue(active: Active, input: RunInput, signal: AbortSignal, emit: (event: Json) => void): Promise<Json> {
     const response = active.response!;
     const update = contextUpdate(input.projection, cursor(active.projection, response.observed));
+    // Steer while the activation still waits: calls and a turn end that arrive meanwhile are held as before.
+    const suffix = active.ended ? "" : await this.steer(active, update);
     const completion = Promise.withResolvers<Json>();
     Object.assign(active, completion, { input, emit, projection: input.projection, waiting: false, response: undefined });
     active.session.pending = input.activationId;
@@ -157,7 +159,7 @@ export class CodexHost {
           + `Wait for pending actions before ending a turn.\n${response.text}` + (update === "{}" ? "" : `\nEndograph context update:\n${update}`));
         return;
       }
-      this.server.respond(response.id, { success: response.success, contentItems: [{ type: "inputText", text: response.text + (update === "{}" ? "" : `\nEndograph context update:\n${update}`) }] });
+      this.server.respond(response.id, { success: response.success, contentItems: [{ type: "inputText", text: response.text + suffix }] });
       const queued = active.queued.shift();
       if (queued) this.onMessage(queued);
     });
@@ -265,6 +267,20 @@ export class CodexHost {
         execution: { model: this.options.model, latencyMs: Date.now() - active.startedAt, threadId: active.session.threadId, turnId: p.turn.id,
           ...(usage ? { usage: { inputTokens: usage.inputTokens, cachedInputTokens: usage.cachedInputTokens, outputTokens: usage.outputTokens } } : {}) } }));
     }
+  }
+  /**
+   * Give the running turn what changed while an action ran. Code-mode models read action results
+   * through script output, which Codex truncates; a steered input reaches the model whole. When the
+   * turn cannot be steered, the update rides on the action result instead. Returns that suffix.
+   */
+  private async steer(active: Active, update: string): Promise<string> {
+    if (update === "{}") return "";
+    const text = `Endograph context update:\n${update}`;
+    if (!active.turnId) return `\n${text}`;
+    try {
+      await this.server.request("turn/steer", { threadId: active.session.threadId, expectedTurnId: active.turnId, input: [{ type: "text", text }] });
+      return "";
+    } catch { return `\n${text}`; }
   }
   /** Codex keeps only its summary and a recent tail of user messages: give the turn its standing context again. */
   private restore(active: Active) {
