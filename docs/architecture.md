@@ -37,6 +37,13 @@ current turn finish, and releases the store and lock once. Persistence failures
 retain the fatal shutdown path described below.
 The parent requests graceful shutdown through private IPC so it reaches the
 worker through Linux sandbox wrappers, with a forced-stop timeout as fallback.
+The worker logs why it stops, and its exit code tells the parent what follows:
+78 starts a fresh worker for a new program, 79 means another machine adopted
+the agent and the parent stops too, and other failures end the parent so the
+service manager reruns startup. A clean exit the parent did not request, such
+as a signal that reached only the worker, starts a fresh worker with backoff:
+service managers restart only failures, so ending the parent would leave the
+agent down.
 
 Appending a request or call frame indexes its delivered messages using the same
 function as archive recovery. SQLite owns deduplication; the harness keeps no

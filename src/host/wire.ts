@@ -1,5 +1,15 @@
 import type { JsonValue } from "./action.ts";
 export const VERSION = 1;
+/**
+ * Worker exit codes that tell the host what to do next. A worker exits 0 only
+ * when the host asked it to stop, or when a signal reached it alone.
+ */
+export const WORKER_EXIT = {
+  /** Inception committed a new program: start a fresh worker. */
+  restart: 78,
+  /** Another machine adopted the agent: stop here for good. */
+  adopted: 79,
+} as const;
 export const validId = (id: unknown): id is string => typeof id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(id);
 export function object(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value); }
 

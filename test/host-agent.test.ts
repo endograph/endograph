@@ -256,6 +256,74 @@ test("a worker exits when its trusted parent dies", async () => {
   }
 }, 20000);
 
+test("a signal that reaches only the worker restarts it; a signal to the host or an adoption stops the service", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "endo-worker-signal-")));
+  const paths = pathsOf(dir);
+  mkdirSync(join(paths.state, "program"), { recursive: true });
+  mkdirSync(paths.inbox);
+  writeFileSync(paths.program, program);
+  writeFileSync(join(dir, "manifest.md"), "Report the worker process identity.");
+  writeFileSync(paths.grant, 'name="worker-signal"\n[executor]\nmodule=".endo/executor.ts"\n[inception]\nmode="manual"\n');
+  writeFileSync(join(paths.state, "executor.ts"), `
+    import {scripted} from ${JSON.stringify(join(root, "test/fixtures/agent/scripted.ts"))};
+    export default {create:()=>scripted(async({requests,call})=>{
+      for(const request of requests)await call("reply",{id:request.id,ok:true,text:String(process.pid)});
+    })};
+  `);
+  const parentFile = join(dir, "parent.ts");
+  writeFileSync(parentFile, `
+    import {createAgentHost} from ${JSON.stringify(join(root, "src/host/agent.ts"))};
+    const host=await createAgentHost({agentDir:${JSON.stringify(dir)}});
+    process.exit(await host.run());
+  `);
+  // The host and worker share stdout, as they share endo.log under a service manager.
+  const parent = Bun.spawn([process.execPath, parentFile], { stdout: "pipe", stderr: "pipe" });
+  const output = new Response(parent.stdout).text();
+  const errors = new Response(parent.stderr).text();
+  const workerPid = async () => {
+    const id = newId();
+    writeMessage(paths.inbox, { v: 1, kind: "request", id, text: "pid", at: Date.now() });
+    return Number((await until(() => readReply(paths.outbox, id) ?? undefined)).text);
+  };
+  const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  try {
+    const first = await workerPid();
+    process.kill(first, "SIGTERM");
+    await until(() => alive(first) ? undefined : true, 5000);
+    const second = await workerPid();
+    expect(second).not.toBe(first);
+    expect(parent.exitCode).toBeNull();
+
+    parent.kill("SIGTERM");
+    expect(await parent.exited).toBe(0);
+    await until(() => alive(second) ? undefined : true, 5000);
+    const log = await output;
+    expect(log).toContain(`worker ${first} stopping: SIGTERM`);
+    expect(log).toContain(`worker ${first} exited 0; the host did not ask it to stop, so it starts again in 1s`);
+    expect(log).toContain("SIGTERM: stopping");
+    expect(log).toContain(`worker ${second} stopping: the host asked it to`);
+    expect(log).toMatch(new RegExp(`worker ${second} exited 0\\n`));
+    expect(await errors).toBe("");
+
+    // Adoption by another machine still stops this host for good.
+    const adopted = Bun.spawn([process.execPath, parentFile], { stdout: "pipe", stderr: "pipe" });
+    const adoptedOutput = new Response(adopted.stdout).text();
+    try {
+      const third = await workerPid();
+      const status = JSON.parse(readFileSync(paths.status, "utf8"));
+      writeFileSync(paths.status, JSON.stringify({ ...status, host: "elsewhere", at: Date.now() + 1000 }));
+      writeMessage(paths.inbox, { v: 1, kind: "request", id: newId(), text: "pid", at: Date.now() });
+      expect(await adopted.exited).toBe(0);
+      expect(await adoptedOutput).toContain(`worker ${third} stopping: adopted by elsewhere`);
+      expect(await adoptedOutput).toMatch(new RegExp(`worker ${third} exited 79\\n`));
+    } finally { adopted.kill("SIGKILL"); await adopted.exited; }
+  } finally {
+    parent.kill("SIGKILL");
+    await parent.exited;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 30000);
+
 test("a host action's emitMessage lands in its agent's inbox as a request from that action", async () => {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "endo-host-emit-")));
   const paths = pathsOf(dir);
