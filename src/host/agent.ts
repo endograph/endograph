@@ -17,13 +17,13 @@ import { createHostBroker } from "./broker.ts";
 import { createHostModelHandler } from "./model.ts";
 import { closeSandbox, sandboxCommand } from "./sandbox.ts";
 import { ipcTransport } from "./transport.ts";
+import { WORKER_EXIT } from "./wire.ts";
 import { CodexHost } from "@endograph/codex-executor/host";
 import { NATIVE_LABELS } from "@endograph/codex-executor/protocol";
 import { ClaudeHost } from "@endograph/claude-executor/host";
 import { hasCommittedActivation } from "../store/activation.ts";
 
 const WORKER = join(import.meta.dir, "worker.ts");
-const RESTART = 78;
 
 /** One outer process per agent: owner code and credentials stay here. */
 export interface AgentHost {
@@ -75,6 +75,8 @@ export async function createAgentHost(opts: {
   let lastAttemptedInputs: string | undefined;
   let closing = false;
   let closeTask: Promise<void> | undefined;
+  /** Ends a wait before relaunching a worker, so closing never waits out a backoff. */
+  let wake: (() => void) | undefined;
   const launch = async (mode: "run" | "load", inputFile?: string, validationGrant?: Grant) => {
     if (closing) throw new Error("agent host is closing");
     if (mode === "run" && existsSync(join(paths.state, "promotion.json"))) {
@@ -211,18 +213,38 @@ export async function createAgentHost(opts: {
       const stop = (signal: NodeJS.Signals) => { log(`${logTime(Date.now())}  ${signal}: stopping`); void host.close(); };
       process.on("SIGINT", stop);
       process.on("SIGTERM", stop);
+      let delay = 0;
       try {
         for (;;) {
+          const started = Date.now();
           const { child, exited } = await launch("run");
           const code = await exited;
-          log(`${logTime(Date.now())}  worker ${child.pid} exited ${code}${code === RESTART && !closing ? "; restarting to load the new program" : ""}`);
-          if (closing || code !== RESTART) return code;
+          // A clean exit the host did not ask for means a signal reached the worker alone. Returning
+          // 0 would end the service: launchd and systemd restart only failures. Serve again, backing
+          // off if it keeps happening.
+          const unrequested = !closing && code === 0;
+          if (unrequested) delay = Date.now() - started > 60_000 ? 1000 : Math.min(Math.max(delay * 2, 1000), 60_000);
+          log(`${logTime(Date.now())}  worker ${child.pid} exited ${code}${closing ? ""
+            : code === WORKER_EXIT.restart ? "; restarting to load the new program"
+            : unrequested ? `; the host did not ask it to stop, so it starts again in ${delay / 1000}s` : ""}`);
+          if (closing) return code;
+          if (code === WORKER_EXIT.restart) continue;
+          if (code === WORKER_EXIT.adopted) return 0;
+          // Failures exit the host, and the service manager reruns startup, which can incept.
+          if (!unrequested) return code;
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, delay);
+            wake = () => { clearTimeout(timer); resolve(); };
+          });
+          wake = undefined;
+          if (closing) return 0;
         }
       } finally { process.off("SIGINT", stop); process.off("SIGTERM", stop); }
     },
     close() {
       return closeTask ??= (async () => {
         closing = true;
+        wake?.();
         const pending = [...children];
         // Signals can stop the Linux sandbox wrapper without reaching the
         // worker. The inherited IPC channel addresses the worker directly.
